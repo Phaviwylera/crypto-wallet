@@ -1,0 +1,72 @@
+name: Deploy Seedlab to private EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ec2-production
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+      DEPLOY_BUCKET: ${{ vars.DEPLOY_BUCKET }}
+    steps:
+      - name: Check out merged source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Build static site
+        run: npm ci && npm run build
+
+      - name: Configure short-lived AWS credentials with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload immutable release to private S3 bucket
+        run: aws s3 sync dist/ "s3://${DEPLOY_BUCKET}/releases/${GITHUB_SHA}/" --only-show-errors --sse AES256
+
+      - name: Ask SSM to deploy the release on EC2
+        shell: bash
+        run: |
+          set -euo pipefail
+          params="$(jq -n \
+            --arg bucket "$DEPLOY_BUCKET" \
+            --arg sha "$GITHUB_SHA" \
+            '{commands: [
+              "set -eu",
+              ("release_dir=/var/www/seedlab/releases/" + $sha),
+              "install -d -o www-data -g www-data \"$release_dir\"",
+              ("aws s3 sync s3://" + $bucket + "/releases/" + $sha + "/ \"$release_dir/\" --delete --only-show-errors"),
+              "test -s \"$release_dir/index.html\"",
+              "chown -R www-data:www-data \"$release_dir\"",
+              "ln -sfn \"$release_dir\" /var/www/seedlab/current.new",
+              "mv -Tf /var/www/seedlab/current.new /var/www/seedlab/current",
+              "nginx -t",
+              "systemctl reload nginx"
+            ]}')"
+          command_id="$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "Deploy Seedlab ${GITHUB_SHA}" \
+            --parameters "$params" \
+            --query 'Command.CommandId' \
+            --output text)"
+          aws ssm wait command-executed --command-id "$command_id" --instance-id "$EC2_INSTANCE_ID"
+          aws ssm get-command-invocation --command-id "$command_id" --instance-id "$EC2_INSTANCE_ID" --query 'StandardOutputContent' --output text
