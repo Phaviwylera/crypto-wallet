@@ -1,6 +1,6 @@
 # Seedlab — an interactive wallet primer
 
-A browser-based, step-by-step crypto wallet learning demo. Lesson 1 generates a BIP-39 12-word recovery phrase. Lesson 2 can derive and display the BIP-39 512-bit seed. It does not derive a private key, public key, or address.
+A browser-based, step-by-step crypto wallet learning demo. Lesson 1 generates a BIP-39 12-word recovery phrase. Lesson 2 can derive and display the BIP-39 512-bit seed. It also includes a bounded, client-side candidate checker for testing supplied phrase candidates against a seed; it does not brute-force the BIP-39 phrase space. It does not derive a private key, public key, or address.
 
 ## Run locally
 
