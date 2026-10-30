@@ -1,18 +1,54 @@
-import { generateMnemonic, mnemonicToSeedSync, validateMnemonic } from '@scure/bip39';
+import { HDKey } from '@scure/bip32';
+import { entropyToMnemonic, mnemonicToSeedSync } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english';
+import { secp256k1 } from '@noble/curves/secp256k1.js';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { keccak_256 } from '@noble/hashes/sha3.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
 import './style.css';
 
 const app = document.querySelector('#app');
-let phrase = '';
-let seedHex = '';
-let copiedPhrase = false;
-let copiedSeed = false;
-let matchedPhrase = '';
-let copiedMatch = false;
-let searchSeed = '';
-let searchPassphrase = '';
-let candidatePhrases = '';
-let searchResult = '';
+const DERIVATION_PATH = "m/44'/60'/0'/0/0";
+let wallet = freshWallet();
+let passphrase = '';
+let copied = new Set();
+
+function freshWallet() {
+  return {
+    stage: 0,
+    entropy: null,
+    entropyChecksum: '',
+    phrase: '',
+    seed: null,
+    master: null,
+    account: null,
+    publicKey: null,
+    keccakHash: null,
+    address: '',
+  };
+}
+
+function hex(bytes) {
+  return bytes ? bytesToHex(bytes) : '';
+}
+
+function spacedHex(bytes) {
+  return hex(bytes).match(/.{1,8}/g)?.join(' ') ?? '';
+}
+
+function binary(bytes) {
+  return Array.from(bytes, (value) => value.toString(2).padStart(8, '0')).join('');
+}
+
+function checksumAddress(lowerHex) {
+  const lower = lowerHex.toLowerCase();
+  const hash = hex(keccak_256(new TextEncoder().encode(lower)));
+  const checksummed = Array.from(lower, (character, index) => {
+    if (/[a-f]/.test(character) && parseInt(hash[index], 16) >= 8) return character.toUpperCase();
+    return character;
+  }).join('');
+  return `0x${checksummed}`;
+}
 
 async function copyToClipboard(value) {
   try {
@@ -21,7 +57,7 @@ async function copyToClipboard(value) {
       return;
     }
   } catch {
-    // Fall through to the user-gesture clipboard fallback for non-secure HTTP demos.
+    // Try the user-gesture fallback; this may vary by browser on plain HTTP.
   }
   const field = document.createElement('textarea');
   field.value = value;
@@ -30,118 +66,180 @@ async function copyToClipboard(value) {
   field.style.opacity = '0';
   document.body.append(field);
   field.select();
-  const copied = document.execCommand('copy');
+  const success = document.execCommand('copy');
   field.remove();
-  if (!copied) throw new Error('Clipboard copy was blocked');
+  if (!success) throw new Error('Clipboard access was blocked');
 }
 
-function renderMatchResult() {
-  if (!matchedPhrase) return;
-  const target = document.querySelector('#search-result');
-  if (!target) return;
-  target.className = 'search-result success';
-  const message = document.createElement('span');
-  message.textContent = `Match found among the supplied candidates: ${matchedPhrase}`;
-  const button = document.createElement('button');
-  button.type = 'button';
-  button.className = 'secondary match-copy-button';
-  button.textContent = copiedMatch ? 'Copied!' : 'Copy matched phrase';
-  button.addEventListener('click', async () => {
-    try {
-      await copyToClipboard(matchedPhrase);
-      copiedMatch = true;
-      button.textContent = 'Copied!';
-    } catch {
-      button.textContent = 'Copy failed';
-    }
-  });
-  target.replaceChildren(message, button);
+function copyValue(key) {
+  const values = {
+    entropy: () => hex(wallet.entropy),
+    phrase: () => wallet.phrase,
+    seed: () => hex(wallet.seed),
+    masterPrivate: () => hex(wallet.master?.privateKey),
+    chainCode: () => hex(wallet.master?.chainCode),
+    accountPrivate: () => hex(wallet.account?.privateKey),
+    publicKey: () => hex(wallet.publicKey),
+    keccak: () => hex(wallet.keccakHash),
+    address: () => wallet.address,
+  };
+  return values[key]?.() ?? '';
+}
+
+function copyButton(key, title = 'Copy') {
+  return `<button class="copy-button" type="button" data-copy="${key}">${copied.has(key) ? 'Copied' : title}</button>`;
+}
+
+function stageBadge(step) {
+  if (wallet.stage >= step) return '<span class="step-status complete">DONE</span>';
+  if (wallet.stage + 1 === step) return '<span class="step-status ready">NEXT</span>';
+  return '<span class="step-status">LOCKED</span>';
+}
+
+function stepCard({ number, title, caption, step, body, action }) {
+  const unlocked = wallet.stage >= step - 1;
+  return `<section class="step-card ${wallet.stage >= step ? 'is-complete' : ''} ${unlocked ? '' : 'is-locked'}">
+    <div class="step-heading"><span class="step-number">${number}</span><div class="step-heading-copy"><h2>${title}</h2><p>${caption}</p></div>${stageBadge(step)}</div>
+    ${unlocked ? body : '<p class="locked-note">Complete the previous step to reveal this calculation.</p>'}
+    ${action && wallet.stage === step - 1 ? `<div class="step-action"><button class="action-button" data-run-step="${step}">${action}<span aria-hidden="true">↗</span></button></div>` : ''}
+  </section>`;
 }
 
 function render() {
-  const step2 = Boolean(seedHex);
+  const entropyReady = wallet.stage >= 1;
+  const words = entropyReady ? wallet.phrase.split(' ') : [];
+  const wordGrid = words.map((word, index) => {
+    const wordIndex = wordlist.indexOf(word);
+    return `<div class="mnemonic-word"><span>${String(index + 1).padStart(2, '0')}</span><b>${word}</b><small>index ${String(wordIndex).padStart(4, '0')}</small></div>`;
+  }).join('');
+
+  const entropyBody = entropyReady ? `
+    <div class="value-row"><div><label>128-bit entropy · 16 bytes</label><code>${spacedHex(wallet.entropy)}</code></div>${copyButton('entropy')}</div>
+    <div class="checksum-strip"><span class="mini-label">SHA-256 CHECKSUM · FIRST 4 BITS</span><code>${wallet.entropyChecksum}</code><span class="checksum-explain">128 entropy bits + 4 checksum bits = 132 bits</span></div>
+    <div class="mnemonic-grid">${wordGrid}</div>
+    <p class="step-explanation">BIP-39 splits the 132-bit sequence into twelve 11-bit numbers. Each number (0–2047) selects a word from the English list. The last word carries part of the entropy and the checksum.</p>` : `
+    <p class="step-explanation">Generate 16 cryptographically random bytes. BIP-39 appends the first 4 bits of SHA-256(entropy), then maps the 132 bits to twelve words.</p>
+    <div class="empty-inline">No phrase or keys exist until you generate a demo wallet.</div>`;
+
+  const phraseBody = entropyReady ? `
+    <div class="phrase-title-row"><span class="mini-label">12-WORD BIP-39 MNEMONIC</span>${copyButton('phrase', 'Copy phrase')}</div>
+    <div class="mnemonic-grid compact-words">${wordGrid}</div>
+    <p class="step-explanation">The phrase is the human-readable encoding of the entropy plus checksum. It is not the 512-bit seed and is not an Ethereum address.</p>` : '<p class="locked-note">The twelve-word phrase is produced from the entropy and checksum above.</p>';
+
+  const seedBody = wallet.stage >= 2 ? `
+    <div class="formula-line"><span>PBKDF2-HMAC-SHA512</span><span>2,048 rounds</span><span>output: 64 bytes</span></div>
+    <p class="step-explanation">Input: NFKD-normalized mnemonic. Salt: <code>mnemonic</code> + the optional passphrase you entered. The passphrase is case-sensitive and changes the resulting wallet.</p>
+    <div class="value-row"><div><label>512-bit BIP-39 seed · 64 bytes</label><code>${spacedHex(wallet.seed)}</code></div>${copyButton('seed', 'Copy seed')}</div>` : '<p class="locked-note">This runs PBKDF2-HMAC-SHA512 on the phrase. The result is seed material—not a private key.</p>';
+
+  const masterBody = wallet.stage >= 3 ? `
+    <p class="step-explanation">BIP-32 computes HMAC-SHA512(key = <code>Bitcoin seed</code>, data = seed). The 64-byte result splits into IL (master private scalar) and IR (master chain code).</p>
+    <div class="value-row"><div><label>Master private key · IL</label><code>${spacedHex(wallet.master.privateKey)}</code></div>${copyButton('masterPrivate')}</div>
+    <div class="value-row"><div><label>Master chain code · IR</label><code>${spacedHex(wallet.master.chainCode)}</code></div>${copyButton('chainCode')}</div>
+    <p class="step-explanation subtle">The master node is a root from which a hierarchy of keys can be derived. It is not the Ethereum address.</p>` : '<p class="locked-note">BIP-32 turns the seed into a master private key and chain code using HMAC-SHA512.</p>';
+
+  const accountBody = wallet.stage >= 4 ? `
+    <div class="path-value"><span class="mini-label">ETHEREUM ACCOUNT PATH</span><code>${DERIVATION_PATH}</code></div>
+    <div class="path-legend"><span><b>44′</b> BIP-44 purpose</span><span><b>60′</b> Ethereum coin type</span><span><b>0′</b> account</span><span><b>0</b> external chain</span><span><b>0</b> address index</span></div>
+    <p class="step-explanation">BIP-32 child-key derivation walks this path. Hardened levels use the parent private key; the final levels derive the first external Ethereum account.</p>
+    <div class="value-row"><div><label>Derived account private key</label><code>${spacedHex(wallet.account.privateKey)}</code></div>${copyButton('accountPrivate')}</div>
+    <div class="value-row"><div><label>Uncompressed secp256k1 public key · 65 bytes</label><code>${spacedHex(wallet.publicKey)}</code></div>${copyButton('publicKey')}</div>` : '<p class="locked-note">Derive the first Ethereum account at <code>m/44′/60′/0′/0/0</code>, then compute its public key on secp256k1.</p>';
+
+  const addressBody = wallet.stage >= 5 ? `
+    <p class="step-explanation">Ethereum hashes the 64-byte public-key body (without the leading <code>04</code>) with Keccak-256. The last 20 bytes form the address. EIP-55 uses hash nibbles to capitalize letters for a checksum.</p>
+    <div class="value-row"><div><label>Keccak-256(public key body)</label><code>${spacedHex(wallet.keccakHash)}</code></div>${copyButton('keccak')}</div>
+    <div class="address-output"><div><span class="mini-label">ETHEREUM ADDRESS · EIP-55</span><strong>${wallet.address}</strong></div>${copyButton('address', 'Copy address')}</div>` : '<p class="locked-note">Hash the uncompressed public-key body with Keccak-256; take the last 20 bytes and apply EIP-55 checksum casing.</p>';
+
   app.innerHTML = `
-    <header class="topbar"><a class="brand" href="#"><span class="brand-icon">◈</span> seed<span>lab</span></a><div class="top-meta"><span class="live-dot"></span> LOCAL DEMO <span class="divider">/</span> NO WALLET CONNECTED</div></header>
-    <main>
-      <div class="eyebrow"><span>YOUR FIRST WALLET</span><span class="line"></span><span>LESSON 02 / 05</span></div>
-      <section class="hero"><div><h1>A wallet begins<br/>with <em>randomness.</em></h1><p class="intro">We’ll build one piece at a time. Your phrase is ready; now derive the BIP-39 seed. Still no private key or address.</p></div><div class="lesson-card"><div class="card-label"><span class="number">01</span> THE BUILD SEQUENCE</div><div class="sequence"><div class="seq-item done"><b>01</b><span>Seed phrase</span><i>DONE</i></div><div class="seq-item ${step2 ? 'active' : ''}"><b>02</b><span>Seed</span>${step2 ? '<i>YOU ARE HERE</i>' : ''}</div><div class="seq-item"><b>03</b><span>Private key</span></div><div class="seq-item"><b>04</b><span>Public key</span></div><div class="seq-item"><b>05</b><span>Ethereum address</span></div></div></div></section>
-      <section class="workspace"><div class="panel-title"><div><span class="section-kicker">STEP 01 · ${step2 ? 'COMPLETE' : 'START HERE'}</span><h2>Your recovery phrase</h2></div><span class="badge">BIP-39 · 12 WORDS</span></div><p class="explain">Generated from browser cryptographic randomness and the standard English BIP-39 word list. The phrase stays in this page’s memory only.</p>
-      <div class="phrase-box ${phrase ? 'has-phrase' : ''}">${phrase ? `<div class="words">${phrase.split(' ').map((w,i)=>`<div class="word"><span>${String(i+1).padStart(2,'0')}</span>${w}</div>`).join('')}</div>` : `<div class="empty-state"><span class="spark">✳</span><span>Start by generating your 12 words.</span><small>Nothing is generated until you press the button.</small></div>`}</div>
-      <div class="actions"><button class="primary" id="generate">${phrase ? '↻ &nbsp; Generate a new phrase' : '✳ &nbsp; Generate seed phrase'} <span>→</span></button>${phrase ? `<button class="secondary" id="copy-phrase">${copiedPhrase ? 'Copied!' : 'Copy phrase'}</button>` : ''}</div>
-      ${phrase ? `<div class="step-two"><div class="panel-title"><div><span class="section-kicker">STEP 02</span><h2>Derive the BIP-39 seed</h2></div><span class="badge">512-BIT OUTPUT</span></div><p class="explain">BIP-39 runs the phrase through PBKDF2-HMAC-SHA512 (2,048 iterations). This lesson uses an empty optional passphrase. The result is the binary seed used by later wallet derivation—not a private key.</p><button class="primary" id="derive">${step2 ? '✓ &nbsp; Seed derived' : 'Derive seed'} <span>→</span></button>${step2 ? `<div class="seed-result"><div class="seed-caption"><span>512-BIT SEED · HEX</span><span>128 HEX CHARACTERS</span></div><code>${seedHex.match(/.{1,8}/g).join(' ')}</code><div class="seed-actions"><button class="secondary" id="copy-seed">${copiedSeed ? 'Copied!' : 'Copy seed'}</button><button class="secondary" id="back-to-phrase">← &nbsp; Back to recovery phrase</button></div><p class="reverse-note">This returns to the phrase held in this page’s memory. PBKDF2 is one-way, so a seed cannot be reversed to recover its phrase.</p></div>` : ''}</div>` : ''}
-      <section class="search-lab"><div class="panel-title"><div><span class="section-kicker">EXPERIMENT</span><h2>Search a bounded candidate list</h2></div><span class="badge">LOCAL ONLY</span></div><p class="explain">There is no practical inverse for PBKDF2. This lab only checks phrases you supply, one per line, against a seed. It does not generate or search all possible phrases. Use demo data only.</p><label class="field-label" for="search-seed">BIP-39 seed · 128 hex characters</label><textarea id="search-seed" class="single-line" placeholder="Paste 64 bytes of seed as 128 hexadecimal characters">${searchSeed.replaceAll('&','&amp;').replaceAll('<','&lt;')}</textarea><label class="field-label" for="search-passphrase">Optional BIP-39 passphrase (same one used to create the seed)</label><input id="search-passphrase" type="password" autocomplete="off" placeholder="Leave empty if none was used" value="${searchPassphrase.replaceAll('&','&amp;').replaceAll('"','&quot;').replaceAll('<','&lt;')}"/><label class="field-label" for="candidate-phrases">Candidate 12-word phrases · one candidate per line · maximum 1,000</label><textarea id="candidate-phrases" rows="5" placeholder="word1 word2 ... word12&#10;another candidate phrase ...">${candidatePhrases.replaceAll('&','&amp;').replaceAll('<','&lt;')}</textarea><div class="actions"><button class="primary" id="search-candidates">Check candidate phrases <span>→</span></button></div><div class="search-result" id="search-result" role="status" aria-live="polite"></div></section>
-      <div class="warning"><span class="warning-icon">!</span><div><strong>Learning demo — never use this phrase or seed for real funds.</strong><p>Copy buttons write to your device clipboard, which may keep clipboard history. This page does not send or persist the phrase or seed. It is not an audited wallet; don’t screenshot, share, or enter a real recovery phrase into a website.</p></div></div>
-      <div class="what-next"><span class="section-kicker">WHAT JUST HAPPENED?</span><p>${step2 ? `The phrase was transformed into a 512-bit seed using <strong>PBKDF2-HMAC-SHA512</strong>. This seed is secret wallet material, but it is <strong>not itself an Ethereum address or private key</strong>. The next lesson can derive a private key from it.` : phrase ? 'The words encode 128 bits of entropy plus a checksum. Click <strong>Derive seed</strong> to perform the BIP-39 transformation. No key or address is created.' : 'Generate 12 words first. Then you can run the BIP-39 transformation to derive a seed. No key or address is created in these steps.'}</p></div></section>
-      <footer><span>SEEDLAB <span class="dim">· AN INTERACTIVE WALLET PRIMER</span></span><span>YOUR BROWSER · YOUR SESSION</span></footer>
+    <header class="topbar"><a class="brand" href="#" aria-label="Seedlab home"><span class="brand-mark">S</span><span>seedlab</span></a><div class="topbar-meta"><span class="live-dot"></span> DERIVATION LAB <span class="topbar-divider">/</span> TEST DATA ONLY</div></header>
+    <main class="page-shell">
+      <div class="page-heading"><div><div class="eyebrow">WALLET BUILD · 5 CALCULATIONS</div><h1>Trace a wallet to its address.</h1><p>Run each calculation in order. Every value is generated in this browser session.</p></div><div class="session-chip"><span class="session-dot"></span>${wallet.stage ? `STEP ${String(Math.min(wallet.stage + 1, 5)).padStart(2, '0')} OF 05` : 'READY TO START'}</div></div>
+      <div class="security-banner"><span class="alert-mark">!</span><p><strong>Public HTTP learning demo.</strong> Secret values are shown and copied in this browser. HTTP can be intercepted or altered. Never use a real phrase, passphrase, seed, or key here.</p></div>
+      <div class="layout-grid">
+        <div class="lesson-column">
+          <section class="setup-card"><div class="setup-copy"><span class="eyebrow">START HERE</span><h2>Make a fresh demo wallet</h2><p>Uses browser cryptographic randomness. Nothing is saved or sent to EC2.</p></div><div class="setup-controls"><label for="passphrase">Optional BIP-39 passphrase</label><input id="passphrase" type="password" autocomplete="new-password" placeholder="Leave blank for no passphrase" value="${passphrase.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;')}" ${wallet.stage ? 'disabled' : ''}><small>${wallet.stage ? 'Locked for this derivation; reset to change it.' : 'Case-sensitive. It creates a different wallet.'}</small><button class="action-button generate-button" id="generate">${wallet.stage ? 'Generate another demo wallet' : 'Generate demo wallet'}<span aria-hidden="true">↗</span></button></div></section>
+          <div class="steps-heading"><div><span class="eyebrow">THE PIPELINE</span><h2>Five steps, one address</h2></div>${wallet.stage ? '<button class="reset-button" id="reset">Reset session</button>' : ''}</div>
+          ${stepCard({ number: '01', title: 'Entropy → mnemonic', caption: 'Create randomness and encode twelve words', step: 1, body: entropyBody, action: 'Generate 128-bit entropy & phrase' })}
+          ${stepCard({ number: '02', title: 'Mnemonic → seed', caption: 'PBKDF2-HMAC-SHA512 · BIP-39', step: 2, body: seedBody, action: 'Derive 512-bit seed' })}
+          ${stepCard({ number: '03', title: 'Seed → master node', caption: 'HMAC-SHA512 · BIP-32', step: 3, body: masterBody, action: 'Create BIP-32 master node' })}
+          ${stepCard({ number: '04', title: 'Master node → Ethereum keypair', caption: 'BIP-44 path · secp256k1', step: 4, body: accountBody, action: 'Derive Ethereum account' })}
+          ${stepCard({ number: '05', title: 'Public key → address', caption: 'Keccak-256 · last 20 bytes · EIP-55', step: 5, body: addressBody, action: 'Compute Ethereum address' })}
+        </div>
+        <aside class="side-rail">
+          <section class="rail-card"><div class="rail-title"><span class="eyebrow">MAP</span><span class="rail-index">01—05</span></div><ol class="flow-list"><li class="${wallet.stage >= 1 ? 'visited' : ''}"><b>01</b><span>128-bit entropy</span></li><li class="${wallet.stage >= 1 ? 'visited' : ''}"><b>02</b><span>12 BIP-39 words</span></li><li class="${wallet.stage >= 2 ? 'visited' : ''}"><b>03</b><span>512-bit seed</span></li><li class="${wallet.stage >= 3 ? 'visited' : ''}"><b>04</b><span>BIP-32 master node</span></li><li class="${wallet.stage >= 4 ? 'visited' : ''}"><b>05</b><span>Ethereum keypair</span></li><li class="${wallet.stage >= 5 ? 'visited current' : ''}"><b>↳</b><span>20-byte address</span></li></ol></section>
+          <section class="rail-card path-card"><span class="eyebrow">DEFAULT PATH</span><code>${DERIVATION_PATH}</code><p>Changing the path changes which account address is derived from the same seed.</p></section>
+          <section class="rail-card note-card"><span class="note-icon">i</span><div><strong>Keep the direction clear</strong><p>Each step derives new material from the prior value. The process does not provide a practical way to reverse a seed into its original phrase.</p></div></section>
+          <div class="rail-foot">LOCAL SESSION <span>·</span> NO SERVER API</div>
+        </aside>
+      </div>
+      <footer class="page-footer"><span>SEEDLAB <span class="footer-muted">· INTERACTIVE CRYPTOGRAPHY PRIMER</span></span><span>TEST VALUES ONLY · NEVER FOR FUNDS</span></footer>
     </main>`;
-  renderMatchResult();
-  document.querySelector('#generate').addEventListener('click', () => {
-    try { phrase = generateMnemonic(wordlist, 128); seedHex = ''; copiedPhrase = false; copiedSeed = false; matchedPhrase = ''; copiedMatch = false; render(); }
-    catch { alert('Secure randomness is unavailable in this browser context. Try a modern browser on HTTPS or localhost.'); }
-  });
-  document.querySelector('#derive')?.addEventListener('click', () => {
-    seedHex = Array.from(mnemonicToSeedSync(phrase)).map((b) => b.toString(16).padStart(2, '0')).join('');
-    render();
-  });
-  document.querySelector('#search-seed').addEventListener('input', (event) => { searchSeed = event.target.value; });
-  document.querySelector('#search-passphrase').addEventListener('input', (event) => { searchPassphrase = event.target.value; });
-  document.querySelector('#candidate-phrases').addEventListener('input', (event) => { candidatePhrases = event.target.value; });
-  document.querySelector('#search-candidates').addEventListener('click', async () => {
-    const target = document.querySelector('#search-result');
-    matchedPhrase = '';
-    copiedMatch = false;
-    const normalizedSeed = searchSeed.replace(/\s+/g, '').toLowerCase();
-    if (!/^[0-9a-f]{128}$/.test(normalizedSeed)) {
-      target.textContent = 'Enter a valid 512-bit seed as exactly 128 hexadecimal characters.';
-      target.className = 'search-result error';
-      return;
+
+  const passInput = document.querySelector('#passphrase');
+  passInput?.addEventListener('input', (event) => { passphrase = event.target.value; });
+  document.querySelector('#generate')?.addEventListener('click', generateWallet);
+  document.querySelector('#reset')?.addEventListener('click', resetWallet);
+  document.querySelectorAll('[data-run-step]').forEach((button) => button.addEventListener('click', () => runStep(Number(button.dataset.runStep))));
+  document.querySelectorAll('[data-copy]').forEach((button) => button.addEventListener('click', async () => {
+    try {
+      await copyToClipboard(copyValue(button.dataset.copy));
+      copied.add(button.dataset.copy);
+      button.textContent = 'Copied';
+    } catch {
+      button.textContent = 'Copy unavailable';
     }
-    const candidates = candidatePhrases.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-    if (!candidates.length) {
-      target.textContent = 'Add at least one candidate phrase, with one phrase per line.';
-      target.className = 'search-result error';
-      return;
-    }
-    if (candidates.length > 1000) {
-      target.textContent = 'The demo is limited to 1,000 candidates per search.';
-      target.className = 'search-result error';
-      return;
-    }
-    target.textContent = `Checking ${candidates.length} candidate${candidates.length === 1 ? '' : 's'} in this browser…`;
-    target.className = 'search-result';
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    let checked = 0;
-    for (const candidate of candidates) {
-      if (validateMnemonic(candidate, wordlist)) {
-        const candidateSeed = Array.from(mnemonicToSeedSync(candidate, searchPassphrase)).map((b) => b.toString(16).padStart(2, '0')).join('');
-        if (candidateSeed === normalizedSeed) {
-          matchedPhrase = candidate;
-          copiedMatch = false;
-          renderMatchResult();
-          return;
-        }
-      }
-      checked += 1;
-      if (checked % 20 === 0) {
-        target.textContent = `Checked ${checked} of ${candidates.length} candidates…`;
-        await new Promise((resolve) => setTimeout(resolve, 0));
-      }
-    }
-    target.textContent = `No match found in ${candidates.length} supplied candidates. This does not mean the seed is invalid; the original phrase may simply not be in your list.`;
-    target.className = 'search-result';
-  });
-  document.querySelector('#back-to-phrase')?.addEventListener('click', () => {
-    seedHex = '';
-    render();
-    document.querySelector('.phrase-box')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  });
-  document.querySelector('#copy-phrase')?.addEventListener('click', async (event) => {
-    try { await copyToClipboard(phrase); copiedPhrase = true; event.currentTarget.textContent = 'Copied!'; }
-    catch { event.currentTarget.textContent = 'Copy failed'; }
-  });
-  document.querySelector('#copy-seed')?.addEventListener('click', async (event) => {
-    try { await copyToClipboard(seedHex); copiedSeed = true; event.currentTarget.textContent = 'Copied!'; }
-    catch { event.currentTarget.textContent = 'Copy failed'; }
-  });
+  }));
 }
+
+function generateWallet() {
+  try {
+    const passInput = document.querySelector('#passphrase');
+    if (passInput) passphrase = passInput.value;
+    const entropy = new Uint8Array(16);
+    globalThis.crypto.getRandomValues(entropy);
+    wallet = freshWallet();
+    wallet.entropy = entropy;
+    wallet.entropyChecksum = binary(sha256(entropy)).slice(0, 4);
+    wallet.phrase = entropyToMnemonic(entropy, wordlist);
+    wallet.stage = 1;
+    copied = new Set();
+    render();
+  } catch {
+    alert('Secure browser randomness is unavailable. Use HTTPS or localhost for browser cryptography.');
+  }
+}
+
+function runStep(step) {
+  try {
+    if (step === 2 && wallet.stage === 1) {
+      wallet.seed = mnemonicToSeedSync(wallet.phrase, passphrase);
+    } else if (step === 3 && wallet.stage === 2) {
+      wallet.master = HDKey.fromMasterSeed(wallet.seed);
+    } else if (step === 4 && wallet.stage === 3) {
+      wallet.account = wallet.master.derive(DERIVATION_PATH);
+      wallet.publicKey = secp256k1.getPublicKey(wallet.account.privateKey, false);
+    } else if (step === 5 && wallet.stage === 4) {
+      wallet.keccakHash = keccak_256(wallet.publicKey.slice(1));
+      const lowerAddress = hex(wallet.keccakHash.slice(12));
+      wallet.address = checksumAddress(lowerAddress);
+    }
+    wallet.stage = step;
+    copied = new Set();
+    render();
+  } catch (error) {
+    console.error(error);
+    alert('That derivation step failed. Reset and try again in a modern browser.');
+  }
+}
+
+function resetWallet() {
+  wallet.entropy?.fill(0);
+  wallet.seed?.fill(0);
+  wallet.master?.wipePrivateData();
+  wallet.account?.wipePrivateData();
+  wallet = freshWallet();
+  passphrase = '';
+  copied = new Set();
+  render();
+}
+
 render();
