@@ -1,5 +1,5 @@
 import { HDKey } from '@scure/bip32';
-import { base58, bech32 } from '@scure/base';
+import { base58, bech32, bech32m } from '@scure/base';
 import { entropyToMnemonic, mnemonicToEntropy, mnemonicToSeedSync } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
@@ -12,17 +12,26 @@ import './style.css';
 const app = document.querySelector('#app');
 const NETWORKS = {
   ethereum: { label: 'Ethereum', shortLabel: 'ETH', family: 'evm', path: "m/44'/60'/0'/0/0", pathLabels: ['BIP-44 purpose', 'Ethereum coin type', 'account', 'external chain', 'address index'] },
-  bitcoin: { label: 'Bitcoin · Native SegWit', shortLabel: 'BTC', family: 'bitcoin', path: "m/84'/0'/0'/0/0", pathLabels: ['BIP-84 purpose', 'Bitcoin coin type', 'account', 'receive chain', 'address index'] },
+  bitcoin: { label: 'Bitcoin · Native SegWit', shortLabel: 'BTC P2WPKH', family: 'bitcoin', format: 'p2wpkh', path: "m/84'/0'/0'/0/0", pathLabels: ['BIP-84 purpose', 'Bitcoin coin type', 'account', 'receive chain', 'address index'] },
+  bitcoinLegacy: { label: 'Bitcoin · Legacy', shortLabel: 'BTC Legacy', family: 'bitcoin', format: 'p2pkh', path: "m/44'/0'/0'/0/0", pathLabels: ['BIP-44 purpose', 'Bitcoin coin type', 'account', 'external chain', 'address index'] },
+  bitcoinNested: { label: 'Bitcoin · Nested SegWit', shortLabel: 'BTC Nested', family: 'bitcoin', format: 'p2sh-p2wpkh', path: "m/49'/0'/0'/0/0", pathLabels: ['BIP-49 purpose', 'Bitcoin coin type', 'account', 'change chain', 'address index'] },
+  bitcoinTaproot: { label: 'Bitcoin · Taproot', shortLabel: 'BTC Taproot', family: 'bitcoin', format: 'p2tr', path: "m/86'/0'/0'/0/0", pathLabels: ['BIP-86 purpose', 'Bitcoin coin type', 'account', 'change chain', 'address index'] },
   tron: { label: 'TRON', shortLabel: 'TRX', family: 'tron', path: "m/44'/195'/0'/0/0", pathLabels: ['BIP-44 purpose', 'TRON coin type', 'account', 'external chain', 'address index'] },
-  bnb: { label: 'BNB Smart Chain', shortLabel: 'BNB', family: 'evm', path: "m/44'/60'/0'/0/0", pathLabels: ['BIP-44 purpose', 'EVM coin type', 'account', 'external chain', 'address index'] },
+  bnb: { label: 'BNB Smart Chain', shortLabel: 'BNB Smart Chain', family: 'evm', path: "m/44'/60'/0'/0/0", pathLabels: ['BIP-44 purpose', 'EVM coin type', 'account', 'external chain', 'address index'] },
+  bnbBeacon: { label: 'BNB Beacon Chain · Legacy', shortLabel: 'BNB Beacon', family: 'bnbBeacon', path: "m/44'/714'/0'/0/0", pathLabels: ['BIP-44 purpose', 'BNB coin type', 'account', 'external chain', 'address index'] },
 };
 let selectedNetworkId = 'ethereum';
+const SEARCH_BATCH_SIZE = 256;
+const SEARCH_SCALAR_LIMIT = 10_000_000;
 const selectedNetwork = () => NETWORKS[selectedNetworkId];
 let wallet = freshWallet();
 let passphrase = '';
 let copied = new Set();
 let backwardOpen = false;
 let discreteLogResult = null;
+let discreteLogProgress = null;
+let autoSearchEnabled = false;
+let searchRunId = 0;
 let labAddressInput = null;
 
 function freshWallet() {
@@ -44,8 +53,17 @@ function freshWallet() {
     addressBytes: null,
     eip55Hash: null,
     tronPayload: null,
+    tronShaFirst: null,
+    tronShaSecond: null,
     tronChecksum: null,
+    tronBase58Bytes: null,
     btcHash160: null,
+    btcSha256: null,
+    btcRedeemScript: null,
+    btcScriptHash: null,
+    btcPayload: null,
+    btcChecksum: null,
+    taprootData: null,
     compressedPublicKey: null,
     address: '',
   };
@@ -72,27 +90,56 @@ function byteGrid(bytes, addressStart = -1) {
   return Array.from(bytes, (value, index) => `<span class="hash-byte ${index >= addressStart ? 'address-byte' : ''}"><small>${index.toString(16).padStart(2, '0')}</small><b>${value.toString(16).padStart(2, '0')}</b></span>`).join('');
 }
 
+function looksLikeEvmPublicKey(input) {
+  const key = input.trim().replace(/\s+/g, '').replace(/^0x/i, '');
+  return /^(?:[0-9a-fA-F]{128}|04[0-9a-fA-F]{128}|0[23][0-9a-fA-F]{64})$/.test(key);
+}
+
 function addressPlaceholder() {
-  const family = selectedNetwork().family;
-  return family === 'bitcoin' ? 'bc1q…' : family === 'tron' ? 'T…' : '0x…';
+  const network = selectedNetwork();
+  if (selectedNetworkId === 'bitcoinTaproot') return 'bc1p…';
+  if (network.family === 'bitcoin') return network.format === 'p2wpkh' ? 'bc1q…' : network.format === 'p2sh-p2wpkh' ? '3…' : '1…';
+  if (network.family === 'bnbBeacon') return 'bnb1…';
+  return network.family === 'tron' ? 'T…' : '0x…';
+}
+
+function addressCaption(network = selectedNetwork()) {
+  if (network.family === 'bitcoin') {
+    return ({ p2wpkh: 'BIP-84 · HASH160 · Bech32', p2pkh: 'BIP-44 · HASH160 · Base58Check', 'p2sh-p2wpkh': 'BIP-49 · nested SegWit · Base58Check', p2tr: 'BIP-86 · TapTweak · Bech32m' })[network.format];
+  }
+  if (network.family === 'bnbBeacon') return 'BIP-44 · HASH160 · Bech32';
+  if (network.family === 'tron') return 'Keccak-256 · Base58Check';
+  return 'Keccak-256 · last 20 bytes · EIP-55';
 }
 
 function addressInputHint() {
-  const family = selectedNetwork().family;
-  if (family === 'bitcoin') return 'Bitcoin mainnet native-SegWit P2WPKH only (bc1q…).';
-  if (family === 'tron') return 'TRON mainnet Base58Check address (usually starts with T).';
-  return '20-byte 0x-prefixed address; mixed-case Ethereum/BNB input must pass EIP-55.';
+  const network = selectedNetwork();
+  if (network.family === 'bitcoin') {
+    if (network.format === 'p2wpkh') return 'Bitcoin mainnet P2WPKH native SegWit (bc1q…), Bech32 v0.';
+    if (network.format === 'p2tr') return 'Bitcoin mainnet P2TR Taproot (bc1p…), BIP-86 and Bech32m v1.';
+    if (network.format === 'p2sh-p2wpkh') return 'Bitcoin mainnet P2SH-wrapped P2WPKH (3…), BIP-49 Base58Check.';
+    return 'Bitcoin mainnet P2PKH legacy address (1…), BIP-44 Base58Check.';
+  }
+  if (network.family === 'bnbBeacon') return 'BNB Beacon Chain Bech32 address with bnb human-readable prefix.';
+  if (network.family === 'tron') return 'TRON mainnet Base58Check address (usually starts with T).';
+  return 'Paste a 20-byte 0x address, or a 33/64/65-byte secp256k1 public key to calculate its full Keccak-256 digest. Mixed-case addresses must pass EIP-55.';
 }
 
 function networkAddressDetails(parsed, network) {
   if (network.family === 'bitcoin') {
-    const scriptPubKey = new Uint8Array([0x00, 0x14, ...parsed.bytes]);
-    return `<p>Witness version: <b>0</b> · HRP: <b>bc</b> · checksum: Bech32</p><p>Witness program / HASH160: <code>${hex(parsed.bytes)}</code></p><p>P2WPKH scriptPubKey: <code>${hex(scriptPubKey)}</code></p>`;
+    if (network.format === 'p2wpkh') {
+      const scriptPubKey = new Uint8Array([0x00, 0x14, ...parsed.bytes]);
+      return `<p>Witness version: <b>0</b> · HRP: <b>bc</b> · Bech32 v0</p><p>HASH160 witness program: <code>${hex(parsed.bytes)}</code></p><p>P2WPKH scriptPubKey: <code>${hex(scriptPubKey)}</code></p>`;
+    }
+    if (network.format === 'p2tr') return `<p>Witness version: <b>1</b> · HRP: <b>bc</b> · Bech32m</p><p>Taproot output-key program: <code>${hex(parsed.bytes)}</code></p>`;
+    return network.format === 'p2pkh'
+      ? `<p>P2PKH payload (version 00 || HASH160): <code>${hex(parsed.payload)}</code></p><p>Base58Check checksum: <code>${hex(parsed.checksum)}</code> · verified</p>`
+      : `<p>P2SH script hash: <code>${hex(parsed.bytes)}</code></p><p>P2SH payload (version 05 || script hash): <code>${hex(parsed.payload)}</code></p><p>Base58Check checksum: <code>${hex(parsed.checksum)}</code> · verified</p><p>The address alone does not reveal the redeem script; a candidate's script is derived from its public key.</p>`;
   }
-  if (network.family === 'tron') {
-    return `<p>Version + address payload: <code>${hex(parsed.payload)}</code></p><p>Base58Check checksum: <code>${hex(parsed.checksum)}</code> · verified</p>`;
-  }
-  return `<p>EIP-55 Keccak hash: <code>${hex(parsed.checksumHash)}</code></p>`;
+  if (network.family === 'bnbBeacon') return `<p>HASH160(compressed public key): <code>${hex(parsed.bytes)}</code></p><p>Bech32 HRP: <b>bnb</b> · checksum verified</p>`;
+  if (network.family === 'tron') return `<p>Version + address payload: <code>${hex(parsed.payload)}</code></p><p>Base58Check checksum: <code>${hex(parsed.checksum)}</code> · verified</p>`;
+  if (parsed.inputKind === 'publicKey') return `<p>EIP-55 checksum hash of lowercase address text:</p><div class="hash-byte-grid output-byte-grid">${byteGrid(parsed.checksumHash, parsed.checksumHash.length)}</div>`;
+  return `<p>EIP-55 checksum hash: Keccak-256 of the lowercase address text (40 hex characters) · full 32-byte digest:</p><div class="hash-byte-grid output-byte-grid">${byteGrid(parsed.checksumHash, parsed.checksumHash.length)}</div><p>This EIP-55 digest is for address-letter casing. It is not the Keccak digest of the public key used to create the address; that original digest cannot be recovered from the 20-byte address alone.</p>`;
 }
 
 function binary(bytes) {
@@ -107,6 +154,75 @@ function checksumAddress(lowerHex, checksumDigest) {
     return character;
   }).join('');
   return `0x${checksummed}`;
+}
+
+const SECP256K1_ORDER = BigInt('0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141');
+
+function concatBytes(...parts) {
+  const output = new Uint8Array(parts.reduce((all, part) => all + part.length, 0));
+  let offset = 0;
+  for (const part of parts) {
+    output.set(part, offset);
+    offset += part.length;
+  }
+  return output;
+}
+
+function bytesToBigInt(bytes) {
+  return BigInt(`0x${hex(bytes)}`);
+}
+
+function bigIntToBytes(value) {
+  const bytes = new Uint8Array(32);
+  let number = value;
+  for (let index = 31; index >= 0; index -= 1) {
+    bytes[index] = Number(number & 0xffn);
+    number >>= 8n;
+  }
+  return bytes;
+}
+
+function hash160(bytes) {
+  return ripemd160(sha256(bytes));
+}
+
+function base58Check(versionedPayload) {
+  const checksum = sha256(sha256(versionedPayload)).slice(0, 4);
+  const bytes = concatBytes(versionedPayload, checksum);
+  return { address: base58.encode(bytes), payload: versionedPayload, checksum, bytes };
+}
+
+function taggedHash(tag, message) {
+  const tagHash = sha256(new TextEncoder().encode(tag));
+  return sha256(concatBytes(tagHash, tagHash, message));
+}
+
+function taprootDetails(privateKey) {
+  const scalar = bytesToBigInt(privateKey);
+  const publicKey = secp256k1.getPublicKey(privateKey, false);
+  const yIsOdd = (publicKey[64] & 1) === 1;
+  const evenScalar = yIsOdd ? SECP256K1_ORDER - scalar : scalar;
+  const internalPrivateKey = bigIntToBytes(evenScalar);
+  const internalPublicKey = secp256k1.getPublicKey(internalPrivateKey, true);
+  const internalX = internalPublicKey.slice(1);
+  const tweakHash = taggedHash('TapTweak', internalX);
+  const tweak = bytesToBigInt(tweakHash);
+  if (tweak >= SECP256K1_ORDER) throw new Error('Invalid BIP-341 TapTweak scalar');
+  const outputScalar = (evenScalar + tweak) % SECP256K1_ORDER;
+  if (outputScalar === 0n) throw new Error('Invalid BIP-341 tweaked private scalar');
+  const outputPrivateKey = bigIntToBytes(outputScalar);
+  const outputPublicKey = secp256k1.getPublicKey(outputPrivateKey, true);
+  const outputX = outputPublicKey.slice(1);
+  return {
+    internalX,
+    internalPrivateKey,
+    tweakHash,
+    tweak: bigIntToBytes(tweak),
+    outputPrivateKey,
+    outputPublicKey,
+    outputX,
+    address: bech32m.encode('bc', [1, ...bech32m.toWords(outputX)]),
+  };
 }
 
 async function copyToClipboard(value) {
@@ -145,10 +261,26 @@ function copyValue(key) {
     compressedPublicKey: () => hex(wallet.compressedPublicKey),
     publicBody: () => hex(wallet.publicKey?.slice(1)),
     tronPayload: () => hex(wallet.tronPayload),
+    tronShaFirst: () => hex(wallet.tronShaFirst),
+    tronShaSecond: () => hex(wallet.tronShaSecond),
+    tronChecksum: () => hex(wallet.tronChecksum),
+    tronBase58Bytes: () => hex(wallet.tronBase58Bytes),
     btcHash160: () => hex(wallet.btcHash160),
+    btcSha256: () => hex(wallet.btcSha256),
+    btcPayload: () => hex(wallet.btcPayload),
+    btcChecksum: () => hex(wallet.btcChecksum),
+    btcRedeemScript: () => hex(wallet.btcRedeemScript),
+    btcScriptHash: () => hex(wallet.btcScriptHash),
+    taprootInternalX: () => hex(wallet.taprootData?.internalX),
+    taprootTweakHash: () => hex(wallet.taprootData?.tweakHash),
+    taprootTweak: () => hex(wallet.taprootData?.tweak),
+    taprootOutputX: () => hex(wallet.taprootData?.outputX),
+    taprootOutputPrivateKey: () => hex(wallet.taprootData?.outputPrivateKey),
     keccak: () => hex(wallet.keccakHash),
     addressBytes: () => hex(wallet.addressBytes),
     eip55Hash: () => hex(wallet.eip55Hash),
+    searchPublicKey: () => hex(discreteLogResult?.parsed?.publicKey),
+    searchKeyDigest: () => hex(discreteLogResult?.parsed?.keyKeccakHash),
     address: () => wallet.address,
   };
   return values[key]?.() ?? '';
@@ -171,6 +303,13 @@ function stepCard({ number, title, caption, step, body, action }) {
     ${unlocked ? body : '<p class="locked-note">Complete the previous step to reveal this calculation.</p>'}
     ${action && wallet.stage === step - 1 ? `<div class="step-action"><button class="action-button" data-run-step="${step}">${action}<span aria-hidden="true">↗</span></button></div>` : ''}
   </section>`;
+}
+
+function searchResultMarkup(result, network, searchLimitReached) {
+  if (!result) return '<p class="dlog-placeholder">Enter an address or public key and run the appropriate local calculation.</p>';
+  if (result.status === 'invalid') return `<div class="dlog-warning result-error"><strong>Invalid ${network.label} input.</strong> ${escapeHtml(result.reason)}</div>`;
+  if (result.status === 'publicKey') return `<div class="dlog-results"><div><label>INPUT · VALIDATED SECP256K1 PUBLIC KEY</label><code class="dlog-address-value">${hex(result.parsed.publicKey)}</code>${copyButton('searchPublicKey', 'Copy public key')}<p>Point validation succeeded. The app uses only this public key; it does not need or derive the private key.</p></div><div><label>FULL ADDRESS-GENERATION DIGEST · 32 BYTES</label><p>Keccak-256(public key body X || Y):</p><div class="hash-byte-grid output-byte-grid">${byteGrid(result.parsed.keyKeccakHash, result.parsed.keyKeccakHash.length)}</div>${copyButton('searchKeyDigest', 'Copy 32-byte digest')}<p>The final 20 bytes are the address payload:</p><code class="dlog-address-value">${hex(result.parsed.bytes)}</code></div><div><label>DERIVED ETHEREUM ADDRESS</label><code class="dlog-address-value">${result.parsed.display}</code>${networkAddressDetails(result.parsed, network)}<p>No private-scalar search was run; this is the direct public-key-to-address calculation.</p></div></div>`;
+  return `<div class="dlog-results"><div><label>INPUT · ${network.shortLabel} ADDRESS BYTES</label><code class="dlog-address-value">${escapeHtml(result.parsed.display)}</code><div class="hash-byte-grid address-byte-grid">${byteGrid(result.parsed.bytes)}</div>${networkAddressDetails(result.parsed, network)}</div><div><label>SEARCH · REAL SECP256K1 CANDIDATES</label><p>${result.foundScalar ? `Match found at private scalar d=${result.foundScalar}; this candidate reproduces the entered address.` : `No match in scalars ${result.startScalar}–${result.lastScalar}; ${result.totalTested.toLocaleString()} candidates tested in total.`}</p><p>A miss excludes only the tested interval. Scalars outside it remain untested; request another batch to continue the next range.</p><div class="search-progress"><span style="width:100%"></span></div><p>Latest batch: ${result.trials}/${result.trials} candidates · ${result.elapsedMs.toFixed(2)} ms · ${result.candidatesPerSecond.toFixed(0)} candidates/s. Tested through scalar ${result.totalTested.toLocaleString()} of ${SEARCH_SCALAR_LIMIT.toLocaleString()} max.</p><p>Address-preimage work estimate: average ≈2<sup>${result.addressBits}</sup> candidate addresses${result.addressBits === 255 ? ' (Taproot x-only output space).' : ' (20-byte address output).'} At the latest measured rate, roughly 10<sup>${result.log10ExpectedYears.toFixed(1)}</sup> years. Extrapolation only—not practical private-key recovery or a full secp256k1 attack.</p>${result.foundPublicKey ? `<p>Matched public key: <code class="dlog-address-value">${result.foundPublicKey}</code></p>` : '<p>The target public key was not found in this bounded interval.</p>'}${searchLimitReached ? '<p><strong>The app’s maximum scalar bound has been reached; no further candidates will be tested.</strong></p>' : ''}</div><div><label>THIS BATCH · BOUNDARY CANDIDATES</label><p>d=${result.startScalar} → <code>${result.firstCandidateAddress}</code></p><p>d=${result.lastScalar} → <code>${result.lastCandidateAddress}</code></p><p>These are real addresses computed under ${network.label} rules.</p></div></div>`;
 }
 
 function render() {
@@ -218,27 +357,68 @@ function render() {
     <div class="path-node-list">${wallet.pathNodes.map((entry) => `<details class="path-node"><summary><span>${entry.fullPath}</span><small>${entry.hardened ? 'HARDENED' : 'NORMAL'} · index 0x${entry.childIndex.toString(16).padStart(8, '0')}</small></summary><div class="value-row"><div><label>Child private key</label><code>${spacedHex(entry.node.privateKey)}</code></div></div><div class="value-row"><div><label>Child chain code</label><code>${spacedHex(entry.node.chainCode)}</code></div></div><div class="value-row"><div><label>Child compressed public key</label><code>${spacedHex(entry.node.publicKey)}</code></div></div></details>`).join('')}</div>
     <div class="value-row"><div><label>Final ${activeNetwork.label} account private key</label><code>${spacedHex(wallet.account.privateKey)}</code></div>${copyButton('accountPrivate')}</div>
     <div class="value-row"><div><label>Uncompressed secp256k1 public key · 65 bytes</label><code>${spacedHex(wallet.publicKey)}</code></div>${copyButton('publicKey')}</div>
-    ${activeNetwork.family === 'bitcoin' ? `<div class="value-row"><div><label>Compressed public key · 33 bytes (used for P2WPKH)</label><code>${spacedHex(wallet.compressedPublicKey)}</code></div>${copyButton('compressedPublicKey')}</div>` : ''}` : `<p class="locked-note">Derive the ${activeNetwork.label} account at <code>${activeNetwork.path}</code>, then compute its secp256k1 public key.</p>`;
+    ${activeNetwork.family === 'bitcoin' || activeNetwork.family === 'bnbBeacon' ? `<div class="value-row"><div><label>Compressed public key · 33 bytes (used by ${activeNetwork.label})</label><code>${spacedHex(wallet.compressedPublicKey)}</code></div>${copyButton('compressedPublicKey')}</div>` : ''}` : `<p class="locked-note">Derive the ${activeNetwork.label} account at <code>${activeNetwork.path}</code>, then compute its secp256k1 public key.</p>`;
 
   let addressBody;
   if (wallet.stage < 5) {
     addressBody = `<p class="locked-note">Derive the public key, then apply the ${activeNetwork.label} address encoding.</p>`;
-  } else if (activeNetwork.family === 'bitcoin') {
+  } else if (activeNetwork.family === 'bitcoin' && activeNetwork.format === 'p2wpkh') {
     addressBody = `
-      <p class="step-explanation">Bitcoin native SegWit P2WPKH uses the compressed secp256k1 public key. SHA-256 then RIPEMD-160 produces a 20-byte witness program. Bech32 encodes witness version 0, that program, and the mainnet human-readable prefix <code>bc</code>.</p>
+      <p class="step-explanation">Bitcoin native SegWit P2WPKH uses the compressed secp256k1 public key. SHA-256 then RIPEMD-160 produces a 20-byte witness program. Bech32 encodes witness version 0 and the mainnet HRP <code>bc</code>.</p>
       <div class="hash-block"><div class="hash-block-heading"><label>INPUT · COMPRESSED PUBLIC KEY · 33 BYTES</label>${copyButton('compressedPublicKey', 'Copy key')}</div><div class="hash-byte-grid">${byteGrid(wallet.compressedPublicKey)}</div></div>
-      <div class="hash-params"><span>HASH STEP 1 <b>SHA-256</b></span><span>HASH STEP 2 <b>RIPEMD-160</b></span><span>WITNESS <b>v0 · 20 bytes</b></span><span>ENCODING <b>BECH32</b></span></div>
-      <div class="value-row"><div><label>HASH160 witness program · 20 bytes</label><code>${spacedHex(wallet.btcHash160)}</code></div>${copyButton('addressBytes', 'Copy program')}</div>
+      <div class="value-row"><div><label>SHA-256(compressed public key)</label><code>${spacedHex(wallet.btcSha256)}</code></div></div>
+      <div class="value-row"><div><label>HASH160 · RIPEMD-160(SHA-256) · 20 bytes</label><code>${spacedHex(wallet.btcHash160)}</code></div>${copyButton('addressBytes', 'Copy program')}</div>
+      <div class="hash-params"><span>WITNESS <b>version 0</b></span><span>HRP <b>bc</b></span><span>CHECKSUM <b>Bech32</b></span></div>
       <div class="hash-byte-grid address-byte-grid">${byteGrid(wallet.btcHash160)}</div>
       <div class="address-output"><div><span class="mini-label">BITCOIN · NATIVE SEGWIT P2WPKH</span><strong>${wallet.address}</strong></div>${copyButton('address', 'Copy address')}</div>`;
+  } else if (activeNetwork.family === 'bitcoin' && activeNetwork.format === 'p2pkh') {
+    addressBody = `
+      <p class="step-explanation">Legacy Bitcoin P2PKH hashes the compressed public key with HASH160, prepends mainnet version byte <code>00</code>, appends a 4-byte double-SHA-256 checksum, then Base58Check encodes the 25 bytes.</p>
+      <div class="value-row"><div><label>Compressed public key · 33 bytes</label><code>${spacedHex(wallet.compressedPublicKey)}</code></div>${copyButton('compressedPublicKey')}</div>
+      <div class="value-row"><div><label>SHA-256(compressed public key)</label><code>${spacedHex(wallet.btcSha256)}</code></div></div>
+      <div class="value-row"><div><label>HASH160 · 20 bytes</label><code>${spacedHex(wallet.btcHash160)}</code></div></div>
+      <div class="value-row"><div><label>Payload · version 00 || HASH160 · 21 bytes</label><code>${spacedHex(wallet.btcPayload)}</code></div></div>
+      <div class="value-row"><div><label>Base58Check checksum · 4 bytes</label><code>${spacedHex(wallet.btcChecksum)}</code></div></div>
+      <div class="address-output"><div><span class="mini-label">BITCOIN · LEGACY P2PKH</span><strong>${wallet.address}</strong></div>${copyButton('address', 'Copy address')}</div>`;
+  } else if (activeNetwork.family === 'bitcoin' && activeNetwork.format === 'p2sh-p2wpkh') {
+    addressBody = `
+      <p class="step-explanation">Nested SegWit P2SH-P2WPKH creates redeem script <code>0014 || HASH160(compressed pubkey)</code>, then hashes that script with HASH160. Version <code>05</code> and a double-SHA-256 checksum are Base58Check encoded.</p>
+      <div class="value-row"><div><label>Compressed public key · 33 bytes</label><code>${spacedHex(wallet.compressedPublicKey)}</code></div>${copyButton('compressedPublicKey')}</div>
+      <div class="value-row"><div><label>HASH160(compressed public key)</label><code>${spacedHex(wallet.btcHash160)}</code></div></div>
+      <div class="value-row"><div><label>Redeem script · 00 14 || witness program · 22 bytes</label><code>${spacedHex(wallet.btcRedeemScript)}</code></div></div>
+      <div class="value-row"><div><label>HASH160(redeem script)</label><code>${spacedHex(wallet.btcScriptHash)}</code></div></div>
+      <div class="value-row"><div><label>P2SH payload · version 05 || script hash · 21 bytes</label><code>${spacedHex(wallet.btcPayload)}</code></div></div>
+      <div class="value-row"><div><label>Base58Check checksum · 4 bytes</label><code>${spacedHex(wallet.btcChecksum)}</code></div></div>
+      <div class="address-output"><div><span class="mini-label">BITCOIN · NESTED SEGWIT P2SH-P2WPKH</span><strong>${wallet.address}</strong></div>${copyButton('address', 'Copy address')}</div>`;
+  } else if (activeNetwork.family === 'bitcoin' && activeNetwork.format === 'p2tr') {
+    addressBody = `
+      <p class="step-explanation">BIP-86 Taproot normalizes the x-only internal point to even Y, applies tagged <code>TapTweak</code>, adds tweak·G, then encodes the x-only output key as witness v1 with Bech32m.</p>
+      <div class="value-row"><div><label>Internal x-only public key · 32 bytes</label><code>${spacedHex(wallet.taprootData.internalX)}</code></div></div>
+      <div class="value-row"><div><label>TaggedHash(TapTweak, internal key)</label><code>${spacedHex(wallet.taprootData.tweakHash)}</code></div></div>
+      <div class="value-row"><div><label>TapTweak scalar</label><code>${spacedHex(wallet.taprootData.tweak)}</code></div></div>
+      <div class="value-row"><div><label>Tweaked output public key · compressed</label><code>${spacedHex(wallet.taprootData.outputPublicKey)}</code></div></div>
+      <div class="value-row"><div><label>Witness v1 program · x-only output key · 32 bytes</label><code>${spacedHex(wallet.taprootData.outputX)}</code></div></div>
+      <p class="step-explanation subtle">BIP-86 tweaked private scalar (sensitive; keep private): <code>${hex(wallet.taprootData.outputPrivateKey)}</code></p>
+      <div class="address-output"><div><span class="mini-label">BITCOIN · TAPROOT P2TR · BECH32M</span><strong>${wallet.address}</strong></div>${copyButton('address', 'Copy address')}</div>`;
   } else if (activeNetwork.family === 'tron') {
     addressBody = `
       <p class="step-explanation">TRON uses the uncompressed public key body (X || Y), Keccak-256, and the final 20 digest bytes. It prepends mainnet version byte <code>41</code>, appends the first 4 bytes of double-SHA-256 as a Base58Check checksum, then encodes the 25-byte result in Base58.</p>
       <div class="hash-block"><div class="hash-block-heading"><label>INPUT · PUBLIC KEY BODY · 64 BYTES</label>${copyButton('publicBody', 'Copy input')}</div><div class="hash-byte-grid input-byte-grid">${byteGrid(wallet.publicKey.slice(1))}</div></div>
       <div class="hash-block"><div class="hash-block-heading"><label>KECCAK-256 · FULL DIGEST · 32 BYTES</label></div><div class="hash-byte-grid output-byte-grid">${byteGrid(wallet.keccakHash, 12)}</div></div>
-      <div class="value-row"><div><label>Address payload · 0x41 || last 20 digest bytes · 21 bytes</label><code>${spacedHex(wallet.tronPayload)}</code></div>${copyButton('tronPayload')}</div>
-      <div class="value-row"><div><label>Checksum · first 4 bytes of SHA256(SHA256(payload))</label><code>${spacedHex(wallet.tronChecksum)}</code></div></div>
+      <div class="value-row"><div><label>Address payload · version 0x41 || 20 address bytes · 21 bytes</label><code>${spacedHex(wallet.tronPayload)}</code></div>${copyButton('tronPayload')}</div>
+      <div class="value-row"><div><label>SHA-256(payload) · 32 bytes</label><code>${spacedHex(wallet.tronShaFirst)}</code></div>${copyButton('tronShaFirst')}</div>
+      <div class="value-row"><div><label>SHA-256(previous digest) · 32 bytes</label><code>${spacedHex(wallet.tronShaSecond)}</code></div>${copyButton('tronShaSecond')}</div>
+      <div class="value-row"><div><label>Checksum · first 4 bytes of second SHA-256</label><code>${spacedHex(wallet.tronChecksum)}</code></div>${copyButton('tronChecksum')}</div>
+      <div class="value-row"><div><label>Base58Check input · payload || checksum · 25 bytes</label><code>${spacedHex(wallet.tronBase58Bytes)}</code></div>${copyButton('tronBase58Bytes')}</div>
       <div class="address-output"><div><span class="mini-label">TRON MAINNET · BASE58CHECK</span><strong>${wallet.address}</strong></div>${copyButton('address', 'Copy address')}</div>`;
+  } else if (activeNetwork.family === 'bnbBeacon') {
+    addressBody = `
+      <p class="step-explanation">BNB Beacon Chain (legacy BEP2, historical/reference profile) uses path <code>${activeNetwork.path}</code>. It hashes the compressed secp256k1 public key with SHA-256 then RIPEMD-160, and Bech32-encodes the 20-byte result with HRP <code>bnb</code>. This differs from EVM-compatible BNB Smart Chain.</p>
+      <div class="value-row"><div><label>Compressed secp256k1 public key · 33 bytes</label><code>${spacedHex(wallet.compressedPublicKey)}</code></div>${copyButton('compressedPublicKey')}</div>
+      <div class="value-row"><div><label>SHA-256(compressed public key)</label><code>${spacedHex(wallet.btcSha256)}</code></div></div>
+      <div class="value-row"><div><label>RIPEMD-160 · 20-byte address payload</label><code>${spacedHex(wallet.btcHash160)}</code></div>${copyButton('addressBytes', 'Copy payload')}</div>
+      <div class="hash-params"><span>HRP <b>bnb</b></span><span>ENCODING <b>Bech32</b></span><span>PAYLOAD <b>20 bytes</b></span></div>
+      <div class="address-output"><div><span class="mini-label">BNB BEACON CHAIN · BECH32</span><strong>${wallet.address}</strong></div>${copyButton('address', 'Copy address')}</div>`;
   } else {
     addressBody = `
       <p class="step-explanation">${activeNetwork.family === 'evm' && selectedNetworkId === 'bnb' ? 'BNB Smart Chain is EVM-compatible: it uses the same secp256k1 public key, Keccak-256 address construction, and BIP-44 coin type 60 as Ethereum. The address is identical on both networks; the chain selection tells you which network to use.' : 'Ethereum derives its address from the uncompressed public-key body (X || Y): Keccak-256, then the final 20 digest bytes, followed by EIP-55 display casing.'}</p>
@@ -258,7 +438,7 @@ function render() {
       <p class="backward-intro">Read from your generated address back toward entropy. The forward outputs are visible above; these rows show what each output still tells you about its input.</p>
       <div class="carry-strip"><span><b>Carried forward</b> deterministic relationships, checksums, and the chosen derivation path</span><span><b>Changed at each step</b> representation, key material, and finally a shortened hash</span></div>
       <div class="reverse-list">
-        <article class="reverse-row blocked"><div class="reverse-step">06</div><div class="reverse-content"><div class="reverse-title"><strong>Address ← public key</strong><span class="recovery-tag no">NOT REVERSIBLE</span></div><div class="reverse-live"><label>Live address</label><code>${wallet.address}</code></div><p>${activeNetwork.family === 'bitcoin' ? 'Bitcoin hashes the compressed public key with HASH160 and encodes the witness program using Bech32; there is no inverse to recover the public key.' : activeNetwork.family === 'tron' ? 'TRON Keccak-hashes the public-key body, keeps 20 bytes, then adds a version and Base58Check checksum; this does not reveal the key.' : 'Keccak-256 hashes the public-key body and the address keeps only 20 digest bytes. There is no inverse formula to recover the public key from this value.'}</p></div></article>
+        <article class="reverse-row blocked"><div class="reverse-step">06</div><div class="reverse-content"><div class="reverse-title"><strong>Address ← public key</strong><span class="recovery-tag no">NOT REVERSIBLE</span></div><div class="reverse-live"><label>Live address</label><code>${wallet.address}</code></div><p>${activeNetwork.family === 'bitcoin' ? (activeNetwork.format === 'p2wpkh' ? 'Bitcoin hashes the compressed public key with HASH160 and encodes the witness program using Bech32; there is no inverse to recover the public key.' : activeNetwork.format === 'p2pkh' ? 'Bitcoin Legacy hashes the compressed public key with HASH160, then adds Base58Check version and checksum; this does not reveal the public key.' : activeNetwork.format === 'p2sh-p2wpkh' ? 'Nested SegWit hashes a redeem script containing the witness program with HASH160 and Base58Check; the address alone reveals neither the script nor public key.' : 'Taproot encodes a tweaked x-only output key; the address does not reveal the internal key or private scalar.') : activeNetwork.family === 'bnbBeacon' ? 'BNB Beacon hashes the compressed public key with HASH160 and encodes it with Bech32; there is no inverse to recover the key.' : activeNetwork.family === 'tron' ? 'TRON Keccak-hashes the public-key body, keeps 20 bytes, then adds a version and Base58Check checksum; this does not reveal the key.' : 'Keccak-256 hashes the public-key body and the address keeps only 20 digest bytes. There is no inverse formula to recover the public key from this value.'}</p></div></article>
         <article class="reverse-row blocked"><div class="reverse-step">05</div><div class="reverse-content"><div class="reverse-title"><strong>Public key ← private key</strong><span class="recovery-tag no">NOT PRACTICAL</span></div><div class="reverse-live"><label>Live public key</label><code>${shortHex(wallet.publicKey, 18, 12)}</code></div><p>The public key is <code>Q = d × G</code> on secp256k1. Finding <code>d</code> from <code>Q</code> requires solving the elliptic-curve discrete-log problem.</p></div></article>
         <article class="reverse-row blocked"><div class="reverse-step">04</div><div class="reverse-content"><div class="reverse-title"><strong>Child key ← master node + path</strong><span class="recovery-tag no">PATH MATTERS</span></div><div class="reverse-live"><label>Path used</label><code>${activeNetwork.path}</code><label class="second-live-label">Live child key</label><code>${shortHex(wallet.account.privateKey, 18, 12)}</code></div><p>BIP-32 derives a child using HMAC-SHA512 and the selected path. The address does not encode that path. A child key alone lacks the parent chain code; hardened levels (${pathSegments.filter((segment) => segment.endsWith("'")).map((segment) => segment.replace("'", '′')).join(', ')}) also block deriving ancestors.</p></div></article>
         <article class="reverse-row blocked"><div class="reverse-step">03</div><div class="reverse-content"><div class="reverse-title"><strong>Master node ← BIP-39 seed</strong><span class="recovery-tag no">NOT PRACTICAL</span></div><div class="reverse-live"><label>Master private · IL</label><code>${shortHex(wallet.master.privateKey, 18, 12)}</code><label class="second-live-label">Master chain code · IR</label><code>${shortHex(wallet.master.chainCode, 18, 12)}</code></div><p>BIP-32 creates these with HMAC-SHA512 using the key <code>Bitcoin seed</code>. The master node is derived from the seed; it does not contain a reversible copy of it.</p></div></article>
@@ -267,15 +447,34 @@ function render() {
       </div>
       <div class="takeaway"><strong>Why address → phrase search is not practical</strong><span>With no phrase words known, a search must try up to 2<sup>128</sup> valid mnemonics (and know the passphrase and derivation path), derive each address, then compare. This is not a useful workload for the $85 EC2 budget.</span></div>
     </section>` : '';
+  const previousSearchMatchesInput = discreteLogResult?.status === 'valid'
+    && discreteLogResult.networkId === selectedNetworkId
+    && discreteLogResult.addressInput === (labAddressInput ?? wallet.address);
+  const nextSearchScalar = previousSearchMatchesInput && !discreteLogResult.foundScalar ? discreteLogResult.lastScalar + 1 : 1;
+  const canContinueSearch = previousSearchMatchesInput && !discreteLogResult.foundScalar && nextSearchScalar <= SEARCH_SCALAR_LIMIT;
+  const searchLimitReached = previousSearchMatchesInput && !discreteLogResult.foundScalar && discreteLogResult.lastScalar >= SEARCH_SCALAR_LIMIT;
+  const nextSearchEnd = Math.min(nextSearchScalar + SEARCH_BATCH_SIZE - 1, SEARCH_SCALAR_LIMIT);
+  const publicKeyInputEntered = activeNetwork.family === 'evm' && looksLikeEvmPublicKey(labAddressInput ?? '');
+  const searchButtonLabel = discreteLogProgress
+    ? autoSearchEnabled ? 'Automatic search running…' : discreteLogProgress.auto ? 'Stopping after current block…' : 'Search running…'
+    : publicKeyInputEntered
+      ? 'Calculate full Keccak-256 from public key'
+      : canContinueSearch
+      ? `Search next batch · ${nextSearchScalar}–${nextSearchEnd}`
+      : searchLimitReached
+        ? 'Maximum bounded range reached'
+        : discreteLogResult?.foundScalar
+          ? 'Start again from scalar 1'
+          : `Run ${SEARCH_BATCH_SIZE}-candidate ${activeNetwork.shortLabel} search`;
   const discreteLogLab = wallet.stage >= 5 ? `
     <section class="backward-panel dlog-panel">
-      <div class="backward-heading"><div><span class="eyebrow">ADDRESS SEARCH · LOCAL ONLY</span><h3>Test a ${activeNetwork.label} address</h3></div><span class="live-example">256 CANDIDATES MAX</span></div>
-      <p class="backward-intro">Enter any address for the selected network. The lab generates actual secp256k1 public keys for scalars 1–256, derives each address using this network’s format, and compares them.</p>
-      <div class="dlog-address-control"><label for="lab-address">${activeNetwork.label} address</label><input id="lab-address" type="text" spellcheck="false" autocomplete="off" placeholder="${addressPlaceholder()}" value="${escapeHtml(labAddressInput ?? wallet.address)}"><small>${addressInputHint()}</small></div>
-      <div class="dlog-warning"><strong>This is a real but tiny bounded search—not a full secp256k1 break.</strong> An address does not reveal its public key or private key; only scalars 1–256 are tested. Everything runs in this browser.</div>
-      <button class="action-button dlog-button" id="run-dlog-lab" type="button">${discreteLogResult ? 'Search this address again' : `Run 256-candidate ${activeNetwork.shortLabel} search`}<span aria-hidden="true">↗</span></button>
-      ${discreteLogResult ? discreteLogResult.status === 'invalid' ? `<div class="dlog-warning result-error"><strong>Invalid ${activeNetwork.label} address.</strong> ${escapeHtml(discreteLogResult.reason)}</div>` : `<div class="dlog-results"><div><label>INPUT · ${activeNetwork.shortLabel} ADDRESS BYTES</label><code class="dlog-address-value">${escapeHtml(discreteLogResult.parsed.display)}</code><div class="hash-byte-grid address-byte-grid">${byteGrid(discreteLogResult.parsed.bytes)}</div>${networkAddressDetails(discreteLogResult.parsed, activeNetwork)}</div><div><label>SEARCH · REAL SECP256K1 CANDIDATES</label><p>${discreteLogResult.foundScalar ? `Match found at private scalar d=${discreteLogResult.foundScalar}; this candidate reproduces the entered address.` : `No match in scalars 1–${discreteLogResult.trials}, after ${discreteLogResult.trials} public-key/address derivations.`}</p><p>Only the tested interval is ruled out. The other valid private scalars were not searched.</p>${discreteLogResult.foundPublicKey ? `<p>Matched public key: <code class="dlog-address-value">${discreteLogResult.foundPublicKey}</code></p>` : '<p>The target public key cannot be recovered from this address alone.</p>'}</div><div><label>BOUNDARY CANDIDATES</label><p>d=1 → <code>${discreteLogResult.firstCandidateAddress}</code></p><p>d=${discreteLogResult.trials} → <code>${discreteLogResult.lastCandidateAddress}</code></p><p>These are real addresses computed under ${activeNetwork.label} rules.</p></div></div>` : '<p class="dlog-placeholder">Enter an address and run the bounded real-curve candidate test.</p>'}
-      <p class="step-explanation subtle">For each candidate d, compute Q=dG on secp256k1, apply the selected network’s public-key/address encoding, then compare. A miss means only “not found in 1–256”—not “key impossible” or “curve broken.”</p>
+      <div class="backward-heading"><div><span class="eyebrow">ADDRESS SEARCH · LOCAL ONLY</span><h3>Inspect a ${activeNetwork.label} address or public key</h3></div><span class="live-example">${SEARCH_BATCH_SIZE} PER BATCH · ${SEARCH_SCALAR_LIMIT.toLocaleString()} TOTAL CAP</span></div>
+      <p class="backward-intro">Enter an address to test consecutive bounded scalar batches, or paste a public key to calculate its full address-generation Keccak-256 digest directly. Public-key input does not run a scalar search. Address batches remain capped at 1–${SEARCH_SCALAR_LIMIT.toLocaleString()}.</p>
+      <div class="dlog-address-control"><label for="lab-address">${activeNetwork.label} address or public key</label><input id="lab-address" type="text" spellcheck="false" autocomplete="off" placeholder="${addressPlaceholder()}" value="${escapeHtml(labAddressInput ?? wallet.address)}" ${discreteLogProgress ? 'disabled' : ''}><small>${addressInputHint()}</small></div>
+      <div class="dlog-warning"><strong>This is a bounded address search—not a full secp256k1 break.</strong> An address alone does not reveal its public key or private key. If you provide a public key, the app can compute its address digest, but cannot derive the private key. Address search runs in batches of ${SEARCH_BATCH_SIZE} and cannot test beyond scalar ${SEARCH_SCALAR_LIMIT.toLocaleString()}. Everything runs in this browser; automatic search requires this tab/device to stay awake and is not an EC2 background job.</div>
+      <div class="dlog-actions"><button class="action-button dlog-button" id="run-dlog-lab" type="button" ${discreteLogProgress || searchLimitReached ? 'disabled' : ''}>${searchButtonLabel}<span aria-hidden="true">↗</span></button><button class="dlog-auto-button" id="run-auto-search" type="button" ${discreteLogProgress || searchLimitReached || publicKeyInputEntered ? 'disabled' : ''}>Auto-search ${canContinueSearch ? `${nextSearchScalar}–${SEARCH_SCALAR_LIMIT.toLocaleString()}` : `1–${SEARCH_SCALAR_LIMIT.toLocaleString()}`}<span aria-hidden="true">↗</span></button></div>
+      ${discreteLogProgress ? `<div class="dlog-live-progress" role="status" aria-live="polite"><b>Testing scalars ${discreteLogProgress.startScalar}–${discreteLogProgress.endScalar}</b><div class="search-progress"><span style="width:${100 * discreteLogProgress.completed / discreteLogProgress.trials}%"></span></div><p>${discreteLogProgress.completed}/${discreteLogProgress.trials} ${discreteLogProgress.auto ? 'in this automatic run' : 'in this batch'} · ${discreteLogProgress.elapsedMs.toFixed(2)} ms elapsed · ${discreteLogProgress.candidatesPerSecond.toFixed(0)} candidates/s measured. Overall tested-through scalar: ${discreteLogProgress.startScalar + discreteLogProgress.completed - 1} of ${SEARCH_SCALAR_LIMIT.toLocaleString()} max.</p>${discreteLogProgress.auto && autoSearchEnabled ? '<button class="dlog-stop-button" id="stop-auto-search" type="button">Stop after this progress block (max 4,096 candidates)</button>' : ''}</div>` : searchResultMarkup(discreteLogResult, activeNetwork, searchLimitReached)}
+      <p class="step-explanation subtle">${publicKeyInputEntered ? 'For a supplied public key, validate the secp256k1 point, compute Keccak-256 of X || Y, and take the final 20 bytes for the Ethereum address. No private key is derived.' : 'For each candidate d, compute Q=dG on secp256k1, apply the selected network’s public-key/address encoding, then compare. A miss rules out only the exact interval tested—not any private scalars beyond it and not the curve.'}</p>
     </section>` : '';
 
   app.innerHTML = `
@@ -285,13 +484,13 @@ function render() {
       <div class="security-banner"><span class="alert-mark">!</span><p><strong>Public HTTP learning demo.</strong> Secret values stay in this browser; HTTP can be intercepted or altered. Never enter real wallet secrets. The optional TXT export is unencrypted and contains the phrase, passphrase, seed, and private keys; it requires confirmation.</p></div>
       <div class="layout-grid">
         <div class="lesson-column">
-          <section class="setup-card"><div class="setup-copy"><span class="eyebrow">START HERE</span><h2>Make a fresh demo wallet</h2><p>Uses browser cryptographic randomness. Nothing is saved or sent to EC2.</p></div><div class="setup-controls"><label for="network-select">Derive an address for</label><select id="network-select">${Object.entries(NETWORKS).map(([id, network]) => `<option value="${id}" ${selectedNetworkId === id ? 'selected' : ''}>${network.label}</option>`).join('')}</select><small class="network-note">BTC: native SegWit · TRON: Base58Check · BNB Smart Chain uses the EVM address format.</small><label for="passphrase">Optional BIP-39 passphrase</label><input id="passphrase" type="password" autocomplete="new-password" placeholder="Leave blank for no passphrase" value="${passphrase.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;')}" ${wallet.stage ? 'disabled' : ''}><small>${wallet.stage ? 'Locked for this derivation; reset to change it.' : 'Case-sensitive. It creates a different wallet.'}</small><button class="action-button generate-button" id="generate">${wallet.stage ? 'Generate another demo wallet' : 'Generate demo wallet'}<span aria-hidden="true">↗</span></button></div></section>
+          <section class="setup-card"><div class="setup-copy"><span class="eyebrow">START HERE</span><h2>Make a fresh demo wallet</h2><p>Uses browser cryptographic randomness. Nothing is saved or sent to EC2.</p></div><div class="setup-controls"><label for="network-select">Derive an address for</label><select id="network-select">${Object.entries(NETWORKS).map(([id, network]) => `<option value="${id}" ${selectedNetworkId === id ? 'selected' : ''}>${network.label}</option>`).join('')}</select><small class="network-note">Includes BTC Legacy, Nested SegWit, Native SegWit and Taproot; TRON; BNB Smart Chain (EVM) and BNB Beacon (BEP2).</small><label for="passphrase">Optional BIP-39 passphrase</label><input id="passphrase" type="password" autocomplete="new-password" placeholder="Leave blank for no passphrase" value="${passphrase.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;')}" ${wallet.stage ? 'disabled' : ''}><small>${wallet.stage ? 'Locked for this derivation; reset to change it.' : 'Case-sensitive. It creates a different wallet.'}</small><button class="action-button generate-button" id="generate">${wallet.stage ? 'Generate another demo wallet' : 'Generate demo wallet'}<span aria-hidden="true">↗</span></button></div></section>
           <div class="steps-heading"><div><span class="eyebrow">THE PIPELINE</span><h2>Five steps, one address</h2></div><div class="steps-actions">${wallet.stage >= 5 ? `<button class="export-button" id="export-txt">Export full TXT</button><button class="reverse-toggle" id="backward-toggle">${backwardOpen ? 'Hide backward trace' : 'Trace backward'}</button>` : ''}${wallet.stage ? '<button class="reset-button" id="reset">Reset session</button>' : ''}</div></div>
           ${stepCard({ number: '01', title: 'Entropy → mnemonic', caption: 'Create randomness and encode twelve words', step: 1, body: entropyBody, action: 'Generate 128-bit entropy & phrase' })}
           ${stepCard({ number: '02', title: 'Mnemonic → seed', caption: 'PBKDF2-HMAC-SHA512 · BIP-39', step: 2, body: seedBody, action: 'Derive 512-bit seed' })}
           ${stepCard({ number: '03', title: 'Seed → master node', caption: 'HMAC-SHA512 · BIP-32', step: 3, body: masterBody, action: 'Create BIP-32 master node' })}
           ${stepCard({ number: '04', title: `Master node → ${activeNetwork.label} keypair`, caption: `${activeNetwork.path.split('/')[1].replaceAll("'", '′')} path · secp256k1`, step: 4, body: accountBody, action: `Derive ${activeNetwork.label} account` })}
-          ${stepCard({ number: '05', title: `${activeNetwork.label} public key → address`, caption: activeNetwork.family === 'bitcoin' ? 'SHA-256 · RIPEMD-160 · Bech32' : activeNetwork.family === 'tron' ? 'Keccak-256 · Base58Check' : 'Keccak-256 · last 20 bytes · EIP-55', step: 5, body: addressBody, action: `Compute ${activeNetwork.label} address` })}
+          ${stepCard({ number: '05', title: `${activeNetwork.label} public key → address`, caption: addressCaption(activeNetwork), step: 5, body: addressBody, action: `Compute ${activeNetwork.label} address` })}
           ${backwardPanel}
           ${discreteLogLab}
         </div>
@@ -315,8 +514,22 @@ function render() {
     render();
   });
   document.querySelector('#export-txt')?.addEventListener('click', exportDerivationTxt);
-  document.querySelector('#run-dlog-lab')?.addEventListener('click', runDiscreteLogLab);
-  document.querySelector('#lab-address')?.addEventListener('input', (event) => { labAddressInput = event.target.value; });
+  document.querySelector('#run-dlog-lab')?.addEventListener('click', () => { autoSearchEnabled = false; runDiscreteLogLab(); });
+  document.querySelector('#run-auto-search')?.addEventListener('click', () => { autoSearchEnabled = true; runDiscreteLogLab(); });
+  document.querySelector('#stop-auto-search')?.addEventListener('click', () => { autoSearchEnabled = false; });
+  document.querySelector('#lab-address')?.addEventListener('input', (event) => {
+    labAddressInput = event.target.value;
+    if (discreteLogResult && labAddressInput.trim() !== discreteLogResult.addressInput) {
+      discreteLogResult = null;
+      document.querySelector('.dlog-results')?.remove();
+      document.querySelector('.dlog-warning.result-error')?.remove();
+    }
+    const button = document.querySelector('#run-dlog-lab');
+    if (button && !discreteLogProgress) {
+      button.disabled = false;
+      button.innerHTML = `${activeNetwork.family === 'evm' && looksLikeEvmPublicKey(labAddressInput) ? 'Calculate full Keccak-256 from public key' : `Run ${SEARCH_BATCH_SIZE}-candidate ${selectedNetwork().shortLabel} search`}<span aria-hidden="true">↗</span>`;
+    }
+  });
   document.querySelectorAll('[data-run-step]').forEach((button) => button.addEventListener('click', () => runStep(Number(button.dataset.runStep))));
   document.querySelectorAll('[data-copy]').forEach((button) => button.addEventListener('click', async () => {
     try {
@@ -330,6 +543,9 @@ function render() {
 }
 
 function selectNetwork(event) {
+  autoSearchEnabled = false;
+  searchRunId += 1;
+  discreteLogProgress = null;
   selectedNetworkId = event.target.value;
   discreteLogResult = null;
   labAddressInput = null;
@@ -342,6 +558,9 @@ function selectNetwork(event) {
 }
 
 function generateWallet() {
+  autoSearchEnabled = false;
+  searchRunId += 1;
+  discreteLogProgress = null;
   try {
     const passInput = document.querySelector('#passphrase');
     if (passInput) passphrase = passInput.value;
@@ -405,26 +624,94 @@ function deriveAccountForNetwork() {
   wallet.compressedPublicKey = wallet.account.publicKey;
 }
 
-function addressFromPublicKeys(uncompressedPublicKey, compressedPublicKey, networkId = selectedNetworkId) {
+function calculateAddressData(privateKey, networkId = selectedNetworkId) {
   const network = NETWORKS[networkId];
+  const publicKey = secp256k1.getPublicKey(privateKey, false);
+  const compressedPublicKey = secp256k1.getPublicKey(privateKey, true);
   if (network.family === 'bitcoin') {
-    const witnessProgram = ripemd160(sha256(compressedPublicKey));
-    return bech32.encode('bc', [0, ...bech32.toWords(witnessProgram)]);
+    if (network.format === 'p2tr') {
+      const taproot = taprootDetails(privateKey);
+      return { publicKey, compressedPublicKey, address: taproot.address, addressBytes: taproot.outputX, taprootData: taproot };
+    }
+    const btcSha256 = sha256(compressedPublicKey);
+    const btcHash160 = ripemd160(btcSha256);
+    if (network.format === 'p2wpkh') {
+      return { publicKey, compressedPublicKey, btcSha256, btcHash160, addressBytes: btcHash160, address: bech32.encode('bc', [0, ...bech32.toWords(btcHash160)]) };
+    }
+    if (network.format === 'p2pkh') {
+      const checked = base58Check(new Uint8Array([0x00, ...btcHash160]));
+      return { publicKey, compressedPublicKey, btcSha256, btcHash160, btcPayload: checked.payload, btcChecksum: checked.checksum, addressBytes: btcHash160, address: checked.address };
+    }
+    const btcRedeemScript = new Uint8Array([0x00, 0x14, ...btcHash160]);
+    const btcScriptHash = hash160(btcRedeemScript);
+    const checked = base58Check(new Uint8Array([0x05, ...btcScriptHash]));
+    return { publicKey, compressedPublicKey, btcSha256, btcHash160, btcRedeemScript, btcScriptHash, btcPayload: checked.payload, btcChecksum: checked.checksum, addressBytes: btcScriptHash, address: checked.address };
   }
-  const keccakHash = keccak_256(uncompressedPublicKey.slice(1));
+  if (network.family === 'bnbBeacon') {
+    const btcHash160 = hash160(compressedPublicKey);
+    return { publicKey, compressedPublicKey, btcHash160, addressBytes: btcHash160, address: bech32.encode('bnb', bech32.toWords(btcHash160)) };
+  }
+  const keccakHash = keccak_256(publicKey.slice(1));
   const addressBytes = keccakHash.slice(12);
   if (network.family === 'tron') {
-    const payload = new Uint8Array([0x41, ...addressBytes]);
-    const checksum = sha256(sha256(payload)).slice(0, 4);
-    return base58.encode(new Uint8Array([...payload, ...checksum]));
+    const tronPayload = new Uint8Array([0x41, ...addressBytes]);
+    const tronShaFirst = sha256(tronPayload);
+    const tronShaSecond = sha256(tronShaFirst);
+    const tronChecksum = tronShaSecond.slice(0, 4);
+    const tronBase58Bytes = concatBytes(tronPayload, tronChecksum);
+    return { publicKey, compressedPublicKey, keccakHash, addressBytes, tronPayload, tronShaFirst, tronShaSecond, tronChecksum, tronBase58Bytes, address: base58.encode(tronBase58Bytes) };
   }
-  return checksumAddress(hex(addressBytes));
+  const lowerAddress = hex(addressBytes);
+  const eip55Hash = keccak_256(new TextEncoder().encode(lowerAddress));
+  return { publicKey, compressedPublicKey, keccakHash, addressBytes, eip55Hash, address: checksumAddress(lowerAddress, eip55Hash) };
+}
+
+function parseBase58Check(input, version) {
+  try {
+    const decoded = base58.decode(input);
+    if (decoded.length !== 25) return { valid: false, reason: 'Base58Check address must decode to 25 bytes.' };
+    const payload = decoded.slice(0, 21);
+    const checksum = decoded.slice(21);
+    const expected = sha256(sha256(payload)).slice(0, 4);
+    if (payload[0] !== version || hex(checksum) !== hex(expected)) return { valid: false, reason: 'Address version or Base58Check checksum is invalid for this profile.' };
+    return { valid: true, display: input, normalized: input, bytes: payload.slice(1), payload, checksum };
+  } catch {
+    return { valid: false, reason: 'Address is not valid Base58Check.' };
+  }
+}
+
+function parseEvmPublicKey(input) {
+  const key = input.trim().replace(/\s+/g, '').replace(/^0x/i, '');
+  if (!looksLikeEvmPublicKey(key)) return null;
+  try {
+    let bytes = Uint8Array.from(key.match(/.{2}/g), (byte) => Number.parseInt(byte, 16));
+    if (bytes.length === 64) bytes = new Uint8Array([0x04, ...bytes]);
+    const publicKey = secp256k1.Point.fromBytes(bytes).toBytes(false);
+    const keccakHash = keccak_256(publicKey.slice(1));
+    const addressBytes = keccakHash.slice(12);
+    const lowerAddress = hex(addressBytes);
+    const checksumHash = keccak_256(new TextEncoder().encode(lowerAddress));
+    return {
+      valid: true,
+      inputKind: 'publicKey',
+      publicKey,
+      keyKeccakHash: keccakHash,
+      display: checksumAddress(lowerAddress, checksumHash),
+      normalized: `0x${lowerAddress}`,
+      bytes: addressBytes,
+      checksumHash,
+    };
+  } catch {
+    return { valid: false, reason: 'Public key is not a valid secp256k1 point. Paste a 33-byte compressed or 64/65-byte uncompressed public key.' };
+  }
 }
 
 function parseNetworkAddress(input, networkId = selectedNetworkId) {
   const network = NETWORKS[networkId];
   if (network.family === 'evm') {
-    if (!/^0x[0-9a-fA-F]{40}$/.test(input)) return { valid: false, reason: 'Enter 0x followed by exactly 40 hexadecimal characters.' };
+    const publicKeyInput = parseEvmPublicKey(input);
+    if (publicKeyInput) return publicKeyInput;
+    if (!/^0x[0-9a-fA-F]{40}$/.test(input)) return { valid: false, reason: 'Enter a 0x-prefixed 20-byte address, or paste a valid compressed/uncompressed secp256k1 public key.' };
     const body = input.slice(2);
     const lower = body.toLowerCase();
     const mixed = body !== lower && body !== body.toUpperCase();
@@ -433,56 +720,61 @@ function parseNetworkAddress(input, networkId = selectedNetworkId) {
     return { valid: true, display: checksummed, normalized: `0x${lower}`, bytes: Uint8Array.from(lower.match(/.{2}/g), (byte) => Number.parseInt(byte, 16)), checksumHash: keccak_256(new TextEncoder().encode(lower)) };
   }
   if (network.family === 'tron') {
+    const result = parseBase58Check(input, 0x41);
+    return result.valid ? { ...result, payload: result.payload } : { valid: false, reason: 'Enter a valid TRON mainnet Base58Check address (version 0x41, usually starts with T).' };
+  }
+  if (network.family === 'bnbBeacon') {
     try {
-      const decoded = base58.decode(input);
-      if (decoded.length !== 25) return { valid: false, reason: 'TRON mainnet Base58Check addresses decode to 25 bytes.' };
-      const payload = decoded.slice(0, 21);
-      const checksum = decoded.slice(21);
-      const expected = sha256(sha256(payload)).slice(0, 4);
-      if (payload[0] !== 0x41 || hex(checksum) !== hex(expected)) return { valid: false, reason: 'Invalid TRON mainnet prefix or Base58Check checksum.' };
-      return { valid: true, display: input, normalized: input, bytes: payload.slice(1), payload, checksum };
+      const decoded = bech32.decode(input);
+      const bytes = Uint8Array.from(bech32.fromWords(decoded.words));
+      if (decoded.prefix !== 'bnb' || bytes.length !== 20) return { valid: false, reason: 'Enter a BNB Beacon Chain Bech32 address (bnb prefix, 20-byte payload).' };
+      return { valid: true, display: bech32.encode('bnb', bech32.toWords(bytes)), normalized: input.toLowerCase(), bytes };
     } catch {
-      return { valid: false, reason: 'Enter a valid TRON mainnet Base58Check address (usually starts with T).' };
+      return { valid: false, reason: 'Enter a valid BNB Beacon Chain Bech32 address beginning with bnb1.' };
     }
   }
+  if (network.format === 'p2pkh') return parseBase58Check(input, 0x00);
+  if (network.format === 'p2sh-p2wpkh') return parseBase58Check(input, 0x05);
   try {
+    if (network.format === 'p2tr') {
+      const decoded = bech32m.decode(input);
+      const program = Uint8Array.from(bech32m.fromWords(decoded.words.slice(1)));
+      if (decoded.prefix !== 'bc' || decoded.words[0] !== 1 || program.length !== 32) return { valid: false, reason: 'Enter a Bitcoin mainnet Taproot P2TR address (bc1p…, witness v1, 32-byte output key).' };
+      return { valid: true, display: bech32m.encode('bc', [1, ...bech32m.toWords(program)]), normalized: input.toLowerCase(), bytes: program };
+    }
     const decoded = bech32.decode(input);
     const program = Uint8Array.from(bech32.fromWords(decoded.words.slice(1)));
-    if (decoded.prefix !== 'bc' || decoded.words[0] !== 0 || program.length !== 20) return { valid: false, reason: 'Enter a Bitcoin mainnet native-SegWit P2WPKH address (bc1q… with a 20-byte witness program).' };
-    const canonical = bech32.encode('bc', [0, ...bech32.toWords(program)]);
-    return { valid: true, display: canonical, normalized: canonical.toLowerCase(), bytes: program };
+    if (decoded.prefix !== 'bc' || decoded.words[0] !== 0 || program.length !== 20) return { valid: false, reason: 'Enter a Bitcoin mainnet native-SegWit P2WPKH address (bc1q…, witness v0, 20-byte program).' };
+    return { valid: true, display: bech32.encode('bc', [0, ...bech32.toWords(program)]), normalized: input.toLowerCase(), bytes: program };
   } catch {
-    return { valid: false, reason: 'Enter a valid Bitcoin mainnet Bech32 P2WPKH address (bc1q…).'}
+    return { valid: false, reason: network.format === 'p2tr' ? 'Enter a valid Bitcoin mainnet Bech32m Taproot address (bc1p…).': 'Enter a valid Bitcoin mainnet Bech32 P2WPKH address (bc1q…).' };
   }
 }
 
+function wipeTaprootData(data = wallet.taprootData) {
+  data?.internalPrivateKey?.fill(0);
+  data?.outputPrivateKey?.fill(0);
+}
+
 function deriveNetworkAddress() {
-  wallet.keccakHash = null;
-  wallet.addressBytes = null;
-  wallet.eip55Hash = null;
-  wallet.tronPayload = null;
-  wallet.tronChecksum = null;
-  wallet.btcHash160 = null;
-
-  if (selectedNetwork().family === 'bitcoin') {
-    wallet.btcHash160 = ripemd160(sha256(wallet.compressedPublicKey));
-    wallet.addressBytes = wallet.btcHash160;
-    wallet.address = bech32.encode('bc', [0, ...bech32.toWords(wallet.btcHash160)]);
-    return;
-  }
-
-  wallet.keccakHash = keccak_256(wallet.publicKey.slice(1));
-  wallet.addressBytes = wallet.keccakHash.slice(12);
-  const lowerAddress = hex(wallet.addressBytes);
-  if (selectedNetwork().family === 'tron') {
-    wallet.tronPayload = new Uint8Array([0x41, ...wallet.addressBytes]);
-    wallet.tronChecksum = sha256(sha256(wallet.tronPayload)).slice(0, 4);
-    wallet.address = base58.encode(new Uint8Array([...wallet.tronPayload, ...wallet.tronChecksum]));
-    return;
-  }
-
-  wallet.eip55Hash = keccak_256(new TextEncoder().encode(lowerAddress));
-  wallet.address = checksumAddress(lowerAddress, wallet.eip55Hash);
+  wipeTaprootData();
+  const data = calculateAddressData(wallet.account.privateKey);
+  wallet.keccakHash = data.keccakHash ?? null;
+  wallet.addressBytes = data.addressBytes;
+  wallet.eip55Hash = data.eip55Hash ?? null;
+  wallet.tronPayload = data.tronPayload ?? null;
+  wallet.tronShaFirst = data.tronShaFirst ?? null;
+  wallet.tronShaSecond = data.tronShaSecond ?? null;
+  wallet.tronChecksum = data.tronChecksum ?? null;
+  wallet.tronBase58Bytes = data.tronBase58Bytes ?? null;
+  wallet.btcHash160 = data.btcHash160 ?? null;
+  wallet.btcSha256 = data.btcSha256 ?? null;
+  wallet.btcRedeemScript = data.btcRedeemScript ?? null;
+  wallet.btcScriptHash = data.btcScriptHash ?? null;
+  wallet.btcPayload = data.btcPayload ?? null;
+  wallet.btcChecksum = data.btcChecksum ?? null;
+  wallet.taprootData = data.taprootData ?? null;
+  wallet.address = data.address;
 }
 
 function smallScalarBytes(scalar) {
@@ -495,47 +787,92 @@ function smallScalarBytes(scalar) {
   return bytes;
 }
 
-function runDiscreteLogLab() {
+async function runDiscreteLogLab() {
+  const runAuto = autoSearchEnabled;
   const addressInput = document.querySelector('#lab-address')?.value.trim() ?? '';
   labAddressInput = addressInput;
   const parsed = parseNetworkAddress(addressInput);
   if (!parsed.valid) {
+    autoSearchEnabled = false;
     discreteLogResult = { status: 'invalid', addressInput, reason: parsed.reason, networkId: selectedNetworkId };
+    discreteLogProgress = null;
+    render();
+    return;
+  }
+  if (parsed.inputKind === 'publicKey') {
+    autoSearchEnabled = false;
+    discreteLogResult = { status: 'publicKey', addressInput, networkId: selectedNetworkId, parsed };
+    discreteLogProgress = null;
     render();
     return;
   }
 
-  const trials = 256;
+  const networkId = selectedNetworkId;
+  const previous = discreteLogResult?.status === 'valid'
+    && !discreteLogResult.foundScalar
+    && discreteLogResult.networkId === networkId
+    && discreteLogResult.addressInput === addressInput
+    && discreteLogResult.lastScalar < SEARCH_SCALAR_LIMIT
+    ? discreteLogResult
+    : null;
+  const startScalar = previous ? previous.lastScalar + 1 : 1;
+  if (startScalar > SEARCH_SCALAR_LIMIT) {
+    autoSearchEnabled = false;
+    return;
+  }
+  const endScalar = runAuto ? SEARCH_SCALAR_LIMIT : Math.min(startScalar + SEARCH_BATCH_SIZE - 1, SEARCH_SCALAR_LIMIT);
+  const plannedTrials = endScalar - startScalar + 1;
+  const progressStride = runAuto ? 4096 : 16;
+  const runId = ++searchRunId;
+  const startedAt = performance.now();
+  discreteLogResult = null;
+  discreteLogProgress = { completed: 0, trials: plannedTrials, startScalar, endScalar, elapsedMs: 0, candidatesPerSecond: 0, networkId, parsed, auto: runAuto };
+  render();
   let firstCandidateAddress = '';
   let lastCandidateAddress = '';
+  let lastScalarTested = startScalar - 1;
+  let testedCount = 0;
   let foundScalar = null;
   let foundPublicKey = null;
-  const family = selectedNetwork().family;
-  const normalize = (address) => family === 'tron' ? address : address.toLowerCase();
-  for (let candidate = 1; candidate <= trials; candidate += 1) {
+  const network = NETWORKS[networkId];
+  const normalize = (address) => network.family === 'evm' || network.family === 'bnbBeacon' || (network.family === 'bitcoin' && ['p2wpkh', 'p2tr'].includes(network.format)) ? address.toLowerCase() : address;
+  for (let candidate = startScalar; candidate <= endScalar; candidate += 1) {
     const privateKey = smallScalarBytes(candidate);
-    const uncompressed = secp256k1.getPublicKey(privateKey, false);
-    const compressed = secp256k1.getPublicKey(privateKey, true);
-    const candidateAddress = addressFromPublicKeys(uncompressed, compressed);
-    if (candidate === 1) firstCandidateAddress = candidateAddress;
-    if (candidate === trials) lastCandidateAddress = candidateAddress;
+    const candidateData = calculateAddressData(privateKey, networkId);
+    const candidateAddress = candidateData.address;
+    if (candidate === startScalar) firstCandidateAddress = candidateAddress;
+    lastCandidateAddress = candidateAddress;
+    lastScalarTested = candidate;
+    testedCount += 1;
     if (normalize(candidateAddress) === normalize(parsed.display)) {
       foundScalar = candidate;
-      foundPublicKey = `0x${hex(uncompressed)}`;
+      foundPublicKey = `0x${hex(candidateData.publicKey)}`;
     }
+    privateKey.fill(0);
+    if (candidateData.taprootData) wipeTaprootData(candidateData.taprootData);
+    const completed = candidate - startScalar + 1;
+    if (foundScalar || completed % progressStride === 0 || candidate === endScalar) {
+      const elapsedMs = Math.max(performance.now() - startedAt, 0.01);
+      discreteLogProgress = { completed, trials: plannedTrials, startScalar, endScalar, elapsedMs, candidatesPerSecond: completed * 1000 / elapsedMs, networkId, parsed, auto: runAuto };
+      render();
+      if (candidate < endScalar && !foundScalar) await new Promise((resolve) => setTimeout(resolve, 0));
+      if (runId !== searchRunId) return;
+      if (runAuto && !autoSearchEnabled) break;
+    }
+    if (foundScalar) break;
   }
+  const elapsedMs = Math.max(performance.now() - startedAt, 0.01);
+  const candidatesPerSecond = testedCount * 1000 / elapsedMs;
+  const addressBits = NETWORKS[networkId].format === 'p2tr' ? 255 : 160;
+  const log10ExpectedYears = addressBits * Math.log10(2) - Math.log10(candidatesPerSecond) - Math.log10(365.25 * 24 * 60 * 60);
 
   discreteLogResult = {
-    status: 'valid',
-    addressInput,
-    networkId: selectedNetworkId,
-    parsed,
-    trials,
-    firstCandidateAddress,
-    lastCandidateAddress,
-    foundScalar,
-    foundPublicKey,
+    status: 'valid', addressInput, networkId, parsed, startScalar, lastScalar: lastScalarTested,
+    trials: testedCount, totalTested: lastScalarTested, elapsedMs, candidatesPerSecond, addressBits,
+    log10ExpectedYears, firstCandidateAddress, lastCandidateAddress, foundScalar, foundPublicKey,
   };
+  autoSearchEnabled = false;
+  discreteLogProgress = null;
   render();
 }
 
@@ -551,29 +888,57 @@ function networkAddressExportLines() {
     `Y coordinate (32 bytes): ${hex(wallet.publicKey.slice(33, 65))}`,
   ];
   if (network.family === 'bitcoin') {
-    const sha = sha256(wallet.compressedPublicKey);
-    return [
-      ...common,
-      `Compressed public key (33 bytes): ${hex(wallet.compressedPublicKey)}`,
-      `SHA-256(compressed public key): ${hex(sha)}`,
-      `HASH160 = RIPEMD-160(SHA-256): ${hex(wallet.btcHash160)}`,
+    const base = [...common, `Compressed public key (33 bytes): ${hex(wallet.compressedPublicKey)}`];
+    if (network.format === 'p2tr') return [
+      ...base,
+      `BIP-86 internal x-only key: ${hex(wallet.taprootData.internalX)}`,
+      `TaggedHash(TapTweak, internal key): ${hex(wallet.taprootData.tweakHash)}`,
+      `TapTweak scalar: ${hex(wallet.taprootData.tweak)}`,
+      `Tweaked private scalar (SENSITIVE): ${hex(wallet.taprootData.outputPrivateKey)}`,
+      `Tweaked output public key: ${hex(wallet.taprootData.outputPublicKey)}`,
+      `Witness v1 output program: ${hex(wallet.taprootData.outputX)}`,
+      'Witness version 1; mainnet HRP bc; Bech32m checksum.',
+      `Bitcoin Taproot P2TR address: ${wallet.address}`,
+    ];
+    const lines = [...base,
+      `SHA-256(compressed public key): ${hex(wallet.btcSha256)}`,
+      `HASH160 = RIPEMD-160(SHA-256): ${hex(wallet.btcHash160)}`];
+    if (network.format === 'p2wpkh') return [...lines,
       'Native SegWit P2WPKH: witness version 0; mainnet HRP bc; Bech32 checksum.',
       `Witness program bytes: ${indexedBytes(wallet.btcHash160)}`,
       `Bitcoin address: ${wallet.address}`,
-      `P2WPKH scriptPubKey: 0014${hex(wallet.btcHash160)}`,
-    ];
+      `P2WPKH scriptPubKey: 0014${hex(wallet.btcHash160)}`];
+    if (network.format === 'p2pkh') return [...lines,
+      `P2PKH payload (version 00 || HASH160): ${hex(wallet.btcPayload)}`,
+      `Base58Check checksum: ${hex(wallet.btcChecksum)}`,
+      `Bitcoin Legacy P2PKH address: ${wallet.address}`];
+    return [...lines,
+      `P2WPKH redeem script: ${hex(wallet.btcRedeemScript)}`,
+      `HASH160(redeem script): ${hex(wallet.btcScriptHash)}`,
+      `P2SH payload (version 05 || script hash): ${hex(wallet.btcPayload)}`,
+      `Base58Check checksum: ${hex(wallet.btcChecksum)}`,
+      `Nested SegWit P2SH-P2WPKH address: ${wallet.address}`];
   }
-  if (network.family === 'tron') {
-    return [
-      ...common,
-      `Keccak input (public-key body X || Y, 64 bytes): ${hex(wallet.publicKey.slice(1))}`,
-      `Keccak-256 digest: ${hex(wallet.keccakHash)}`,
-      `Address bytes (last 20 digest bytes): ${hex(wallet.addressBytes)}`,
-      `TRON payload (0x41 || address bytes): ${hex(wallet.tronPayload)}`,
-      `Base58Check checksum (first 4 bytes of double-SHA256): ${hex(wallet.tronChecksum)}`,
-      `TRON mainnet Base58Check address: ${wallet.address}`,
-    ];
-  }
+  if (network.family === 'bnbBeacon') return [
+    ...common,
+    `Compressed public key (33 bytes): ${hex(wallet.compressedPublicKey)}`,
+    `SHA-256(compressed public key): ${hex(sha256(wallet.compressedPublicKey))}`,
+    `HASH160 payload: ${hex(wallet.btcHash160)}`,
+    'BNB Beacon Chain (legacy BEP2): Bech32, HRP bnb; separate from BNB Smart Chain.',
+    `BNB Beacon address: ${wallet.address}`,
+  ];
+  if (network.family === 'tron') return [
+    ...common,
+    `Keccak input (public-key body X || Y, 64 bytes): ${hex(wallet.publicKey.slice(1))}`,
+    `Keccak-256 digest: ${hex(wallet.keccakHash)}`,
+    `Address bytes (last 20 digest bytes): ${hex(wallet.addressBytes)}`,
+    `TRON payload (0x41 || address bytes): ${hex(wallet.tronPayload)}`,
+    `SHA-256(payload): ${hex(wallet.tronShaFirst)}`,
+    `SHA-256(previous digest): ${hex(wallet.tronShaSecond)}`,
+    `Base58Check checksum (first 4 bytes): ${hex(wallet.tronChecksum)}`,
+    `25-byte Base58Check input: ${hex(wallet.tronBase58Bytes)}`,
+    `TRON mainnet Base58Check address: ${wallet.address}`,
+  ];
   return [
     ...common,
     `Keccak input (public-key body X || Y, 64 bytes): ${hex(wallet.publicKey.slice(1))}`,
@@ -589,20 +954,36 @@ function networkSearchExportLines() {
   const result = discreteLogResult;
   const network = NETWORKS[result?.networkId ?? selectedNetworkId];
   if (!result) return ['Not run during this session.'];
-  if (result.status === 'invalid') return [`Invalid ${network.label} address: ${result.reason}`, 'No candidates were tested.'];
+  if (result.status === 'invalid') return [`Invalid ${network.label} input: ${result.reason}`, 'No candidates were tested.'];
+  if (result.status === 'publicKey') return [
+    `Input kind: validated secp256k1 public key`,
+    `Public key (65-byte uncompressed): ${hex(result.parsed.publicKey)}`,
+    `Address-generation Keccak-256 of X || Y (32 bytes): ${hex(result.parsed.keyKeccakHash)}`,
+    `Derived Ethereum address: ${result.parsed.display}`,
+    `EIP-55 checksum hash of lowercase address text: ${hex(result.parsed.checksumHash)}`,
+    'No scalar search was run. The private key was not supplied or derived.',
+  ];
   const lines = [
-    `Selected network: ${network.label}`,
+    `Selected network/profile: ${network.label} (${network.path})`,
     `Entered address: ${result.addressInput}`,
     `Canonical address: ${result.parsed.display}`,
     `Address bytes: ${hex(result.parsed.bytes)}`,
   ];
   if (network.family === 'evm') lines.push(`EIP-55 hash: ${hex(result.parsed.checksumHash)}`);
   if (network.family === 'tron') lines.push(`TRON payload: ${hex(result.parsed.payload)}`, `Base58Check checksum: ${hex(result.parsed.checksum)}`);
-  if (network.family === 'bitcoin') lines.push(`P2WPKH witness program: ${hex(result.parsed.bytes)}`, `scriptPubKey: 0014${hex(result.parsed.bytes)}`);
-  lines.push(`Algorithm: derive secp256k1 public keys for scalars 1..${result.trials}; encode each address using ${network.label} rules; compare with target.`);
-  lines.push(result.foundScalar ? `Match found: private scalar d=${result.foundScalar}; uncompressed public key=${result.foundPublicKey}.` : `No match among scalars 1..${result.trials}. This does not test any other valid private scalars.`);
-  lines.push(`Candidate d=1 address: ${result.firstCandidateAddress}`, `Candidate d=${result.trials} address: ${result.lastCandidateAddress}`);
-  lines.push('The address does not reveal its public key or private scalar. No address or derivation value is sent to a server.');
+  if (network.family === 'bitcoin') {
+    lines.push(`Address format: ${network.format}`, `Address payload/program: ${hex(result.parsed.bytes)}`);
+    if (network.format === 'p2wpkh') lines.push('Witness v0; HRP bc; Bech32 checksum verified.', `P2WPKH scriptPubKey: 0014${hex(result.parsed.bytes)}`);
+    else if (network.format === 'p2tr') lines.push('Witness v1; HRP bc; Bech32m checksum verified.', `Taproot x-only output key: ${hex(result.parsed.bytes)}`);
+    else lines.push(`Base58Check payload: ${hex(result.parsed.payload)}`, `Base58Check checksum: ${hex(result.parsed.checksum)} (verified).`, network.format === 'p2sh-p2wpkh' ? 'Redeem script is not recoverable from the address alone.' : 'Legacy P2PKH version byte 00.');
+  }
+  if (network.family === 'bnbBeacon') lines.push(`BNB Beacon HASH160 payload: ${hex(result.parsed.bytes)}`, 'Bech32 HRP bnb; checksum verified.');
+  lines.push(`Algorithm: derive secp256k1 public keys for scalars ${result.startScalar}..${result.lastScalar}; encode each address using ${network.label} rules; compare with target.`);
+  lines.push(result.foundScalar ? `Match found: private scalar d=${result.foundScalar}; uncompressed public key=${result.foundPublicKey}.` : `No match in latest interval ${result.startScalar}..${result.lastScalar}; cumulative search tested through scalar ${result.totalTested}. Other scalars remain untested.`);
+  lines.push(`Measured latest batch: ${result.elapsedMs.toFixed(2)} ms for ${result.trials} candidates; ${result.candidatesPerSecond.toFixed(2)} candidates/second.`);
+  lines.push(`Address-preimage estimate: average approximately 2^${result.addressBits} candidate addresses; at the latest measured rate approximately 10^${result.log10ExpectedYears.toFixed(1)} years. This is an extrapolation, not a practical key-recovery method. The app's fixed upper bound is scalar ${SEARCH_SCALAR_LIMIT}.`);
+  lines.push(`First candidate in latest batch, d=${result.startScalar}: ${result.firstCandidateAddress}`, `Last candidate in latest batch, d=${result.lastScalar}: ${result.lastCandidateAddress}`);
+  lines.push('An address does not reveal its public key or private scalar. No address or derivation value is sent to a server.');
   return lines;
 }
 
@@ -673,7 +1054,7 @@ function exportDerivationTxt() {
     'Mnemonic/passphrase → seed: PBKDF2 is not practically invertible; only candidate phrases can be checked by deriving forward.',
     'Seed → BIP-32 node → child keys: deterministic forward derivation; path and hardened levels matter.',
     'Private key → public key: elliptic-curve scalar multiplication; reversing requires solving the secp256k1 discrete-log problem.',
-    selectedNetwork().family === 'bitcoin' ? 'Bitcoin address: HASH160 of the compressed public key, then native-SegWit Bech32; no practical inverse.' : selectedNetwork().family === 'tron' ? 'TRON address: Keccak-256 truncation plus Base58Check version and checksum; no practical inverse.' : 'EVM address: Keccak-256 truncation and EIP-55 casing; no practical inverse.' ,
+    selectedNetwork().family === 'bitcoin' ? `Bitcoin ${selectedNetwork().format} address: profile-specific public-key hashing/encoding; no practical inverse.` : selectedNetwork().family === 'tron' ? 'TRON address: Keccak-256 truncation plus Base58Check version and checksum; no practical inverse.' : selectedNetwork().family === 'bnbBeacon' ? 'BNB Beacon address: HASH160 of compressed public key and Bech32; no practical inverse.' : selectedNetworkId === 'bnb' ? 'BNB Smart Chain address: same EVM address construction as Ethereum; no practical inverse.' : 'Ethereum address: Keccak-256 truncation and EIP-55 casing; no practical inverse.' ,
     '',
     'BOUNDED SECP256K1 ADDRESS SEARCH (if run)',
     ...networkSearchExportLines(),
@@ -693,6 +1074,7 @@ function exportDerivationTxt() {
 }
 
 function wipeWalletSecrets() {
+  wipeTaprootData();
   wallet.entropy?.fill(0);
   wallet.bip39Salt?.fill(0);
   wallet.seed?.fill(0);
@@ -703,6 +1085,9 @@ function wipeWalletSecrets() {
 }
 
 function resetWallet() {
+  autoSearchEnabled = false;
+  searchRunId += 1;
+  discreteLogProgress = null;
   wipeWalletSecrets();
   wallet = freshWallet();
   passphrase = '';
