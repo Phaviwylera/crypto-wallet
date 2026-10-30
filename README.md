@@ -19,4 +19,6 @@ The phrase is generated client-side with `@scure/bip39` using the browser crypto
 
 The repository includes `vercel.json` and can be imported as a Vite project on Vercel (build command `npm run build`, output directory `dist`). It can also be deployed as a static site on Render with the same build command and `dist` publish directory.
 
+For private EC2 hosting with automatic deployments after merges to `main`, see [the EC2 setup guide](docs/ec2-deployment.md). The deployment workflow uses GitHub OIDC, private S3 releases, and AWS Systems Manager; it does not expose SSH or a public compute endpoint.
+
 For a private EC2 setup with automated deployment on merges to `main`, follow [the EC2 deployment guide](docs/ec2-deployment.md). The GitHub Actions workflow uses OIDC and Systems Manager; it does not expose SSH or a public compute endpoint.
