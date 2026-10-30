@@ -1,5 +1,5 @@
 import { HDKey } from '@scure/bip32';
-import { entropyToMnemonic, mnemonicToSeedSync } from '@scure/bip39';
+import { entropyToMnemonic, mnemonicToEntropy, mnemonicToSeedSync } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { sha256 } from '@noble/hashes/sha2.js';
@@ -12,6 +12,7 @@ const DERIVATION_PATH = "m/44'/60'/0'/0/0";
 let wallet = freshWallet();
 let passphrase = '';
 let copied = new Set();
+let backwardOpen = false;
 
 function freshWallet() {
   return {
@@ -34,6 +35,11 @@ function hex(bytes) {
 
 function spacedHex(bytes) {
   return hex(bytes).match(/.{1,8}/g)?.join(' ') ?? '';
+}
+
+function shortHex(bytes, head = 14, tail = 10) {
+  const value = hex(bytes);
+  return value.length > head + tail ? `${value.slice(0, head)}…${value.slice(-tail)}` : value;
 }
 
 function binary(bytes) {
@@ -149,6 +155,24 @@ function render() {
     <div class="value-row"><div><label>Keccak-256(public key body)</label><code>${spacedHex(wallet.keccakHash)}</code></div>${copyButton('keccak')}</div>
     <div class="address-output"><div><span class="mini-label">ETHEREUM ADDRESS · EIP-55</span><strong>${wallet.address}</strong></div>${copyButton('address', 'Copy address')}</div>` : '<p class="locked-note">Hash the uncompressed public-key body with Keccak-256; take the last 20 bytes and apply EIP-55 checksum casing.</p>';
 
+  const recoveredEntropy = wallet.stage >= 5 ? mnemonicToEntropy(wallet.phrase, wordlist) : null;
+  const entropyRoundTripMatches = recoveredEntropy && hex(recoveredEntropy) === hex(wallet.entropy);
+  const backwardPanel = wallet.stage >= 5 && backwardOpen ? `
+    <section class="backward-panel">
+      <div class="backward-heading"><div><span class="eyebrow">LIVE REVERSE TRACE</span><h3>What can—and cannot—be recovered?</h3></div><span class="live-example">THIS SESSION · REAL VALUES</span></div>
+      <p class="backward-intro">Read from your generated address back toward entropy. The forward outputs are visible above; these rows show what each output still tells you about its input.</p>
+      <div class="carry-strip"><span><b>Carried forward</b> deterministic relationships, checksums, and the chosen derivation path</span><span><b>Changed at each step</b> representation, key material, and finally a shortened hash</span></div>
+      <div class="reverse-list">
+        <article class="reverse-row blocked"><div class="reverse-step">06</div><div class="reverse-content"><div class="reverse-title"><strong>Address ← public key</strong><span class="recovery-tag no">NOT REVERSIBLE</span></div><div class="reverse-live"><label>Live address</label><code>${wallet.address}</code></div><p>Keccak-256 hashes the public-key body, then the address keeps only 20 of the 32 hash bytes. There is no inverse formula to recover the public key from this value.</p></div></article>
+        <article class="reverse-row blocked"><div class="reverse-step">05</div><div class="reverse-content"><div class="reverse-title"><strong>Public key ← private key</strong><span class="recovery-tag no">NOT PRACTICAL</span></div><div class="reverse-live"><label>Live public key</label><code>${shortHex(wallet.publicKey, 18, 12)}</code></div><p>The public key is <code>Q = d × G</code> on secp256k1. Finding <code>d</code> from <code>Q</code> requires solving the elliptic-curve discrete-log problem.</p></div></article>
+        <article class="reverse-row blocked"><div class="reverse-step">04</div><div class="reverse-content"><div class="reverse-title"><strong>Child key ← master node + path</strong><span class="recovery-tag no">PATH MATTERS</span></div><div class="reverse-live"><label>Path used</label><code>${DERIVATION_PATH}</code><label class="second-live-label">Live child key</label><code>${shortHex(wallet.account.privateKey, 18, 12)}</code></div><p>BIP-32 derives a child using HMAC-SHA512 and the selected path. The address does not encode that path. A child key alone lacks the parent chain code; hardened levels (44′, 60′, 0′) also block deriving ancestors.</p></div></article>
+        <article class="reverse-row blocked"><div class="reverse-step">03</div><div class="reverse-content"><div class="reverse-title"><strong>Master node ← BIP-39 seed</strong><span class="recovery-tag no">NOT PRACTICAL</span></div><div class="reverse-live"><label>Master private · IL</label><code>${shortHex(wallet.master.privateKey, 18, 12)}</code><label class="second-live-label">Master chain code · IR</label><code>${shortHex(wallet.master.chainCode, 18, 12)}</code></div><p>BIP-32 creates these with HMAC-SHA512 using the key <code>Bitcoin seed</code>. The master node is derived from the seed; it does not contain a reversible copy of it.</p></div></article>
+        <article class="reverse-row blocked"><div class="reverse-step">02</div><div class="reverse-content"><div class="reverse-title"><strong>Seed ← mnemonic + passphrase</strong><span class="recovery-tag no">CANDIDATES ONLY</span></div><div class="reverse-live"><label>Live seed · abbreviated</label><code>${shortHex(wallet.seed, 20, 12)}</code><label class="second-live-label">Passphrase used</label><code>${passphrase ? 'non-empty · hidden' : 'empty'}</code></div><p>PBKDF2-HMAC-SHA512 produces a 512-bit seed. It is not an encrypted copy of the words. You can test a guessed phrase and passphrase by running forward and comparing, but cannot extract the original from the seed.</p></div></article>
+        <article class="reverse-row reversible"><div class="reverse-step">01</div><div class="reverse-content"><div class="reverse-title"><strong>Mnemonic → entropy</strong><span class="recovery-tag yes">REVERSIBLE</span></div><div class="reverse-live"><label>Live phrase</label><code>${wallet.phrase}</code><label class="second-live-label">Recovered entropy · matches original: ${entropyRoundTripMatches ? 'YES' : 'NO'}</label><code>${spacedHex(recoveredEntropy)}</code></div><p>This is the exception: the 12 word indices encode the 128 entropy bits plus a 4-bit checksum. BIP-39 can decode the phrase back to the exact entropy and verify its checksum.</p></div></article>
+      </div>
+      <div class="takeaway"><strong>Why address → phrase search is not practical</strong><span>With no phrase words known, a search must try up to 2<sup>128</sup> valid mnemonics (and know the passphrase and derivation path), derive each address, then compare. This is not a useful workload for the $85 EC2 budget.</span></div>
+    </section>` : '';
+
   app.innerHTML = `
     <header class="topbar"><a class="brand" href="#" aria-label="Seedlab home"><span class="brand-mark">S</span><span>seedlab</span></a><div class="topbar-meta"><span class="live-dot"></span> DERIVATION LAB <span class="topbar-divider">/</span> TEST DATA ONLY</div></header>
     <main class="page-shell">
@@ -157,12 +181,13 @@ function render() {
       <div class="layout-grid">
         <div class="lesson-column">
           <section class="setup-card"><div class="setup-copy"><span class="eyebrow">START HERE</span><h2>Make a fresh demo wallet</h2><p>Uses browser cryptographic randomness. Nothing is saved or sent to EC2.</p></div><div class="setup-controls"><label for="passphrase">Optional BIP-39 passphrase</label><input id="passphrase" type="password" autocomplete="new-password" placeholder="Leave blank for no passphrase" value="${passphrase.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;')}" ${wallet.stage ? 'disabled' : ''}><small>${wallet.stage ? 'Locked for this derivation; reset to change it.' : 'Case-sensitive. It creates a different wallet.'}</small><button class="action-button generate-button" id="generate">${wallet.stage ? 'Generate another demo wallet' : 'Generate demo wallet'}<span aria-hidden="true">↗</span></button></div></section>
-          <div class="steps-heading"><div><span class="eyebrow">THE PIPELINE</span><h2>Five steps, one address</h2></div>${wallet.stage ? '<button class="reset-button" id="reset">Reset session</button>' : ''}</div>
+          <div class="steps-heading"><div><span class="eyebrow">THE PIPELINE</span><h2>Five steps, one address</h2></div><div class="steps-actions">${wallet.stage >= 5 ? `<button class="reverse-toggle" id="backward-toggle">${backwardOpen ? 'Hide backward trace' : 'Trace backward'}</button>` : ''}${wallet.stage ? '<button class="reset-button" id="reset">Reset session</button>' : ''}</div></div>
           ${stepCard({ number: '01', title: 'Entropy → mnemonic', caption: 'Create randomness and encode twelve words', step: 1, body: entropyBody, action: 'Generate 128-bit entropy & phrase' })}
           ${stepCard({ number: '02', title: 'Mnemonic → seed', caption: 'PBKDF2-HMAC-SHA512 · BIP-39', step: 2, body: seedBody, action: 'Derive 512-bit seed' })}
           ${stepCard({ number: '03', title: 'Seed → master node', caption: 'HMAC-SHA512 · BIP-32', step: 3, body: masterBody, action: 'Create BIP-32 master node' })}
           ${stepCard({ number: '04', title: 'Master node → Ethereum keypair', caption: 'BIP-44 path · secp256k1', step: 4, body: accountBody, action: 'Derive Ethereum account' })}
           ${stepCard({ number: '05', title: 'Public key → address', caption: 'Keccak-256 · last 20 bytes · EIP-55', step: 5, body: addressBody, action: 'Compute Ethereum address' })}
+          ${backwardPanel}
         </div>
         <aside class="side-rail">
           <section class="rail-card"><div class="rail-title"><span class="eyebrow">MAP</span><span class="rail-index">01—05</span></div><ol class="flow-list"><li class="${wallet.stage >= 1 ? 'visited' : ''}"><b>01</b><span>128-bit entropy</span></li><li class="${wallet.stage >= 1 ? 'visited' : ''}"><b>02</b><span>12 BIP-39 words</span></li><li class="${wallet.stage >= 2 ? 'visited' : ''}"><b>03</b><span>512-bit seed</span></li><li class="${wallet.stage >= 3 ? 'visited' : ''}"><b>04</b><span>BIP-32 master node</span></li><li class="${wallet.stage >= 4 ? 'visited' : ''}"><b>05</b><span>Ethereum keypair</span></li><li class="${wallet.stage >= 5 ? 'visited current' : ''}"><b>↳</b><span>20-byte address</span></li></ol></section>
@@ -178,6 +203,10 @@ function render() {
   passInput?.addEventListener('input', (event) => { passphrase = event.target.value; });
   document.querySelector('#generate')?.addEventListener('click', generateWallet);
   document.querySelector('#reset')?.addEventListener('click', resetWallet);
+  document.querySelector('#backward-toggle')?.addEventListener('click', () => {
+    backwardOpen = !backwardOpen;
+    render();
+  });
   document.querySelectorAll('[data-run-step]').forEach((button) => button.addEventListener('click', () => runStep(Number(button.dataset.runStep))));
   document.querySelectorAll('[data-copy]').forEach((button) => button.addEventListener('click', async () => {
     try {
@@ -197,6 +226,7 @@ function generateWallet() {
     const entropy = new Uint8Array(16);
     globalThis.crypto.getRandomValues(entropy);
     wallet = freshWallet();
+    backwardOpen = false;
     wallet.entropy = entropy;
     wallet.entropyChecksum = binary(sha256(entropy)).slice(0, 4);
     wallet.phrase = entropyToMnemonic(entropy, wordlist);
@@ -238,6 +268,7 @@ function resetWallet() {
   wallet.account?.wipePrivateData();
   wallet = freshWallet();
   passphrase = '';
+  backwardOpen = false;
   copied = new Set();
   render();
 }
