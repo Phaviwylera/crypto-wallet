@@ -42,6 +42,10 @@ function shortHex(bytes, head = 14, tail = 10) {
   return value.length > head + tail ? `${value.slice(0, head)}…${value.slice(-tail)}` : value;
 }
 
+function byteGrid(bytes, addressStart = -1) {
+  return Array.from(bytes, (value, index) => `<span class="hash-byte ${index >= addressStart ? 'address-byte' : ''}"><small>${index.toString(16).padStart(2, '0')}</small><b>${value.toString(16).padStart(2, '0')}</b></span>`).join('');
+}
+
 function binary(bytes) {
   return Array.from(bytes, (value) => value.toString(2).padStart(8, '0')).join('');
 }
@@ -86,6 +90,7 @@ function copyValue(key) {
     chainCode: () => hex(wallet.master?.chainCode),
     accountPrivate: () => hex(wallet.account?.privateKey),
     publicKey: () => hex(wallet.publicKey),
+    publicBody: () => hex(wallet.publicKey?.slice(1)),
     keccak: () => hex(wallet.keccakHash),
     address: () => wallet.address,
   };
@@ -151,9 +156,11 @@ function render() {
     <div class="value-row"><div><label>Uncompressed secp256k1 public key · 65 bytes</label><code>${spacedHex(wallet.publicKey)}</code></div>${copyButton('publicKey')}</div>` : '<p class="locked-note">Derive the first Ethereum account at <code>m/44′/60′/0′/0/0</code>, then compute its public key on secp256k1.</p>';
 
   const addressBody = wallet.stage >= 5 ? `
-    <p class="step-explanation">Ethereum hashes the 64-byte public-key body (without the leading <code>04</code>) with Keccak-256. The last 20 bytes form the address. EIP-55 uses hash nibbles to capitalize letters for a checksum.</p>
-    <div class="value-row"><div><label>Keccak-256(public key body)</label><code>${spacedHex(wallet.keccakHash)}</code></div>${copyButton('keccak')}</div>
-    <div class="address-output"><div><span class="mini-label">ETHEREUM ADDRESS · EIP-55</span><strong>${wallet.address}</strong></div>${copyButton('address', 'Copy address')}</div>` : '<p class="locked-note">Hash the uncompressed public-key body with Keccak-256; take the last 20 bytes and apply EIP-55 checksum casing.</p>';
+    <p class="step-explanation">Ethereum takes the uncompressed public key’s 64-byte body (X || Y), omitting the leading <code>04</code>. Keccak-256 absorbs it into a 1,600-bit state: 136-byte rate, 64-byte capacity, Keccak padding (<code>01…80</code>), then 24 permutation rounds. The first 32 output bytes are the digest. Ethereum Keccak-256 uses legacy Keccak padding, not standardized SHA3-256.</p>
+    <div class="hash-block"><div class="hash-block-heading"><label>INPUT · PUBLIC KEY BODY · 64 BYTES · PREFIX 04 OMITTED</label>${copyButton('publicBody', 'Copy input')}</div><div class="hash-byte-grid input-byte-grid">${byteGrid(wallet.publicKey.slice(1))}</div></div>
+    <div class="hash-params"><span>RATE <b>136 bytes</b></span><span>CAPACITY <b>64 bytes</b></span><span>ROUNDS <b>24</b></span><span>OUTPUT <b>32 bytes</b></span></div>
+    <div class="hash-block"><div class="hash-block-heading"><label>OUTPUT · FULL KECCAK-256 DIGEST · 32 BYTES</label>${copyButton('keccak', 'Copy hash')}</div><div class="hash-byte-grid output-byte-grid">${byteGrid(wallet.keccakHash, 12)}</div><p class="hash-footnote">Byte indices <code>0c–1f</code> (highlighted) are the final 20 bytes used for the Ethereum address. The first 12 digest bytes are discarded.</p></div>
+    <div class="address-output"><div><span class="mini-label">ETHEREUM ADDRESS · EIP-55</span><strong>${wallet.address}</strong></div>${copyButton('address', 'Copy address')}</div>` : '<p class="locked-note">Hash the uncompressed public-key body with Ethereum Keccak-256; take the last 20 bytes and apply EIP-55 checksum casing.</p>';
 
   const recoveredEntropy = wallet.stage >= 5 ? mnemonicToEntropy(wallet.phrase, wordlist) : null;
   const entropyRoundTripMatches = recoveredEntropy && hex(recoveredEntropy) === hex(wallet.entropy);
