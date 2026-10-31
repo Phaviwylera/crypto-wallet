@@ -34,7 +34,13 @@ export const BALANCE_CONFIG = {
   bitcoinLegacy: { kind: 'btc', symbol: 'BTC', coingecko: 'bitcoin', decimals: 8 },
   bitcoinNested: { kind: 'btc', symbol: 'BTC', coingecko: 'bitcoin', decimals: 8 },
   bitcoinTaproot: { kind: 'btc', symbol: 'BTC', coingecko: 'bitcoin', decimals: 8 },
-  tron: { kind: 'tron', symbol: 'TRX', coingecko: 'tron', decimals: 6 },
+  tron: {
+    kind: 'tron', symbol: 'TRX', coingecko: 'tron', decimals: 6,
+    tokens: [
+      { symbol: 'USDT', contract: 'TR7NHqjeKQxwQ12brMJFCGmNTw4UcoVjc6', decimals: 6, coingecko: 'tether' },
+      { symbol: 'USDC', contract: 'TEkxiTehnzSCVEmWn4KkvXmsiT9c4PXhET', decimals: 6, coingecko: 'usd-coin' },
+    ],
+  },
   // bnbBeacon is legacy BEP2 without a reliable keyless API; reported as unavailable.
   bnbBeacon: { kind: 'skip', symbol: 'BNB' },
 };
@@ -89,6 +95,16 @@ async function tronBalance(address) {
   return Number(acct.balance || 0) / 1e6;
 }
 
+// TRC-20 token balance via TronGrid account-tokens list (matched by contract).
+async function tronTokenBalance(address, token) {
+  const data = await fetchJson(`https://api.trongrid.io/v1/accounts/${address}/tokens`);
+  const held = data?.data || [];
+  const found = held.find((h) => (h.tokenId || '').toLowerCase() === token.contract.toLowerCase());
+  if (!found) return 0; // token not held by this address
+  const raw = BigInt(found.balance || '0');
+  return Number(raw) / 10 ** Number(found.tokenDecimal || token.decimals);
+}
+
 export async function getPrices() {
   if (MOCK) {
     return { bitcoin: 60000, ethereum: 2500, binancecoin: 500, tron: 0.12, tether: 1, 'usd-coin': 1, 'binance-usd': 1, dai: 1 };
@@ -139,15 +155,19 @@ export async function getWalletBalances(addresses, prices) {
       totalValueUsd += valueUsd;
       const entry = { symbol: cfg.symbol, balance: Number(balance), valueUsd, error: null };
 
-      if (cfg.kind === 'evm' && cfg.tokens?.length) {
+      if (cfg.tokens?.length) {
         const tokens = [];
         for (const tk of cfg.tokens) {
           try {
             let tokBal;
             if (MOCK) {
               tokBal = seedNum % 11 === 0 ? 0 : (seedNum % 500) / 100 * 1000; // 0..~5000 units
-            } else {
+            } else if (cfg.kind === 'evm') {
               tokBal = await evmTokenBalance(cfg.rpc, tk.contract, address, tk.decimals);
+            } else if (cfg.kind === 'tron') {
+              tokBal = await tronTokenBalance(address, tk);
+            } else {
+              throw new Error('unsupported token chain');
             }
             const tokPrice = priceMap[tk.coingecko] || 0;
             const tokValue = Number(tokBal) * tokPrice;
