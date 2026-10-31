@@ -33,6 +33,9 @@ let discreteLogProgress = null;
 let autoSearchEnabled = false;
 let searchRunId = 0;
 let labAddressInput = null;
+let pendingFile = null;
+let scanState = { jobId: null, status: 'idle', total: 0, processed: 0, results: [], error: null, hideEmpty: true };
+const API_BASE = (import.meta.env && import.meta.env.VITE_SCAN_API_BASE) || '';
 
 function freshWallet() {
   return {
@@ -312,6 +315,209 @@ function searchResultMarkup(result, network, searchLimitReached) {
   return `<div class="dlog-results"><div><label>INPUT · ${network.shortLabel} ADDRESS BYTES</label><code class="dlog-address-value">${escapeHtml(result.parsed.display)}</code><div class="hash-byte-grid address-byte-grid">${byteGrid(result.parsed.bytes)}</div>${networkAddressDetails(result.parsed, network)}</div><div><label>SEARCH · REAL SECP256K1 CANDIDATES</label><p>${result.foundScalar ? `Match found at private scalar d=${result.foundScalar}; this candidate reproduces the entered address.` : `No match in scalars ${result.startScalar}–${result.lastScalar}; ${result.totalTested.toLocaleString()} candidates tested in total.`}</p><p>A miss excludes only the tested interval. Scalars outside it remain untested; request another batch to continue the next range.</p><div class="search-progress"><span style="width:100%"></span></div><p>Latest batch: ${result.trials}/${result.trials} candidates · ${result.elapsedMs.toFixed(2)} ms · ${result.candidatesPerSecond.toFixed(0)} candidates/s. Tested through scalar ${result.totalTested.toLocaleString()} of ${SEARCH_SCALAR_LIMIT.toLocaleString()} max.</p><p>Address-preimage work estimate: average ≈2<sup>${result.addressBits}</sup> candidate addresses${result.addressBits === 255 ? ' (Taproot x-only output space).' : ' (20-byte address output).'} At the latest measured rate, roughly 10<sup>${result.log10ExpectedYears.toFixed(1)}</sup> years. Extrapolation only—not practical private-key recovery or a full secp256k1 attack.</p>${result.foundPublicKey ? `<p>Matched public key: <code class="dlog-address-value">${result.foundPublicKey}</code></p>` : '<p>The target public key was not found in this bounded interval.</p>'}${searchLimitReached ? '<p><strong>The app’s maximum scalar bound has been reached; no further candidates will be tested.</strong></p>' : ''}</div><div><label>THIS BATCH · BOUNDARY CANDIDATES</label><p>d=${result.startScalar} → <code>${result.firstCandidateAddress}</code></p><p>d=${result.lastScalar} → <code>${result.lastCandidateAddress}</code></p><p>These are real addresses computed under ${network.label} rules.</p></div></div>`;
 }
 
+function scanCardMarkup() {
+  return `
+    <section class="scan-card" id="scan-card">
+      <div class="scan-heading"><div><span class="eyebrow">SERVER-SIDE WALLET SCAN · EC2 / LAMBDA</span><h2>Upload wallets, scan them on the server</h2></div></div>
+      <p class="scan-intro">Upload a file of seeds, mnemonics, or private keys (one per line in <strong>.txt</strong>/<strong>.csv</strong>, or a JSON array). It is uploaded and a server job derives each wallet’s addresses for every supported network, fetches its <strong>holdings</strong> and <strong>USD value</strong>, and shows live progress. Empty wallets are hidden once the scan finishes; click a wallet’s <em>Export addr + seed</em> to download its address and seed phrase (sensitive).</p>
+      <div class="scan-controls">
+        <label class="file-drop" for="scan-file">
+          <input id="scan-file" type="file" accept=".txt,.csv,.json,text/plain,application/json" hidden>
+          <span class="file-drop-inner">${pendingFile ? escapeHtml(pendingFile.name) : 'Choose a <strong>.txt</strong> / <strong>.csv</strong> / <strong>.json</strong> file'}</span>
+        </label>
+        <button class="action-button" id="scan-start" type="button" ${pendingFile ? '' : 'disabled'}>Scan on server<span aria-hidden="true">↗</span></button>
+      </div>
+      <div class="scan-status" id="scan-status"></div>
+      <div class="scan-results" id="scan-results"></div>
+    </section>`;
+}
+
+function setScanStatus() {
+  const el = document.querySelector('#scan-status');
+  if (!el) return;
+  const map = {
+    idle: { cls: '', text: 'Choose a file and press “Scan on server”.' },
+    uploading: { cls: 'is-busy', text: 'Uploading file…' },
+    queued: { cls: 'is-busy', text: 'File uploaded — waiting for the scan to start…' },
+    processing: { cls: 'is-busy', text: `Scanning… ${scanState.processed} / ${scanState.total} processed` },
+    done: { cls: 'is-done', text: `Scan complete — ${scanState.results.filter((r) => r.valid).length} valid wallet(s) of ${scanState.results.length} entries.` },
+    error: { cls: 'is-error', text: `Error: ${escapeHtml(scanState.error || 'unknown')}` },
+  };
+  const s = map[scanState.status] || { cls: '', text: '' };
+  const pct = scanState.total ? Math.round((scanState.processed / scanState.total) * 100) : 0;
+  const bar = scanState.status === 'processing' ? `<div class="scan-progress"><span style="width:${pct}%"></span></div>` : '';
+  el.className = `scan-status ${s.cls}`;
+  el.innerHTML = `${s.text}${bar}`;
+}
+
+function fmtUsd(value) {
+  if (value == null) return '—';
+  return `$${Number(value).toLocaleString('en-US', { maximumFractionDigits: 2 })}`;
+}
+
+function fmtAmt(value) {
+  if (value == null) return '—';
+  return Number(value).toLocaleString('en-US', { maximumFractionDigits: 8 });
+}
+
+function walletHasFunds(result) {
+  if (!result.balances) return true; // unknown -> keep
+  return Object.values(result.balances).some((b) => b && (b.balance > 0 || (b.tokens && b.tokens.some((t) => t && t.balance > 0))));
+}
+
+function renderScanResults() {
+  const el = document.querySelector('#scan-results');
+  if (!el) return;
+  if (!scanState.results.length) { el.innerHTML = ''; return; }
+
+  const hideEmpty = scanState.hideEmpty !== false;
+  const visible = scanState.results.filter((r) => {
+    if (!r.valid) return true;            // always keep invalid/unknown rows
+    if (scanState.status !== 'done') return true; // don't filter mid-scan
+    return !hideEmpty || walletHasFunds(r); // hide confirmed-empty wallets when done
+  });
+
+  const totalValue = scanState.results
+    .filter(walletHasFunds)
+    .reduce((sum, r) => sum + (r.totalValueUsd || 0), 0);
+  const anyMock = scanState.results.some((r) => r.mocked);
+  const fundedCount = visible.filter((r) => r.valid && walletHasFunds(r)).length;
+
+  const summary = `<div class="scan-summary">
+    <div class="scan-summary-line"><b>${fundedCount}</b> wallet(s) with funds · total value <b>${fmtUsd(totalValue)}</b></div>
+    ${anyMock ? '<div class="scan-mock-note">Demo balances (mock). Set MOCK_BALANCES=0 and deploy the Lambda (which has internet) for live holdings + prices.</div>' : ''}
+    <label class="scan-toggle"><input type="checkbox" id="scan-hide-empty" ${hideEmpty ? 'checked' : ''}> Hide empty wallets</label>
+  </div>`;
+
+  const rows = visible.map((r, i) => {
+    const statusBadge = r.valid ? '<span class="scan-ok">VALID</span>' : (r.kind === 'blank' ? '' : '<span class="scan-bad">INVALID</span>');
+    const note = r.valid ? '' : (r.reason ? `<small class="scan-reason">${escapeHtml(r.reason)}</small>` : '');
+    let assets = '—';
+    if (r.balances) {
+      const parts = [];
+      for (const [id, b] of Object.entries(r.balances)) {
+        if (!b) continue;
+        if (b.error) { parts.push(`${b.symbol}: <span class="scan-err">${escapeHtml(b.error)}</span>`); continue; }
+        if (b.balance > 0) parts.push(`<span class="scan-asset"><b>${escapeHtml(b.symbol)}</b> ${fmtAmt(b.balance)} <span class="scan-val">(${fmtUsd(b.valueUsd)})</span></span>`);
+        if (b.tokens && b.tokens.length) {
+          for (const t of b.tokens) {
+            if (t.error) { parts.push(`${t.symbol}: <span class="scan-err">${escapeHtml(t.error)}</span>`); continue; }
+            if (t.balance > 0) parts.push(`<span class="scan-asset scan-token"><b>${escapeHtml(t.symbol)}</b> ${fmtAmt(t.balance)} <span class="scan-val">(${fmtUsd(t.valueUsd)})</span></span>`);
+          }
+        }
+      }
+      assets = parts.length ? parts.join(' ') : '<span class="scan-empty">empty</span>';
+    }
+    const exportBtn = r.valid ? `<button class="copy-button scan-export" data-export-index="${r.index}" type="button">Export addr + seed</button>` : '';
+    return `<tr>
+      <td class="scan-idx">${i + 1}</td>
+      <td class="scan-input"><code>${escapeHtml(r.input || '')}</code>${note}</td>
+      <td>${statusBadge}</td>
+      <td class="scan-assets" data-export-index="${r.index}">${assets}</td>
+      <td class="scan-total">${r.valid ? fmtUsd(r.totalValueUsd) : '—'}</td>
+      <td>${exportBtn}</td>
+    </tr>`;
+  }).join('');
+
+  const download = scanState.status === 'done' ? `<div class="scan-download"><button class="copy-button" id="scan-download" type="button">Download results (JSON)</button></div>` : '';
+  el.innerHTML = `${download}${summary}<div class="scan-table-wrap"><table class="scan-table"><thead><tr><th>#</th><th>Wallet (seed / private key)</th><th>Status</th><th>Assets · balance · USD value</th><th>Wallet value</th><th>Export</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+
+  document.querySelector('#scan-download')?.addEventListener('click', downloadScanResults);
+  document.querySelector('#scan-hide-empty')?.addEventListener('change', (event) => {
+    scanState.hideEmpty = event.target.checked;
+    renderScanResults();
+  });
+  el.querySelectorAll('[data-export-index]').forEach((node) => node.addEventListener('click', () => exportWallet(Number(node.dataset.exportIndex))));
+}
+
+function exportWallet(index) {
+  const result = scanState.results[index];
+  if (!result || !result.valid) return;
+  const confirmed = window.confirm('This TXT file contains the wallet’s seed phrase / private key AND its addresses. It is sensitive — keep it private. Continue?');
+  if (!confirmed) return;
+  const lines = ['WALLET EXPORT (educational / test data only)', `seed-or-private-key: ${result.input}`];
+  if (result.addresses) {
+    for (const [id, addr] of Object.entries(result.addresses)) lines.push(`${id}: ${addr}`);
+  }
+  const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'wallet-export.txt';
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function downloadScanResults() {
+  const blob = new Blob([JSON.stringify(scanState.results, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'wallet-scan-results.json';
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function startScan() {
+  if (!pendingFile) return;
+  scanState = { jobId: null, status: 'uploading', total: 0, processed: 0, results: [], error: null, hideEmpty: true };
+  setScanStatus();
+  renderScanResults();
+  try {
+    const fd = new FormData();
+    fd.append('file', pendingFile, pendingFile.name);
+    const res = await fetch(`${API_BASE}/api/scan`, { method: 'POST', body: fd });
+    if (!res.ok) {
+      const e = await res.json().catch(() => ({}));
+      scanState.status = 'error';
+      scanState.error = e.error || `HTTP ${res.status}`;
+      setScanStatus();
+      return;
+    }
+    const data = await res.json();
+    scanState.jobId = data.jobId;
+    if (data.uploadUrl) {
+      scanState.status = 'queued';
+      setScanStatus();
+      const put = await fetch(data.uploadUrl, { method: 'PUT', body: pendingFile, headers: { 'content-type': 'application/octet-stream' } });
+      if (!put.ok) {
+        scanState.status = 'error';
+        scanState.error = 'S3 upload failed';
+        setScanStatus();
+        return;
+      }
+    }
+    pollScan(data.jobId);
+  } catch (err) {
+    scanState.status = 'error';
+    scanState.error = err.message;
+    setScanStatus();
+  }
+}
+
+async function pollScan(jobId) {
+  try {
+    const res = await fetch(`${API_BASE}/api/scan/${jobId}`);
+    if (!res.ok) return;
+    const job = await res.json();
+    scanState.status = job.status;
+    scanState.total = job.total || 0;
+    scanState.processed = job.processed || 0;
+    scanState.results = job.results || [];
+    scanState.error = job.error || null;
+    setScanStatus();
+    renderScanResults();
+    if (job.status === 'done' || job.status === 'error') return;
+    setTimeout(() => pollScan(jobId), 800);
+  } catch {
+    setTimeout(() => pollScan(jobId), 1500);
+  }
+}
+
 function render() {
   const activeNetwork = selectedNetwork();
   const pathSegments = activeNetwork.path.slice(2).split('/');
@@ -481,11 +687,12 @@ function render() {
     <header class="topbar"><a class="brand" href="#" aria-label="Seedlab home"><span class="brand-mark">S</span><span>seedlab</span></a><div class="topbar-meta"><span class="live-dot"></span> DERIVATION LAB <span class="topbar-divider">/</span> TEST DATA ONLY</div></header>
     <main class="page-shell">
       <div class="page-heading"><div><div class="eyebrow">WALLET BUILD · 5 CALCULATIONS</div><h1>Trace a wallet to its address.</h1><p>Run each calculation in order. Every value is generated in this browser session.</p></div><div class="session-chip"><span class="session-dot"></span>${wallet.stage ? `STEP ${String(Math.min(wallet.stage + 1, 5)).padStart(2, '0')} OF 05` : 'READY TO START'}</div></div>
-      <div class="security-banner"><span class="alert-mark">!</span><p><strong>Public HTTP learning demo.</strong> Secret values stay in this browser; HTTP can be intercepted or altered. Never enter real wallet secrets. The optional TXT export is unencrypted and contains the phrase, passphrase, seed, and private keys; it requires confirmation.</p></div>
+      <div class="security-banner"><span class="alert-mark">!</span><p><strong>Public HTTP learning demo.</strong> The local derivation lab keeps secret values in this browser. The “Scan on server” upload sends your file to the server (S3 + Lambda) for scanning and is <strong>not</strong> stored permanently — only send test data, never real wallet secrets.</p></div>
       <div class="layout-grid">
         <div class="lesson-column">
+          ${scanCardMarkup()}
           <section class="setup-card"><div class="setup-copy"><span class="eyebrow">START HERE</span><h2>Make a fresh demo wallet</h2><p>Uses browser cryptographic randomness. Nothing is saved or sent to EC2.</p></div><div class="setup-controls"><label for="network-select">Derive an address for</label><select id="network-select">${Object.entries(NETWORKS).map(([id, network]) => `<option value="${id}" ${selectedNetworkId === id ? 'selected' : ''}>${network.label}</option>`).join('')}</select><small class="network-note">Includes BTC Legacy, Nested SegWit, Native SegWit and Taproot; TRON; BNB Smart Chain (EVM) and BNB Beacon (BEP2).</small><label for="passphrase">Optional BIP-39 passphrase</label><input id="passphrase" type="password" autocomplete="new-password" placeholder="Leave blank for no passphrase" value="${passphrase.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;')}" ${wallet.stage ? 'disabled' : ''}><small>${wallet.stage ? 'Locked for this derivation; reset to change it.' : 'Case-sensitive. It creates a different wallet.'}</small><button class="action-button generate-button" id="generate">${wallet.stage ? 'Generate another demo wallet' : 'Generate demo wallet'}<span aria-hidden="true">↗</span></button></div></section>
-          <div class="steps-heading"><div><span class="eyebrow">THE PIPELINE</span><h2>Five steps, one address</h2></div><div class="steps-actions">${wallet.stage >= 5 ? `<button class="export-button" id="export-txt">Export full TXT</button><button class="reverse-toggle" id="backward-toggle">${backwardOpen ? 'Hide backward trace' : 'Trace backward'}</button>` : ''}${wallet.stage ? '<button class="reset-button" id="reset">Reset session</button>' : ''}</div></div>
+          <div class="steps-heading"><div><span class="eyebrow">THE PIPELINE</span><h2>Five steps, one address</h2></div><div class="steps-actions">${wallet.stage >= 5 ? `<button class="reverse-toggle" id="backward-toggle">${backwardOpen ? 'Hide backward trace' : 'Trace backward'}</button>` : ''}${wallet.stage ? '<button class="reset-button" id="reset">Reset session</button>' : ''}</div></div>
           ${stepCard({ number: '01', title: 'Entropy → mnemonic', caption: 'Create randomness and encode twelve words', step: 1, body: entropyBody, action: 'Generate 128-bit entropy & phrase' })}
           ${stepCard({ number: '02', title: 'Mnemonic → seed', caption: 'PBKDF2-HMAC-SHA512 · BIP-39', step: 2, body: seedBody, action: 'Derive 512-bit seed' })}
           ${stepCard({ number: '03', title: 'Seed → master node', caption: 'HMAC-SHA512 · BIP-32', step: 3, body: masterBody, action: 'Create BIP-32 master node' })}
@@ -513,7 +720,6 @@ function render() {
     backwardOpen = !backwardOpen;
     render();
   });
-  document.querySelector('#export-txt')?.addEventListener('click', exportDerivationTxt);
   document.querySelector('#run-dlog-lab')?.addEventListener('click', () => { autoSearchEnabled = false; runDiscreteLogLab(); });
   document.querySelector('#run-auto-search')?.addEventListener('click', () => { autoSearchEnabled = true; runDiscreteLogLab(); });
   document.querySelector('#stop-auto-search')?.addEventListener('click', () => { autoSearchEnabled = false; });
@@ -540,6 +746,13 @@ function render() {
       button.textContent = 'Copy unavailable';
     }
   }));
+  document.querySelector('#scan-file')?.addEventListener('change', (event) => {
+    pendingFile = event.target.files && event.target.files[0];
+    render();
+  });
+  document.querySelector('#scan-start')?.addEventListener('click', startScan);
+  setScanStatus();
+  renderScanResults();
 }
 
 function selectNetwork(event) {
@@ -876,202 +1089,6 @@ async function runDiscreteLogLab() {
   render();
 }
 
-function indexedBytes(bytes) {
-  return Array.from(bytes, (value, index) => `${String(index).padStart(2, '0')}  0x${value.toString(16).padStart(2, '0')}`).join('\n');
-}
-
-function networkAddressExportLines() {
-  const network = selectedNetwork();
-  const common = [
-    `Uncompressed secp256k1 public key (65 bytes): ${hex(wallet.publicKey)}`,
-    `X coordinate (32 bytes): ${hex(wallet.publicKey.slice(1, 33))}`,
-    `Y coordinate (32 bytes): ${hex(wallet.publicKey.slice(33, 65))}`,
-  ];
-  if (network.family === 'bitcoin') {
-    const base = [...common, `Compressed public key (33 bytes): ${hex(wallet.compressedPublicKey)}`];
-    if (network.format === 'p2tr') return [
-      ...base,
-      `BIP-86 internal x-only key: ${hex(wallet.taprootData.internalX)}`,
-      `TaggedHash(TapTweak, internal key): ${hex(wallet.taprootData.tweakHash)}`,
-      `TapTweak scalar: ${hex(wallet.taprootData.tweak)}`,
-      `Tweaked private scalar (SENSITIVE): ${hex(wallet.taprootData.outputPrivateKey)}`,
-      `Tweaked output public key: ${hex(wallet.taprootData.outputPublicKey)}`,
-      `Witness v1 output program: ${hex(wallet.taprootData.outputX)}`,
-      'Witness version 1; mainnet HRP bc; Bech32m checksum.',
-      `Bitcoin Taproot P2TR address: ${wallet.address}`,
-    ];
-    const lines = [...base,
-      `SHA-256(compressed public key): ${hex(wallet.btcSha256)}`,
-      `HASH160 = RIPEMD-160(SHA-256): ${hex(wallet.btcHash160)}`];
-    if (network.format === 'p2wpkh') return [...lines,
-      'Native SegWit P2WPKH: witness version 0; mainnet HRP bc; Bech32 checksum.',
-      `Witness program bytes: ${indexedBytes(wallet.btcHash160)}`,
-      `Bitcoin address: ${wallet.address}`,
-      `P2WPKH scriptPubKey: 0014${hex(wallet.btcHash160)}`];
-    if (network.format === 'p2pkh') return [...lines,
-      `P2PKH payload (version 00 || HASH160): ${hex(wallet.btcPayload)}`,
-      `Base58Check checksum: ${hex(wallet.btcChecksum)}`,
-      `Bitcoin Legacy P2PKH address: ${wallet.address}`];
-    return [...lines,
-      `P2WPKH redeem script: ${hex(wallet.btcRedeemScript)}`,
-      `HASH160(redeem script): ${hex(wallet.btcScriptHash)}`,
-      `P2SH payload (version 05 || script hash): ${hex(wallet.btcPayload)}`,
-      `Base58Check checksum: ${hex(wallet.btcChecksum)}`,
-      `Nested SegWit P2SH-P2WPKH address: ${wallet.address}`];
-  }
-  if (network.family === 'bnbBeacon') return [
-    ...common,
-    `Compressed public key (33 bytes): ${hex(wallet.compressedPublicKey)}`,
-    `SHA-256(compressed public key): ${hex(sha256(wallet.compressedPublicKey))}`,
-    `HASH160 payload: ${hex(wallet.btcHash160)}`,
-    'BNB Beacon Chain (legacy BEP2): Bech32, HRP bnb; separate from BNB Smart Chain.',
-    `BNB Beacon address: ${wallet.address}`,
-  ];
-  if (network.family === 'tron') return [
-    ...common,
-    `Keccak input (public-key body X || Y, 64 bytes): ${hex(wallet.publicKey.slice(1))}`,
-    `Keccak-256 digest: ${hex(wallet.keccakHash)}`,
-    `Address bytes (last 20 digest bytes): ${hex(wallet.addressBytes)}`,
-    `TRON payload (0x41 || address bytes): ${hex(wallet.tronPayload)}`,
-    `SHA-256(payload): ${hex(wallet.tronShaFirst)}`,
-    `SHA-256(previous digest): ${hex(wallet.tronShaSecond)}`,
-    `Base58Check checksum (first 4 bytes): ${hex(wallet.tronChecksum)}`,
-    `25-byte Base58Check input: ${hex(wallet.tronBase58Bytes)}`,
-    `TRON mainnet Base58Check address: ${wallet.address}`,
-  ];
-  return [
-    ...common,
-    `Keccak input (public-key body X || Y, 64 bytes): ${hex(wallet.publicKey.slice(1))}`,
-    'Ethereum/BNB Smart Chain use legacy Keccak-256 padding (not SHA3-256).',
-    `Full Keccak-256 digest: ${hex(wallet.keccakHash)}`,
-    `Address payload (last 20 digest bytes): ${hex(wallet.addressBytes)}`,
-    `EIP-55 checksum hash: ${hex(wallet.eip55Hash)}`,
-    `${network.label} address: ${wallet.address}`,
-  ];
-}
-
-function networkSearchExportLines() {
-  const result = discreteLogResult;
-  const network = NETWORKS[result?.networkId ?? selectedNetworkId];
-  if (!result) return ['Not run during this session.'];
-  if (result.status === 'invalid') return [`Invalid ${network.label} input: ${result.reason}`, 'No candidates were tested.'];
-  if (result.status === 'publicKey') return [
-    `Input kind: validated secp256k1 public key`,
-    `Public key (65-byte uncompressed): ${hex(result.parsed.publicKey)}`,
-    `Address-generation Keccak-256 of X || Y (32 bytes): ${hex(result.parsed.keyKeccakHash)}`,
-    `Derived Ethereum address: ${result.parsed.display}`,
-    `EIP-55 checksum hash of lowercase address text: ${hex(result.parsed.checksumHash)}`,
-    'No scalar search was run. The private key was not supplied or derived.',
-  ];
-  const lines = [
-    `Selected network/profile: ${network.label} (${network.path})`,
-    `Entered address: ${result.addressInput}`,
-    `Canonical address: ${result.parsed.display}`,
-    `Address bytes: ${hex(result.parsed.bytes)}`,
-  ];
-  if (network.family === 'evm') lines.push(`EIP-55 hash: ${hex(result.parsed.checksumHash)}`);
-  if (network.family === 'tron') lines.push(`TRON payload: ${hex(result.parsed.payload)}`, `Base58Check checksum: ${hex(result.parsed.checksum)}`);
-  if (network.family === 'bitcoin') {
-    lines.push(`Address format: ${network.format}`, `Address payload/program: ${hex(result.parsed.bytes)}`);
-    if (network.format === 'p2wpkh') lines.push('Witness v0; HRP bc; Bech32 checksum verified.', `P2WPKH scriptPubKey: 0014${hex(result.parsed.bytes)}`);
-    else if (network.format === 'p2tr') lines.push('Witness v1; HRP bc; Bech32m checksum verified.', `Taproot x-only output key: ${hex(result.parsed.bytes)}`);
-    else lines.push(`Base58Check payload: ${hex(result.parsed.payload)}`, `Base58Check checksum: ${hex(result.parsed.checksum)} (verified).`, network.format === 'p2sh-p2wpkh' ? 'Redeem script is not recoverable from the address alone.' : 'Legacy P2PKH version byte 00.');
-  }
-  if (network.family === 'bnbBeacon') lines.push(`BNB Beacon HASH160 payload: ${hex(result.parsed.bytes)}`, 'Bech32 HRP bnb; checksum verified.');
-  lines.push(`Algorithm: derive secp256k1 public keys for scalars ${result.startScalar}..${result.lastScalar}; encode each address using ${network.label} rules; compare with target.`);
-  lines.push(result.foundScalar ? `Match found: private scalar d=${result.foundScalar}; uncompressed public key=${result.foundPublicKey}.` : `No match in latest interval ${result.startScalar}..${result.lastScalar}; cumulative search tested through scalar ${result.totalTested}. Other scalars remain untested.`);
-  lines.push(`Measured latest batch: ${result.elapsedMs.toFixed(2)} ms for ${result.trials} candidates; ${result.candidatesPerSecond.toFixed(2)} candidates/second.`);
-  lines.push(`Address-preimage estimate: average approximately 2^${result.addressBits} candidate addresses; at the latest measured rate approximately 10^${result.log10ExpectedYears.toFixed(1)} years. This is an extrapolation, not a practical key-recovery method. The app's fixed upper bound is scalar ${SEARCH_SCALAR_LIMIT}.`);
-  lines.push(`First candidate in latest batch, d=${result.startScalar}: ${result.firstCandidateAddress}`, `Last candidate in latest batch, d=${result.lastScalar}: ${result.lastCandidateAddress}`);
-  lines.push('An address does not reveal its public key or private scalar. No address or derivation value is sent to a server.');
-  return lines;
-}
-
-function exportDerivationTxt() {
-  const confirmed = window.confirm('This plain-text file contains the mnemonic, optional passphrase, seed, and private keys. It is not encrypted. Save it only for this educational demo and keep it private. Continue?');
-  if (!confirmed) return;
-
-  const entropyRoundTrip = mnemonicToEntropy(wallet.phrase, wordlist);
-  const pathReport = wallet.pathNodes.map((entry, index) => [
-    `PATH NODE ${index + 1}: ${entry.fullPath}`,
-    `  segment: ${entry.segment} (${entry.hardened ? 'hardened' : 'normal'})`,
-    `  child index: ${entry.childIndex} (0x${entry.childIndex.toString(16).padStart(8, '0')})`,
-    `  depth: ${entry.node.depth}`,
-    `  private key: ${hex(entry.node.privateKey)}`,
-    `  chain code: ${hex(entry.node.chainCode)}`,
-    `  compressed public key: ${hex(entry.node.publicKey)}`,
-  ].join('\n')).join('\n\n');
-
-  const report = [
-    'SEEDLAB — FULL EDUCATIONAL WALLET DERIVATION',
-    `Created locally: ${new Date().toISOString()}`,
-    'WARNING: Unencrypted secret export. Demo values only; never use for real funds.',
-    'All calculations were performed in this browser. This text file contains private wallet material.',
-    '',
-    'DERIVATION SETTINGS',
-    `Selected network: ${selectedNetwork().label}`,
-    `Derivation path: ${selectedNetwork().path}`,
-    `BIP-39 passphrase (exact, JSON-escaped): ${JSON.stringify(passphrase)}`,
-    '',
-    'STEP 1 — ENTROPY → BIP-39 MNEMONIC',
-    'Generate 16 bytes with the browser CSPRNG (128 bits).',
-    `Entropy hex: ${hex(wallet.entropy)}`,
-    'SHA-256 digest of entropy (all 32 bytes):',
-    indexedBytes(wallet.entropyHash),
-    `Checksum: first 4 digest bits = ${wallet.entropyChecksum}`,
-    'Carry/transform: append those 4 bits to the 128 entropy bits = 132 bits.',
-    'Split the 132-bit stream into twelve 11-bit integers; each integer indexes the BIP-39 English list.',
-    'Word mapping (position | 11 bits | zero-based list index | word):',
-    ...wallet.phrase.split(' ').map((word, index) => `${String(index + 1).padStart(2, '0')} | ${wallet.wordChunks[index]} | ${String(wordlist.indexOf(word)).padStart(4, '0')} | ${word}`),
-    `Mnemonic: ${wallet.phrase}`,
-    `Mnemonic decodes back to original entropy: ${hex(entropyRoundTrip)} (match: ${hex(entropyRoundTrip) === hex(wallet.entropy)})`,
-    'Reversibility: word-index mapping restores the entropy; checksum is verified, not extra entropy.',
-    '',
-    'STEP 2 — MNEMONIC + PASSPHRASE → 512-BIT BIP-39 SEED',
-    'Normalize mnemonic and passphrase with Unicode NFKD. PBKDF2-HMAC-SHA512 uses 2,048 iterations and dkLen=64 bytes.',
-    'Salt is UTF-8("mnemonic" + NFKD(passphrase)); full salt bytes:',
-    indexedBytes(wallet.bip39Salt),
-    `Seed hex (64 bytes / 512 bits): ${hex(wallet.seed)}`,
-    'Carry/transform: the 64-byte derived output is new key material, not an encrypted or reversible copy of the phrase.',
-    '',
-    'STEP 3 — BIP-39 SEED → BIP-32 MASTER NODE',
-    'HMAC-SHA512(key=UTF-8("Bitcoin seed"), data=the 64-byte BIP-39 seed).',
-    `Full HMAC output IL || IR (64 bytes): ${hex(wallet.masterHmacOutput)}`,
-    `IL / master private scalar (first 32 bytes): ${hex(wallet.master.privateKey)}`,
-    `IR / master chain code (last 32 bytes): ${hex(wallet.master.chainCode)}`,
-    'Carry/transform: IL and IR form the master node. HMAC output does not provide a practical inverse to recover the seed.',
-    '',
-    `STEP 4 — BIP-32 MASTER → ${selectedNetwork().label.toUpperCase()} ACCOUNT`,
-    `Derive each child in path order; apostrophe means hardened. Path: ${selectedNetwork().path}.`,
-    pathReport,
-    `Final account private key: ${hex(wallet.account.privateKey)}`,
-    '',
-    `STEP 5 — SECP256K1 PUBLIC KEY → ${selectedNetwork().label.toUpperCase()} ADDRESS`,
-    ...networkAddressExportLines(),
-    '',
-    'REVERSIBILITY SUMMARY',
-    'Mnemonic ↔ entropy: reversible encoding (checksum can be validated).',
-    'Mnemonic/passphrase → seed: PBKDF2 is not practically invertible; only candidate phrases can be checked by deriving forward.',
-    'Seed → BIP-32 node → child keys: deterministic forward derivation; path and hardened levels matter.',
-    'Private key → public key: elliptic-curve scalar multiplication; reversing requires solving the secp256k1 discrete-log problem.',
-    selectedNetwork().family === 'bitcoin' ? `Bitcoin ${selectedNetwork().format} address: profile-specific public-key hashing/encoding; no practical inverse.` : selectedNetwork().family === 'tron' ? 'TRON address: Keccak-256 truncation plus Base58Check version and checksum; no practical inverse.' : selectedNetwork().family === 'bnbBeacon' ? 'BNB Beacon address: HASH160 of compressed public key and Bech32; no practical inverse.' : selectedNetworkId === 'bnb' ? 'BNB Smart Chain address: same EVM address construction as Ethereum; no practical inverse.' : 'Ethereum address: Keccak-256 truncation and EIP-55 casing; no practical inverse.' ,
-    '',
-    'BOUNDED SECP256K1 ADDRESS SEARCH (if run)',
-    ...networkSearchExportLines(),
-    '',
-    'END — Treat this file as secret because it contains the phrase, passphrase, seed, and private keys.',
-  ].join('\n');
-
-  const blob = new Blob([report], { type: 'text/plain;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = `seedlab-derivation-${wallet.address.slice(2).toLowerCase()}.txt`;
-  document.body.append(link);
-  link.click();
-  link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
 
 function wipeWalletSecrets() {
   wipeTaprootData();
