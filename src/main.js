@@ -228,6 +228,16 @@ function taprootDetails(privateKey) {
   };
 }
 
+function exportTextFile(filename, contents) {
+  const blob = new Blob([contents], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 async function copyToClipboard(value) {
   try {
     if (navigator.clipboard?.writeText) {
@@ -676,7 +686,7 @@ function render() {
     <section class="backward-panel dlog-panel">
       <div class="backward-heading"><div><span class="eyebrow">ADDRESS SEARCH · LOCAL ONLY</span><h3>Inspect a ${activeNetwork.label} address or public key</h3></div><span class="live-example">${SEARCH_BATCH_SIZE} PER BATCH · ${SEARCH_SCALAR_LIMIT.toLocaleString()} TOTAL CAP</span></div>
       <p class="backward-intro">Enter an address to test consecutive bounded scalar batches, or paste a public key to calculate its full address-generation Keccak-256 digest directly. Public-key input does not run a scalar search. Address batches remain capped at 1–${SEARCH_SCALAR_LIMIT.toLocaleString()}.</p>
-      <div class="dlog-address-control"><label for="lab-address">${activeNetwork.label} address or public key</label><input id="lab-address" type="text" spellcheck="false" autocomplete="off" placeholder="${addressPlaceholder()}" value="${escapeHtml(labAddressInput ?? wallet.address)}" ${discreteLogProgress ? 'disabled' : ''}><small>${addressInputHint()}</small></div>
+      <div class="dlog-address-control"><label for="lab-address">${activeNetwork.label} address or public key</label><input id="lab-address" type="text" spellcheck="false" autocomplete="off" placeholder="${addressPlaceholder()}" value="${escapeHtml(labAddressInput ?? wallet.address)}" ${discreteLogProgress ? 'disabled' : ''}><small>${addressInputHint()}</small>${labAddressInput?.trim() ? '<button class="reverse-toggle" id="export-public-address" type="button">Export public address</button>' : ''}</div>
       <div class="dlog-warning"><strong>This is a bounded address search—not a full secp256k1 break.</strong> An address alone does not reveal its public key or private key. If you provide a public key, the app can compute its address digest, but cannot derive the private key. Address search runs in batches of ${SEARCH_BATCH_SIZE} and cannot test beyond scalar ${SEARCH_SCALAR_LIMIT.toLocaleString()}. Everything runs in this browser; automatic search requires this tab/device to stay awake and is not an EC2 background job.</div>
       <div class="dlog-actions"><button class="action-button dlog-button" id="run-dlog-lab" type="button" ${discreteLogProgress || searchLimitReached ? 'disabled' : ''}>${searchButtonLabel}<span aria-hidden="true">↗</span></button><button class="dlog-auto-button" id="run-auto-search" type="button" ${discreteLogProgress || searchLimitReached || publicKeyInputEntered ? 'disabled' : ''}>Auto-search ${canContinueSearch ? `${nextSearchScalar}–${SEARCH_SCALAR_LIMIT.toLocaleString()}` : `1–${SEARCH_SCALAR_LIMIT.toLocaleString()}`}<span aria-hidden="true">↗</span></button></div>
       ${discreteLogProgress ? `<div class="dlog-live-progress" role="status" aria-live="polite"><b>Testing scalars ${discreteLogProgress.startScalar}–${discreteLogProgress.endScalar}</b><div class="search-progress"><span style="width:${100 * discreteLogProgress.completed / discreteLogProgress.trials}%"></span></div><p>${discreteLogProgress.completed}/${discreteLogProgress.trials} ${discreteLogProgress.auto ? 'in this automatic run' : 'in this batch'} · ${discreteLogProgress.elapsedMs.toFixed(2)} ms elapsed · ${discreteLogProgress.candidatesPerSecond.toFixed(0)} candidates/s measured. Overall tested-through scalar: ${discreteLogProgress.startScalar + discreteLogProgress.completed - 1} of ${SEARCH_SCALAR_LIMIT.toLocaleString()} max.</p>${discreteLogProgress.auto && autoSearchEnabled ? '<button class="dlog-stop-button" id="stop-auto-search" type="button">Stop after this progress block (max 4,096 candidates)</button>' : ''}</div>` : searchResultMarkup(discreteLogResult, activeNetwork, searchLimitReached)}
@@ -697,7 +707,7 @@ function render() {
           ${stepCard({ number: '02', title: 'Mnemonic → seed', caption: 'PBKDF2-HMAC-SHA512 · BIP-39', step: 2, body: seedBody, action: 'Derive 512-bit seed' })}
           ${stepCard({ number: '03', title: 'Seed → master node', caption: 'HMAC-SHA512 · BIP-32', step: 3, body: masterBody, action: 'Create BIP-32 master node' })}
           ${stepCard({ number: '04', title: `Master node → ${activeNetwork.label} keypair`, caption: `${activeNetwork.path.split('/')[1].replaceAll("'", '′')} path · secp256k1`, step: 4, body: accountBody, action: `Derive ${activeNetwork.label} account` })}
-          ${stepCard({ number: '05', title: `${activeNetwork.label} public key → address`, caption: addressCaption(activeNetwork), step: 5, body: addressBody, action: `Compute ${activeNetwork.label} address` })}
+          ${stepCard({ number: '05', title: `${activeNetwork.label} public key → address`, caption: addressCaption(activeNetwork), step: 5, body: addressBody, action: `Compute ${activeNetwork.label} address` })}${wallet.stage >= 5 ? '<button class="reverse-toggle" id="export-seed-wallet" type="button">Export wallet details</button><p class="hash-footnote">Includes the address and BIP-39 recovery phrase. Anyone with the phrase can control the wallet; save it only somewhere secure.</p>' : ''}
           ${backwardPanel}
           ${discreteLogLab}
         </div>
@@ -715,6 +725,8 @@ function render() {
   passInput?.addEventListener('input', (event) => { passphrase = event.target.value; });
   document.querySelector('#network-select')?.addEventListener('change', selectNetwork);
   document.querySelector('#generate')?.addEventListener('click', generateWallet);
+  document.querySelector('#export-seed-wallet')?.addEventListener('click', () => exportTextFile('wallet-export.txt', `Wallet address: ${wallet.address}\nNetwork: ${activeNetwork.label}\nBIP-39 recovery phrase: ${wallet.phrase}\n\nSECURITY: This phrase controls the wallet. Keep it private.`));
+  document.querySelector('#export-public-address')?.addEventListener('click', () => exportTextFile('public-address.txt', `Public address: ${(labAddressInput ?? '').trim()}\nNetwork: ${activeNetwork.label}\n`));
   document.querySelector('#reset')?.addEventListener('click', resetWallet);
   document.querySelector('#backward-toggle')?.addEventListener('click', () => {
     backwardOpen = !backwardOpen;
