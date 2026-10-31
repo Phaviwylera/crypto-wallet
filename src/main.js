@@ -423,7 +423,7 @@ function renderScanResults() {
       <td class="scan-idx">${i + 1}</td>
       <td class="scan-input"><code>${escapeHtml(r.input || '')}</code>${note}</td>
       <td>${statusBadge}</td>
-      <td class="scan-assets" data-export-index="${r.index}">${assets}</td>
+      <td class="scan-assets"><button class="scan-assets-open" data-detail-index="${r.index}" type="button" ${r.valid ? '' : 'disabled'} aria-label="View ${escapeHtml(r.input || 'wallet')} assets">${assets}<span class="scan-view-hint">View / export</span></button></td>
       <td class="scan-total">${r.valid ? fmtUsd(r.totalValueUsd) : '—'}</td>
       <td>${exportBtn}</td>
     </tr>`;
@@ -438,6 +438,31 @@ function renderScanResults() {
     renderScanResults();
   });
   el.querySelectorAll('[data-export-index]').forEach((node) => node.addEventListener('click', () => exportWallet(Number(node.dataset.exportIndex))));
+  el.querySelectorAll('[data-detail-index]').forEach((node) => node.addEventListener('click', () => showWalletDetails(Number(node.dataset.detailIndex))));
+}
+
+function showWalletDetails(index) {
+  const result = scanState.results[index];
+  if (!result || !result.valid) return;
+  document.querySelector('#wallet-details-dialog')?.remove();
+  const assetRows = [];
+  for (const [network, balance] of Object.entries(result.balances || {})) {
+    if (balance?.balance > 0) assetRows.push(`<li><b>${escapeHtml(balance.symbol)}</b> ${fmtAmt(balance.balance)} (${fmtUsd(balance.valueUsd)}) · ${escapeHtml(network)}</li>`);
+    for (const token of balance?.tokens || []) {
+      if (token?.balance > 0) assetRows.push(`<li><b>${escapeHtml(token.symbol)}</b> ${fmtAmt(token.balance)} (${fmtUsd(token.valueUsd)}) · ${escapeHtml(network)}</li>`);
+    }
+  }
+  const addressRows = Object.entries(result.addresses || {}).map(([network, address]) => `<li><b>${escapeHtml(network)}</b><code>${escapeHtml(address)}</code></li>`).join('');
+  const dialog = document.createElement('dialog');
+  dialog.id = 'wallet-details-dialog';
+  dialog.className = 'wallet-details-dialog';
+  dialog.innerHTML = `<div class="wallet-details-heading"><div><span class="eyebrow">ASSET DETAILS</span><h2>${fmtUsd(result.totalValueUsd)} total</h2></div><button type="button" class="reverse-toggle" data-close-details>Close</button></div><h3>Holdings</h3><ul>${assetRows.length ? assetRows.join('') : '<li>No reported assets with a balance.</li>'}</ul><h3>Wallet addresses</h3><ul class="wallet-address-list">${addressRows}</ul><p class="hash-footnote">Exporting includes sensitive recovery material. Anyone with the seed phrase or private key can control the wallet.</p><button type="button" class="action-button" data-detail-export>Export address + seed</button>`;
+  document.body.append(dialog);
+  dialog.showModal();
+  dialog.querySelector('[data-close-details]').addEventListener('click', () => dialog.close());
+  dialog.addEventListener('click', (event) => { if (event.target === dialog) dialog.close(); });
+  dialog.querySelector('[data-detail-export]').addEventListener('click', () => exportWallet(index));
+  dialog.addEventListener('close', () => dialog.remove(), { once: true });
 }
 
 function exportWallet(index) {
