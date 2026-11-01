@@ -30,7 +30,7 @@ export function runPollardKangarooDemo() {
 
   for (; tameSteps < MAX_STEPS; tameSteps += 1) {
     const key = pointKey(tamePoint);
-    if (!tamePoints.has(key)) tamePoints.set(key, tameDistance);
+    if (!tamePoints.has(key)) tamePoints.set(key, { distance: tameDistance, step: tameSteps });
     const index = jumpIndex(tamePoint);
     tamePoint = tamePoint.add(jumpPoints[index]);
     tameDistance += STEP_SIZES[index];
@@ -40,13 +40,23 @@ export function runPollardKangarooDemo() {
   let wildDistance = 0n;
   let wildSteps = 0;
   let recovered = null;
+  let collision = null;
   for (; wildSteps < MAX_STEPS; wildSteps += 1) {
-    const tameAtDistance = tamePoints.get(pointKey(wildPoint));
-    if (tameAtDistance !== undefined) {
-      const offset = WIDTH + tameAtDistance - wildDistance;
+    const collisionKey = pointKey(wildPoint);
+    const tameRecord = tamePoints.get(collisionKey);
+    if (tameRecord !== undefined) {
+      const offset = WIDTH + tameRecord.distance - wildDistance;
       const candidate = LOWER + offset;
       if (candidate >= LOWER && candidate <= UPPER && BASE.multiply(candidate).equals(targetPoint)) {
         recovered = candidate;
+        collision = {
+          point: `0x${collisionKey}`,
+          tameDistance: tameRecord.distance.toString(),
+          wildDistance: wildDistance.toString(),
+          offset: offset.toString(),
+          tameStep: tameRecord.step,
+          wildStep: wildSteps,
+        };
         break;
       }
     }
@@ -60,6 +70,9 @@ export function runPollardKangarooDemo() {
     upper: UPPER.toString(),
     width: WIDTH.toString(),
     targetPoint: `0x${pointKey(targetPoint)}`,
+    shiftedTarget: `0x${pointKey(shiftedTarget)}`,
+    tameStart: `0x${pointKey(BASE.multiply(WIDTH))}`,
+    collision,
     recovered: recovered?.toString() ?? null,
     tameSteps,
     wildSteps,
