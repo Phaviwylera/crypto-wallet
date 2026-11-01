@@ -1071,7 +1071,6 @@ function parseAddressFile(contents, networkId) {
     }
   }
   if (!tokens.length) throw new Error('The text file contains no Ethereum addresses.');
-  if (tokens.length > 100) throw new Error('For this local search, a file can contain at most 100 addresses.');
   const unique = new Map();
   for (const token of tokens) {
     const parsed = parseNetworkAddress(token, networkId);
