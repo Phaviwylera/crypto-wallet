@@ -75,13 +75,15 @@ function runWorker({ workerId, networkId, targetBytesList: targetInputs, targetB
     bucket.push({ bytes, index });
     targetBuckets.set(key, bucket);
   });
-  let scalar = start;
-  let tested = 0;
-  let point = BASE.multiply(BigInt(start));
+  let scalar = BigInt(start);
+  const endScalar = BigInt(end);
+  const chunkSizeBigInt = BigInt(chunkSize);
+  let tested = 0n;
+  let point = BASE.multiply(scalar);
   const startedAt = performance.now();
 
   const reportCancelled = () => self.postMessage({
-    type: 'cancelled', workerId, tested, currentScalar: scalar - 1,
+    type: 'cancelled', workerId, tested, currentScalar: scalar - 1n,
     elapsedMs: Math.max(performance.now() - startedAt, 0.01),
   });
 
@@ -90,10 +92,11 @@ function runWorker({ workerId, networkId, targetBytesList: targetInputs, targetB
       reportCancelled();
       return;
     }
-    const chunkEnd = Math.min(end, scalar + chunkSize - 1);
+    const proposedChunkEnd = scalar + chunkSizeBigInt - 1n;
+    const chunkEnd = proposedChunkEnd < endScalar ? proposedChunkEnd : endScalar;
     while (scalar <= chunkEnd) {
       const payload = addressPayloadForPoint(point, networkId);
-      tested += 1;
+      tested += 1n;
       const bucket = payload ? targetBuckets.get(prefixKey(payload)) : null;
       const found = bucket?.find(({ bytes }) => matchesBytes(payload, bytes));
       if (found) {
@@ -104,16 +107,16 @@ function runWorker({ workerId, networkId, targetBytesList: targetInputs, targetB
         });
         return;
       }
-      scalar += 1;
-      if (scalar <= end) point = point.add(BASE);
+      scalar += 1n;
+      if (scalar <= endScalar) point = point.add(BASE);
     }
 
-    const message = { workerId, tested, currentScalar: scalar - 1, elapsedMs: Math.max(performance.now() - startedAt, 0.01) };
+    const message = { workerId, tested, currentScalar: scalar - 1n, elapsedMs: Math.max(performance.now() - startedAt, 0.01) };
     if (stopRequested) {
       self.postMessage({ type: 'cancelled', ...message });
       return;
     }
-    if (scalar > end) {
+    if (scalar > endScalar) {
       self.postMessage({ type: 'done', ...message });
       return;
     }
