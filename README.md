@@ -48,6 +48,10 @@ Workers partition the range and update each public point incrementally (`Q_(d+1)
 
 This is not practical recovery for a randomly generated real wallet: 10²¹ is about `2^70` scalars, while secp256k1 has nearly `2^256` possible private scalars. A miss rules out only the tested interval. Keep this as a browser-side educational/test-range tool. A server-side EC2 search would require a compute API, expose the instance to abuse and unexpected CPU charges, and disclose the searched address to that server; it is not recommended for the public static site.
 
+## Pollard kangaroo toy demo
+
+Run `npm run demo:kangaroo` to see a bounded discrete-log example using a deliberately small, synthetic scalar interval. The script recovers the toy scalar from its public point and verifies `Q = dG`. It does not read real wallet addresses, transaction hashes, or keys. Pollard kangaroo only improves search when a credible scalar interval is already known; it does not make normal wallet private keys recoverable from public data.
+
 ## Server-side wallet scan (upload → EC2/Lambda)
 
 The app now has an **upload panel**: drop a file of wallet secrets (seeds, BIP-39 mnemonics, or hex private keys), one per line in `.txt`/`.csv`, or a JSON array. The file is uploaded and a server job derives each input's addresses for **every** supported network (Ethereum, BNB Smart Chain, BTC Legacy/Nested/Native-SegWit/Taproot, TRON, BNB Beacon) and validates them. The UI polls for live progress and shows a results table.
