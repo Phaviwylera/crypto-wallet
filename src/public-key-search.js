@@ -5,7 +5,7 @@ import { bytesToHex } from '@noble/hashes/utils.js';
 import { parseSearchRange } from './search-range.js';
 
 const Point = secp256k1.Point;
-export const MAX_INTERVAL_SIZE = 1_000_000n;
+export const MAX_INTERVAL_SIZE = 100_000_000n;
 export const MAX_TARGETS = 10_000;
 
 // The public-key extraction export is tab separated, with an optional header.
