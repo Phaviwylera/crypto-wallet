@@ -54,6 +54,10 @@ function addressPayloadForPoint(point, networkId) {
   throw new Error(`Unsupported search profile: ${networkId}`);
 }
 
+function prefixKey(bytes) {
+  return ((bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3]) >>> 0;
+}
+
 function matchesBytes(left, right) {
   if (!left || left.length !== right.length) return false;
   let difference = 0;
@@ -61,9 +65,16 @@ function matchesBytes(left, right) {
   return difference === 0;
 }
 
-function runWorker({ workerId, networkId, targetBytes: targetInput, start, end, chunkSize }) {
+function runWorker({ workerId, networkId, targetBytesList: targetInputs, targetBytes, start, end, chunkSize }) {
   stopRequested = false;
-  const targetBytes = Uint8Array.from(targetInput);
+  const targets = (targetInputs ?? [targetBytes]).map((bytes) => Uint8Array.from(bytes));
+  const targetBuckets = new Map();
+  targets.forEach((bytes, index) => {
+    const key = prefixKey(bytes);
+    const bucket = targetBuckets.get(key) ?? [];
+    bucket.push({ bytes, index });
+    targetBuckets.set(key, bucket);
+  });
   let scalar = start;
   let tested = 0;
   let point = BASE.multiply(BigInt(start));
@@ -83,9 +94,11 @@ function runWorker({ workerId, networkId, targetBytes: targetInput, start, end, 
     while (scalar <= chunkEnd) {
       const payload = addressPayloadForPoint(point, networkId);
       tested += 1;
-      if (matchesBytes(payload, targetBytes)) {
+      const bucket = payload ? targetBuckets.get(prefixKey(payload)) : null;
+      const found = bucket?.find(({ bytes }) => matchesBytes(payload, bytes));
+      if (found) {
         self.postMessage({
-          type: 'match', workerId, tested, scalar,
+          type: 'match', workerId, tested, scalar, targetIndex: found.index,
           publicKey: `0x${hex(point.toBytes(false))}`,
           elapsedMs: Math.max(performance.now() - startedAt, 0.01),
         });

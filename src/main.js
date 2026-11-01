@@ -34,6 +34,7 @@ let searchRunId = 0;
 let activeSearch = null;
 let searchRenderTimer = null;
 let labAddressInput = null;
+let searchAddressFile = null;
 let pendingFile = null;
 let scanState = { jobId: null, status: 'idle', total: 0, processed: 0, results: [], error: null, hideEmpty: true };
 const API_BASE = (import.meta.env && import.meta.env.VITE_SCAN_API_BASE) || '';
@@ -332,10 +333,12 @@ function searchResultMarkup(result, network) {
   if (result.status === 'publicKey') return `<div class="dlog-results"><div><label>INPUT · VALIDATED SECP256K1 PUBLIC KEY</label><code class="dlog-address-value">${hex(result.parsed.publicKey)}</code>${copyButton('searchPublicKey', 'Copy public key')}<p>Point validation succeeded. No private key was derived.</p></div><div><label>FULL ADDRESS-GENERATION DIGEST · 32 BYTES</label><p>Keccak-256(public key body X || Y):</p><div class="hash-byte-grid output-byte-grid">${byteGrid(result.parsed.keyKeccakHash, result.parsed.keyKeccakHash.length)}</div>${copyButton('searchKeyDigest', 'Copy 32-byte digest')}</div><div><label>DERIVED ETHEREUM ADDRESS</label><code class="dlog-address-value">${result.parsed.display}</code>${networkAddressDetails(result.parsed, network)}<p>No scalar search was run.</p></div></div>`;
   if (result.status === 'cancelled') return `<div class="dlog-warning"><strong>Search stopped.</strong> Checked ${result.totalTested.toLocaleString()} of ${SEARCH_SCALAR_LIMIT.toLocaleString()} candidates in ${result.elapsedMs.toFixed(1)} ms (${result.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second). This partial run cannot rule out the untested scalars.</div>`;
   if (result.status === 'error') return `<div class="dlog-warning result-error"><strong>Search failed.</strong> ${escapeHtml(result.message)}</div>`;
+  const targets = result.targets?.length ? result.targets : [result.parsed];
   const matchText = result.foundScalar
-    ? `Match found at scalar d=${result.foundScalar}. This candidate reproduces the entered address.`
-    : `No match in the complete interval 1–${SEARCH_SCALAR_LIMIT.toLocaleString()}.`;
-  return `<div class="dlog-results"><div><label>INPUT · ${network.shortLabel} ADDRESS</label><code class="dlog-address-value">${escapeHtml(result.parsed.display)}</code><div class="hash-byte-grid address-byte-grid">${byteGrid(result.parsed.bytes)}</div>${networkAddressDetails(result.parsed, network)}</div><div><label>RESULT · ${result.foundScalar ? 'MATCH' : 'FULL RANGE TESTED'}</label><p>${matchText}</p><p>${result.totalTested.toLocaleString()} candidates checked · ${result.elapsedMs.toFixed(1)} ms · ${result.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second across ${result.workers} workers.</p><p>${result.foundScalar ? `Matching public key: <code class="dlog-address-value">${result.foundPublicKey}</code>` : 'This excludes only the tested scalar interval; it does not recover or rule out keys outside it.'}</p><p>The scalar range is only about 2²³ candidates out of the secp256k1 key space. This bounded test is not a practical real-wallet recovery method.</p></div></div>`;
+    ? `Match found at scalar d=${result.foundScalar}; it matches target ${result.matchTargetIndex + 1} of ${targets.length}.`
+    : `No match for any of the ${targets.length} target${targets.length === 1 ? '' : 's'} in the complete interval 1–${SEARCH_SCALAR_LIMIT.toLocaleString()}.`;
+  const targetList = targets.map((target, index) => `<li><b>${index + 1}.</b> <code>${escapeHtml(target.display)}</code>${result.foundScalar && index === result.matchTargetIndex ? ' <strong>← MATCH</strong>' : ''}</li>`).join('');
+  return `<div class="dlog-results"><div><label>INPUT · ${targets.length} ${targets.length === 1 ? 'ADDRESS TARGET' : 'ADDRESS TARGETS'}</label><ul class="search-target-list">${targetList}</ul>${targets.length === 1 ? `<div class="hash-byte-grid address-byte-grid">${byteGrid(targets[0].bytes)}</div>${networkAddressDetails(targets[0], network)}` : '<p>Every candidate was checked against all loaded addresses in the same pass.</p>'}</div><div><label>RESULT · ${result.foundScalar ? 'MATCH' : 'FULL RANGE TESTED'}</label><p>${matchText}</p><p>${result.totalTested.toLocaleString()} candidates checked · ${result.elapsedMs.toFixed(1)} ms · ${result.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second across ${result.workers} workers.</p><p>${result.foundScalar ? `Matching public key: <code class="dlog-address-value">${result.foundPublicKey}</code>` : 'This excludes only the tested scalar interval; it does not recover or rule out keys outside it.'}</p><p>The scalar range is only about 2²³ candidates out of the secp256k1 key space. This bounded test is not a practical real-wallet recovery method.</p></div></div>`;
 }
 
 function scanCardMarkup() {
@@ -708,15 +711,18 @@ function render() {
     ? 'Searching all 10,000,000 candidates…'
     : publicKeyInputEntered
       ? 'Calculate full Keccak-256 from public key'
-      : searchLimitReached
-        ? 'Run the full 10,000,000 search again'
-        : 'Search all 10,000,000 candidates';
+      : searchAddressFile?.addresses?.length
+        ? `Search ${searchAddressFile.addresses.length} addresses through 10,000,000`
+        : searchLimitReached
+          ? 'Run the full 10,000,000 search again'
+          : 'Search all 10,000,000 candidates';
   const discreteLogLab = wallet.stage >= 5 ? `
     <section class="backward-panel dlog-panel">
       <div class="backward-heading"><div><span class="eyebrow">BOUNDED ADDRESS SEARCH · LOCAL ONLY</span><h3>Search ${activeNetwork.label}</h3></div><span class="live-example">SCALARS 1–${SEARCH_SCALAR_LIMIT.toLocaleString()} · UP TO 4 WORKERS</span></div>
-      <p class="backward-intro">Paste a valid address. Search checks the entire scalar interval 1–${SEARCH_SCALAR_LIMIT.toLocaleString()} by default. If a candidate matches, other workers stop after their current small chunk. It runs in browser workers; the address and candidates are not sent to EC2.</p>
+      <p class="backward-intro">Paste a valid address or load a .txt list of Ethereum addresses. Search checks the entire scalar interval 1–${SEARCH_SCALAR_LIMIT.toLocaleString()} by default. If a candidate matches, other workers stop after their current small chunk. It runs in browser workers; the address and candidates are not sent to EC2.</p>
       <div class="dlog-address-control"><label for="lab-address">${activeNetwork.label} address or public key</label><input id="lab-address" type="text" spellcheck="false" autocomplete="off" placeholder="${addressPlaceholder()}" value="${escapeHtml(labAddressInput ?? wallet.address)}" ${discreteLogProgress ? 'disabled' : ''}><small>${addressInputHint()}</small>${labAddressInput?.trim() ? '<button class="reverse-toggle" id="export-public-address" type="button">Export public address</button>' : ''}</div>
-      <div class="dlog-warning"><strong>This is a bounded search, not practical wallet recovery.</strong> A match is possible only when the target was created by a scalar in this exact range. Ten million is about 2²³ candidates versus nearly 2²⁵⁶ possible secp256k1 scalars. A miss rules out only scalars 1–${SEARCH_SCALAR_LIMIT.toLocaleString()}.</div>
+      ${selectedNetworkId === 'ethereum' ? `<div class="search-file-row"><div class="search-file-copy"><strong>Search several Ethereum addresses together</strong><small>Choose a .txt file with one 0x address per line. One scalar pass checks every address in the file; loaded file targets replace the pasted address until you clear the file.</small></div><label class="search-file-button ${discreteLogProgress ? 'is-disabled' : ''}" for="search-address-file" aria-disabled="${Boolean(discreteLogProgress)}">Choose file</label><input id="search-address-file" type="file" accept=".txt,text/plain" hidden ${discreteLogProgress ? 'disabled' : ''}>${searchAddressFile ? `<span class="search-file-name">${escapeHtml(searchAddressFile.name)} · ${searchAddressFile.addresses?.length ?? 0} addresses</span><button class="search-file-clear" id="clear-search-file" type="button" ${discreteLogProgress ? 'disabled' : ''}>Clear</button>` : ''}</div>${searchAddressFile?.error ? `<p class="search-file-error" role="alert">${escapeHtml(searchAddressFile.error)}</p>` : ''}${searchAddressFile?.addresses?.length ? `<ul class="search-target-preview">${searchAddressFile.addresses.map((address, index) => `<li><b>${index + 1}.</b> <code>${escapeHtml(address)}</code></li>`).join('')}</ul>` : ''}` : ''}
+      <div class="dlog-warning"><strong>This is a bounded search, not practical wallet recovery.</strong> A match is possible only when a target was created by a scalar in this exact range. Ten million is about 2²³ candidates versus nearly 2²⁵⁶ possible secp256k1 scalars. A miss rules out only scalars 1–${SEARCH_SCALAR_LIMIT.toLocaleString()}.</div>
       <div class="dlog-actions"><button class="action-button dlog-button" id="run-dlog-lab" type="button" ${discreteLogProgress ? 'disabled' : ''}>${searchButtonLabel}<span aria-hidden="true">↗</span></button>${discreteLogProgress ? `<button class="dlog-stop-button" id="stop-search" type="button">${discreteLogProgress.stopping ? 'Stopping after current chunks…' : 'Stop search'}</button>` : ''}</div>
       ${discreteLogProgress ? `<div class="dlog-live-progress" role="status" aria-live="polite"><b>Checked ${discreteLogProgress.completed.toLocaleString()} / ${discreteLogProgress.trials.toLocaleString()} candidates</b><div class="search-progress"><span style="width:${100 * discreteLogProgress.completed / discreteLogProgress.trials}%"></span></div><p>${discreteLogProgress.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second · ${discreteLogProgress.workers} browser workers · ${discreteLogProgress.elapsedMs.toFixed(1)} ms elapsed · ${discreteLogProgress.candidatesPerSecond ? `about ${formatDuration((discreteLogProgress.trials - discreteLogProgress.completed) * 1000 / discreteLogProgress.candidatesPerSecond)} remaining at this rate` : 'measuring speed'}.</p></div>` : searchResultMarkup(discreteLogResult, activeNetwork)}
       <p class="step-explanation subtle">Each worker starts with Q=dG, then advances with Q(d+1)=Q(d)+G and compares address payload bytes directly. This avoids a fresh scalar multiplication and address encoding for every candidate. The operation stays on this device; it is not an EC2 background job.</p>
@@ -761,6 +767,25 @@ function render() {
     backwardOpen = !backwardOpen;
     render();
   });
+  document.querySelector('#search-address-file')?.addEventListener('change', async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      const addresses = parseAddressFile(await file.text(), selectedNetworkId);
+      invalidateSearch();
+      searchAddressFile = { name: file.name, addresses, error: null };
+      render();
+    } catch (error) {
+      invalidateSearch();
+      searchAddressFile = { name: file.name, addresses: [], error: error.message };
+      render();
+    }
+  });
+  document.querySelector('#clear-search-file')?.addEventListener('click', () => {
+    invalidateSearch();
+    searchAddressFile = null;
+    render();
+  });
   document.querySelector('#run-dlog-lab')?.addEventListener('click', runDiscreteLogLab);
   document.querySelector('#stop-search')?.addEventListener('click', requestSearchStop);
   document.querySelector('#lab-address')?.addEventListener('input', (event) => {
@@ -797,6 +822,7 @@ function render() {
 
 function selectNetwork(event) {
   invalidateSearch();
+  searchAddressFile = null;
   selectedNetworkId = event.target.value;
   discreteLogResult = null;
   labAddressInput = null;
@@ -1026,6 +1052,31 @@ function deriveNetworkAddress() {
   wallet.address = data.address;
 }
 
+function parseAddressFile(contents, networkId) {
+  const lines = contents.split(/\r?\n/);
+  const tokens = [];
+  for (const [index, line] of lines.entries()) {
+    const trimmed = line.trim().replace(/^\uFEFF/, '');
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const parts = trimmed.split(/[\s,;]+/).filter(Boolean);
+    for (const token of parts) {
+      if (!/^0x[0-9a-fA-F]{40}$/.test(token)) {
+        throw new Error(`Line ${index + 1} is not a 20-byte Ethereum address. Use one address per line.`);
+      }
+      tokens.push(token);
+    }
+  }
+  if (!tokens.length) throw new Error('The text file contains no Ethereum addresses.');
+  if (tokens.length > 100) throw new Error('For this local search, a file can contain at most 100 addresses.');
+  const unique = new Map();
+  for (const token of tokens) {
+    const parsed = parseNetworkAddress(token, networkId);
+    if (!parsed.valid) throw new Error(`Invalid address in file: ${parsed.reason}`);
+    unique.set(parsed.normalized.toLowerCase(), parsed.display);
+  }
+  return [...unique.values()];
+}
+
 function invalidateSearch() {
   searchRunId += 1;
   if (searchRenderTimer) clearTimeout(searchRenderTimer);
@@ -1060,7 +1111,8 @@ function finishSearch(search, status, match = null, message = '') {
     startScalar: 1, lastScalar: status === 'valid' && match ? match.scalar : totalTested,
     trials: totalTested, totalTested, elapsedMs, candidatesPerSecond,
     foundScalar: match?.scalar ?? null, foundPublicKey: match?.publicKey ?? null,
-    foundAddress: match ? search.parsed.display : '', workers: search.workers.length, message,
+    foundAddress: match ? search.targets[match.targetIndex]?.display ?? '' : '',
+    matchTargetIndex: match?.targetIndex ?? -1, targets: search.targets, workers: search.workers.length, message,
   };
   render();
 }
@@ -1069,24 +1121,42 @@ async function runDiscreteLogLab() {
   invalidateSearch();
   const addressInput = document.querySelector('#lab-address')?.value.trim() ?? '';
   labAddressInput = addressInput;
-  const parsed = parseNetworkAddress(addressInput);
-  if (!parsed.valid) {
-    discreteLogResult = { status: 'invalid', addressInput, reason: parsed.reason, networkId: selectedNetworkId };
+  if (selectedNetworkId === 'ethereum' && searchAddressFile?.error) {
+    discreteLogResult = { status: 'invalid', addressInput, reason: 'The selected address file must be corrected or cleared before searching.' };
     render();
     return;
   }
-  if (parsed.inputKind === 'publicKey') {
-    discreteLogResult = { status: 'publicKey', addressInput, networkId: selectedNetworkId, parsed };
+  let targets;
+  if (selectedNetworkId === 'ethereum' && searchAddressFile?.addresses?.length) {
+    targets = searchAddressFile.addresses.map((address) => parseNetworkAddress(address, selectedNetworkId));
+  } else {
+    const parsed = parseNetworkAddress(addressInput);
+    if (!parsed.valid) {
+      discreteLogResult = { status: 'invalid', addressInput, reason: parsed.reason, networkId: selectedNetworkId };
+      render();
+      return;
+    }
+    if (parsed.inputKind === 'publicKey') {
+      discreteLogResult = { status: 'publicKey', addressInput, networkId: selectedNetworkId, parsed };
+      render();
+      return;
+    }
+    targets = [parsed];
+  }
+  const invalidTarget = targets.find((target) => !target.valid);
+  if (invalidTarget) {
+    discreteLogResult = { status: 'invalid', addressInput, reason: invalidTarget.reason, networkId: selectedNetworkId };
     render();
     return;
   }
+  const parsed = targets[0];
 
   const availableCores = navigator.hardwareConcurrency || 2;
   const workerCount = Math.max(1, Math.min(4, availableCores));
   const partitionSize = Math.ceil(SEARCH_SCALAR_LIMIT / workerCount);
   const runId = ++searchRunId;
   const search = {
-    runId, networkId: selectedNetworkId, addressInput, parsed,
+    runId, networkId: selectedNetworkId, addressInput, parsed, targets,
     workers: [], progressByWorker: new Map(), finishedWorkers: new Set(),
     foundMatch: null, cancelRequested: false, manualStop: false, startedAt: performance.now(),
   };
@@ -1139,7 +1209,7 @@ async function runDiscreteLogLab() {
         }
       };
       worker.onerror = (error) => finishSearch(search, 'error', null, error.message || 'A search worker failed.');
-      worker.postMessage({ workerId, networkId: search.networkId, targetBytes: parsed.bytes, start, end, chunkSize: SEARCH_WORKER_CHUNK });
+      worker.postMessage({ workerId, networkId: search.networkId, targetBytesList: targets.map((target) => target.bytes), start, end, chunkSize: SEARCH_WORKER_CHUNK });
     }
   } catch (error) {
     finishSearch(search, 'error', null, error?.message ?? String(error));
@@ -1159,6 +1229,7 @@ function wipeWalletSecrets() {
 
 function resetWallet() {
   invalidateSearch();
+  searchAddressFile = null;
   wipeWalletSecrets();
   wallet = freshWallet();
   passphrase = '';
