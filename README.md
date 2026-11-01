@@ -46,14 +46,38 @@ Workers partition the range and update each public point incrementally (`Q_(d+1)
 
 This is not practical recovery for a randomly generated real wallet: 10,000,000 is about `2^23` scalars, while secp256k1 has nearly `2^256` possible private scalars. A miss rules out only the tested interval. Keep this as a browser-side educational/test-range tool. A server-side EC2 search would require a compute API, expose the instance to abuse and unexpected CPU charges, and disclose the searched address to that server; it is not recommended for the public static site.
 
+## Server-side wallet scan (upload → EC2/Lambda)
+
+The app now has an **upload panel**: drop a file of wallet secrets (seeds, BIP-39 mnemonics, or hex private keys), one per line in `.txt`/`.csv`, or a JSON array. The file is uploaded and a server job derives each input's addresses for **every** supported network (Ethereum, BNB Smart Chain, BTC Legacy/Nested/Native-SegWit/Taproot, TRON, BNB Beacon) and validates them. The UI polls for live progress and shows a results table.
+
+- Local/dev: the bundled Node server (`npm run server`) accepts the upload and scans in-process. Vite dev proxies `/api` to it.
+- Production: the scan runs serverless — the file goes to S3, a Lambda derives the wallets, job state lives in DynamoDB, and the UI polls the API Gateway endpoint. See [`infra/`](infra/) (Terraform) and [`docs/serverless-scan.md`](docs/serverless-scan.md).
+
+Run the local stack:
+
+```sh
+npm run build && npm run server   # serves dist/ + /api on :8787
+# or, for live reload with API proxy:
+npm run dev                       # Vite on :5173 proxies /api -> :8787 (run server separately)
+```
+
+Build/deploy the Lambda:
+
+```sh
+cd server && ./build-lambda.sh    # -> ../infra/seedlab-scan.zip
+cd ../infra && terraform init && terraform apply
+# set VITE_SCAN_API_BASE to the printed api_url, then:
+npm run build
+```
+
 ## Safety
 
-The phrase is generated client-side with `@scure/bip39` using the browser cryptographic random source and is held only in page memory; values are not sent to a server. Clipboard actions expose values to the clipboard. The optional TXT export is unencrypted, includes the mnemonic, optional passphrase, seed, and private keys, and requires explicit confirmation. Treat that file as sensitive.
+The local derivation lab keeps secret values in this browser; they are not sent anywhere. The **upload panel intentionally sends your file to the server** for scanning. Uploads are not retained permanently (the Lambda/S3 setup encrypts them and auto-expires them), but you should still **only upload test data, never real wallet secrets**. Clipboard actions expose values to the clipboard.
 
-The public demo is HTTP-only unless separately configured for HTTPS. Never enter real wallet secrets until HTTPS and a trusted, reviewed build are established. This educational demo is not audited and must not be used to create a wallet for real funds.
+The public demo is HTTP-only unless separately configured for HTTPS. Never enter or upload real wallet secrets until HTTPS and a trusted, reviewed build are established. This educational demo is not audited and must not be used to create or hold a wallet for real funds.
 
 ## Deploy
 
 The repository includes `vercel.json` and can be imported as a Vite project on Vercel (build command `npm run build`, output directory `dist`). It can also be deployed as a static site on Render with the same build command and `dist` publish directory.
 
-For private EC2 hosting, see [the EC2 deployment guide](docs/ec2-deployment.md). Keep SSH/port 22 closed; serve only the static site publicly. The guide describes the configured deployment workflow and Systems Manager setup.
+For private EC2 hosting, see [the EC2 deployment guide](docs/ec2-deployment.md). Keep SSH/port 22 closed; serve only the static site publicly. The guide describes the configured deployment workflow and Systems Manager setup. The server-side scan API is a separate, serverless component — see [`docs/serverless-scan.md`](docs/serverless-scan.md).
