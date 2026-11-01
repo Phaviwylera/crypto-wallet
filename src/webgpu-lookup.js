@@ -75,39 +75,70 @@ export async function createWebGpuLookup(preference = 'high-performance', gpu = 
     }
     const pipeline = await device.createComputePipelineAsync({ layout: 'auto', compute: { module, entryPoint: 'main' } });
     return {
+      adapterInfo: Object.fromEntries(['vendor', 'architecture', 'device', 'description'].map((name) => [name, String(adapter.info?.[name] ?? '')])),
       async prepare(points) {
         const { table, capacity } = buildGpuTable(points);
         const tableBuffer = device.createBuffer({ size: table.byteLength, usage: STORAGE | COPY_DST });
         device.queue.writeBuffer(tableBuffer, 0, table);
+        let buffers = null;
+        let queryCapacity = 0;
+        let inFlight = false;
+        let destroyed = false;
+        const freeBuffers = () => {
+          if (!buffers) return;
+          buffers.query.destroy(); buffers.result.destroy(); buffers.readback.destroy(); buffers.params.destroy();
+          buffers = null; queryCapacity = 0;
+        };
+        const ensureCapacity = (count) => {
+          if (count <= queryCapacity) return;
+          freeBuffers();
+          const created = [];
+          const allocate = (size, usage) => {
+            const buffer = device.createBuffer({ size, usage });
+            created.push(buffer);
+            return buffer;
+          };
+          try {
+            const query = allocate(count * WORDS * 4, STORAGE | COPY_DST);
+            const result = allocate(count * 4, STORAGE | COPY_SRC);
+            const readback = allocate(count * 4, MAP_READ | COPY_DST);
+            const params = allocate(8, STORAGE | COPY_DST);
+            const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+              { binding: 0, resource: { buffer: tableBuffer } }, { binding: 1, resource: { buffer: query } },
+              { binding: 2, resource: { buffer: result } }, { binding: 3, resource: { buffer: params } },
+            ] });
+            buffers = { query, result, readback, params, bindGroup };
+            queryCapacity = count;
+          } catch (error) {
+            created.forEach((buffer) => buffer.destroy());
+            throw error;
+          }
+        };
         return {
           async lookup(pointsToCheck) {
-            if (deviceLost) throw new Error('WebGPU device was lost. Search stopped; retry or choose CPU mode.');
+            if (destroyed || deviceLost) throw new Error('WebGPU device was lost or closed. Search stopped; retry or choose CPU mode.');
             if (!pointsToCheck.length) return [];
-            const data = new Uint32Array(pointsToCheck.length * WORDS);
-            pointsToCheck.forEach((point, index) => data.set(pointWords(point), index * WORDS));
-            const query = device.createBuffer({ size: data.byteLength, usage: STORAGE | COPY_DST });
-            const result = device.createBuffer({ size: pointsToCheck.length * 4, usage: STORAGE | COPY_SRC });
-            const readback = device.createBuffer({ size: pointsToCheck.length * 4, usage: MAP_READ | COPY_DST });
-            const params = device.createBuffer({ size: 8, usage: STORAGE | COPY_DST });
+            if (inFlight) throw new Error('Concurrent lookups on the same WebGPU table are not supported.');
+            inFlight = true;
             try {
+              ensureCapacity(pointsToCheck.length);
+              const data = new Uint32Array(pointsToCheck.length * WORDS);
+              pointsToCheck.forEach((point, index) => data.set(pointWords(point), index * WORDS));
+              const { query, result, readback, params, bindGroup } = buffers;
               device.queue.writeBuffer(query, 0, data);
               device.queue.writeBuffer(params, 0, new Uint32Array([pointsToCheck.length, capacity - 1]));
-              const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
-                { binding: 0, resource: { buffer: tableBuffer } }, { binding: 1, resource: { buffer: query } },
-                { binding: 2, resource: { buffer: result } }, { binding: 3, resource: { buffer: params } },
-              ] });
               const encoder = device.createCommandEncoder();
               const pass = encoder.beginComputePass();
               pass.setPipeline(pipeline); pass.setBindGroup(0, bindGroup); pass.dispatchWorkgroups(Math.ceil(pointsToCheck.length / 64)); pass.end();
               encoder.copyBufferToBuffer(result, 0, readback, 0, pointsToCheck.length * 4);
               device.queue.submit([encoder.finish()]);
-              await readback.mapAsync(MAP_READ);
-              const output = Array.from(new Uint32Array(readback.getMappedRange()).slice(), (value) => value ? value - 1 : undefined);
-              readback.unmap();
-              return output;
-            } finally { query.destroy(); result.destroy(); readback.destroy(); params.destroy(); }
+              await readback.mapAsync(MAP_READ, 0, pointsToCheck.length * 4);
+              try {
+                return Array.from(new Uint32Array(readback.getMappedRange(0, pointsToCheck.length * 4)).slice(0, pointsToCheck.length), (value) => value ? value - 1 : undefined);
+              } finally { readback.unmap(); }
+            } finally { inFlight = false; }
           },
-          destroy() { tableBuffer.destroy(); },
+          destroy() { if (!destroyed) { destroyed = true; freeBuffers(); tableBuffer.destroy(); } },
         };
       },
       destroy() { device.destroy(); },

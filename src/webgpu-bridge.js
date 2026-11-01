@@ -20,6 +20,7 @@ export function createGpuBridgeHost(worker, createLookup = createWebGpuLookup) {
           const created = await createLookup(message.preference);
           if (closed) { created.destroy(); return; }
           gpu = created;
+          value = created.adapterInfo ?? {};
         } else if (operation === 'prepare') {
           if (!gpu) throw new Error('WebGPU bridge is not initialized.');
           const table = await gpu.prepare(message.points);
@@ -70,8 +71,9 @@ export function createGpuBridgeClient(send) {
       if (message.error) entry.reject(new Error(message.error)); else entry.resolve(message.value);
     },
     async create(preference) {
-      await request('init', { preference });
+      const adapterInfo = await request('init', { preference });
       return {
+        adapterInfo,
         async prepare(points) {
           const tableId = await request('prepare', { points: points.map(pointWords) });
           return {

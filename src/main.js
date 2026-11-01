@@ -11,6 +11,7 @@ import { recoverEthereumTransactionPublicKey } from './ethereum-transaction.js';
 import { parseSearchRange, partitionSearchRange } from './search-range.js';
 import { captureScalarFocus, restoreScalarFocus } from './input-focus.js';
 import { createPublicKeySearchPool } from './public-key-search-pool.js';
+import { createGpuBridgeHost } from './webgpu-bridge.js';
 import './style.css';
 
 const app = document.querySelector('#app');
@@ -43,6 +44,8 @@ let searchAddressFile = null;
 let ethereumRpcEndpoint = 'https://ethereum-rpc.publicnode.com';
 let pointSearch = { fileName: '', text: '', lower: '1', upper: '1000000', workers: 'auto', backend: 'cpu', busy: false, count: 0, progress: null, result: null, error: '' };
 let pointSearchPool = null;
+let gpuBenchmark = { preference: 'high-performance', busy: false, progress: null, result: null, error: '' };
+let gpuBenchmarkWorker = null;
 let kangarooDemoResult = null;
 let kangarooDemoBusy = false;
 let kangarooDemoError = '';
@@ -596,6 +599,60 @@ function pointSearchStatusMarkup() {
   return `<div class="dlog-live-progress" role="status"><b>${cancelled ? 'Stopped — partial search' : 'Complete'} · ${result.matches.length} verified match(es)</b><p>${result.completed.toLocaleString()} / ${result.total.toLocaleString()} giant-step slots · ${result.targetCount.toLocaleString()} targets · ${result.workers ?? 0} workers · ${result.cpuWorkers ?? 0} CPU-only + ${result.gpuWorkers ?? 0} WebGPU-assisted · interval ${escapeHtml(result.lower)}–${escapeHtml(result.upper)} · ${(result.elapsedMs / 1000).toFixed(1)} seconds.</p><p>${cancelled ? 'No conclusions can be drawn about unsearched steps.' : 'A miss rules out only this interval for the supplied public keys.'}</p>${matches ? `<p>Matching scalars are sensitive private-key material. Do not share them.</p><ul class="point-matches">${matches}</ul>` : ''}</div>`;
 }
 
+function gpuBenchmarkReport(result) {
+  return JSON.stringify({
+    benchmark: 'Seedlab synthetic WebGPU collision lookup',
+    adapter: result.adapter, adapterPreference: result.preference, executionPath: result.path,
+    verified: result.verified, measuredBatches: result.rounds, queriesPerBatch: result.batchSize,
+    lookups: result.lookups, elapsedMs: Math.round(result.elapsedMs),
+    lookupsPerSecond: Math.round(result.lookupsPerSecond),
+    medianBatchMs: Number(result.medianBatchMs.toFixed(2)), p95BatchMs: Number(result.p95BatchMs.toFixed(2)),
+    note: 'Synthetic GPU lookup/readback and CPU verification only; not full BSGS, ECC operations, or address candidates per second.',
+  }, null, 2);
+}
+
+function gpuBenchmarkStatusMarkup() {
+  if (gpuBenchmark.error) return `<p class="kangaroo-error" role="alert">${escapeHtml(gpuBenchmark.error)}</p>`;
+  if (gpuBenchmark.busy) return `<p class="step-explanation" role="status">${gpuBenchmark.progress ? `Measured ${gpuBenchmark.progress.completedRounds} / ${gpuBenchmark.progress.rounds} batches…` : 'Preparing the WebGPU benchmark…'}</p>`;
+  if (!gpuBenchmark.result) return '<p class="dlog-placeholder">No benchmark run yet.</p>';
+  if (gpuBenchmark.result.status === 'cancelled') return '<p class="step-explanation" role="status">Benchmark stopped; no throughput result was recorded.</p>';
+  return `<div class="dlog-live-progress" role="status"><b>${Math.round(gpuBenchmark.result.lookupsPerSecond).toLocaleString()} verified lookups/second</b><p>Includes upload, dispatch, readback and CPU verification; excludes adapter/table setup and warm-up. This is not full search speed or address candidates per second.</p><pre class="gpu-benchmark-report">${escapeHtml(gpuBenchmarkReport(gpuBenchmark.result))}</pre><button class="search-file-button" id="copy-gpu-benchmark" type="button">Copy benchmark result</button></div>`;
+}
+
+function startGpuBenchmark() {
+  if (gpuBenchmark.busy || pointSearch.busy) return;
+  gpuBenchmark = { ...gpuBenchmark, busy: true, progress: null, result: null, error: '' };
+  render();
+  let worker, host;
+  const finish = (result, error) => {
+    if (gpuBenchmarkWorker !== worker) return;
+    host?.close(); worker?.terminate(); gpuBenchmarkWorker = null;
+    gpuBenchmark.busy = false; gpuBenchmark.result = result ?? null; gpuBenchmark.error = error ?? '';
+    render();
+  };
+  try {
+    worker = new Worker(new URL('./gpu-benchmark-worker.js', import.meta.url), { type: 'module' });
+    gpuBenchmarkWorker = worker;
+    host = createGpuBridgeHost(worker);
+    worker.onmessage = ({ data }) => {
+      if (gpuBenchmarkWorker !== worker) return;
+      if (data.type === 'gpu-request') { void host.handle(data); return; }
+      if (data.type === 'result') { finish(data.result, ''); return; }
+      if (data.type === 'error') { finish(null, data.message); return; }
+      if (data.type === 'progress') {
+        gpuBenchmark.progress = data;
+        const status = document.querySelector('#gpu-benchmark-status');
+        if (status) status.innerHTML = gpuBenchmarkStatusMarkup();
+      }
+    };
+    worker.onerror = (error) => finish(null, error.message || 'GPU benchmark worker failed.');
+    worker.postMessage({ type: 'start', preference: gpuBenchmark.preference });
+  } catch (error) {
+    if (worker) { gpuBenchmarkWorker = worker; finish(null, error?.message ?? String(error)); }
+    else { gpuBenchmark.busy = false; gpuBenchmark.error = error?.message ?? String(error); render(); }
+  }
+}
+
 function pointSearchMarkup() {
   return `<section class="backward-panel dlog-panel" id="public-key-search">
     <div class="backward-heading"><div><span class="eyebrow">PUBLIC-KEY SEARCH · LOCAL ONLY</span><h3>Search uploaded Ethereum public keys</h3></div><span class="live-example">PARALLEL BSGS</span></div>
@@ -606,13 +663,14 @@ function pointSearchMarkup() {
     <div class="point-worker-control"><label for="point-search-workers">CPU workers</label><select id="point-search-workers" ${pointSearch.busy ? 'disabled' : ''}><option value="auto" ${pointSearch.workers === 'auto' ? 'selected' : ''}>Auto (up to 8)</option>${Array.from({ length: 32 }, (_, i) => `<option value="${i + 1}" ${pointSearch.workers === String(i + 1) ? 'selected' : ''}>${i + 1}</option>`).join('')}</select><small>CPU only · actual workers cannot exceed the number of targets. More workers increase CPU and memory use and may be slower. Your browser reports ${escapeHtml(navigator.hardwareConcurrency || 'unknown')} logical cores.</small></div>
     <p class="step-explanation subtle">You can edit bounds during a run; changes apply to the next search. Current run bounds remain unchanged.</p>
     <div class="dlog-warning"><strong>Bounded test only.</strong> Bounds may span the valid secp256k1 private scalar range: 1 to curve order minus one, which is slightly below 2²⁵⁶. The search processes at most 100,000,000 scalars per internal chunk. Large intervals can take vastly longer than a human lifetime; a full-range search is infeasible. No interval is more likely for a randomly generated key. Use only keys you are authorized to test.</div>
-    <div class="dlog-actions"><button class="action-button" id="point-search-start" type="button" ${pointSearch.busy || !pointSearch.text ? 'disabled' : ''}>Search uploaded public keys <span aria-hidden="true">↗</span></button>${pointSearch.busy ? '<button class="dlog-stop-button" id="point-search-stop" type="button">Stop search</button>' : ''}</div>
+    <div class="dlog-actions"><button class="action-button" id="point-search-start" type="button" ${pointSearch.busy || gpuBenchmark.busy || !pointSearch.text ? 'disabled' : ''}>Search uploaded public keys <span aria-hidden="true">↗</span></button>${pointSearch.busy ? '<button class="dlog-stop-button" id="point-search-stop" type="button">Stop search</button>' : ''}</div>
     <div id="point-search-status">${pointSearchStatusMarkup()}</div>
+    <div class="gpu-benchmark-panel"><div><span class="eyebrow">LOCAL · SYNTHETIC</span><h3>Benchmark your GPU</h3><p>Tests verified GPU table lookups only. No uploaded keys are used or sent. Copy the result to share it.</p></div><div class="point-worker-control"><label for="gpu-benchmark-preference">Adapter preference</label><select id="gpu-benchmark-preference" ${gpuBenchmark.busy ? 'disabled' : ''}><option value="high-performance" ${gpuBenchmark.preference === 'high-performance' ? 'selected' : ''}>High-performance preference</option><option value="low-power" ${gpuBenchmark.preference === 'low-power' ? 'selected' : ''}>Low-power preference</option></select><small>Browser may ignore this preference and redact adapter details. Results do not measure GPU elliptic-curve arithmetic.</small></div><div class="dlog-actions"><button class="action-button" id="run-gpu-benchmark" type="button" ${gpuBenchmark.busy || pointSearch.busy ? 'disabled' : ''}>Run GPU benchmark</button>${gpuBenchmark.busy ? '<button class="dlog-stop-button" id="stop-gpu-benchmark" type="button">Stop benchmark</button>' : ''}</div><div id="gpu-benchmark-status">${gpuBenchmarkStatusMarkup()}</div></div>
   </section>`;
 }
 
 function startPointSearch() {
-  if (!pointSearch.text || pointSearch.busy) return;
+  if (!pointSearch.text || pointSearch.busy || gpuBenchmark.busy) return;
   pointSearch = { ...pointSearch, busy: true, progress: null, result: null, error: '', count: 0, runningLower: pointSearch.lower.trim(), runningUpper: pointSearch.upper.trim() };
   render();
   const pool = createPublicKeySearchPool({
@@ -874,6 +932,13 @@ function render() {
   document.querySelector('#generate')?.addEventListener('click', generateWallet);
   document.querySelector('#run-kangaroo-demo')?.addEventListener('click', runKangarooDemoFromUi);
   document.querySelector('#point-search-start')?.addEventListener('click', startPointSearch);
+  document.querySelector('#run-gpu-benchmark')?.addEventListener('click', startGpuBenchmark);
+  document.querySelector('#stop-gpu-benchmark')?.addEventListener('click', (event) => { event.target.disabled = true; event.target.textContent = 'Stopping…'; gpuBenchmarkWorker?.postMessage({ type: 'cancel' }); });
+  document.querySelector('#gpu-benchmark-preference')?.addEventListener('change', (event) => { gpuBenchmark.preference = event.target.value; });
+  document.querySelector('#copy-gpu-benchmark')?.addEventListener('click', async (event) => {
+    try { await copyToClipboard(gpuBenchmarkReport(gpuBenchmark.result)); event.target.textContent = 'Copied'; }
+    catch { event.target.textContent = 'Copy unavailable'; }
+  });
   document.querySelector('#point-retry-cpu')?.addEventListener('click', () => { pointSearch.backend = 'cpu'; startPointSearch(); });
   document.querySelector('#point-search-stop')?.addEventListener('click', (event) => { event.target.disabled = true; event.target.textContent = 'Stopping…'; pointSearchPool?.cancel(); });
   document.querySelector('#point-search-backend')?.addEventListener('change', (event) => { pointSearch.backend = event.target.value; });
