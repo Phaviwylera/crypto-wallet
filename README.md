@@ -50,7 +50,7 @@ This is not practical recovery for a randomly generated real wallet: 10²¹ is a
 
 ## Pollard kangaroo toy demo
 
-The Exchange Lab page includes a visible interactive demo card; click **Run kangaroo demo** to see the tame/wild walks collide. You can also run `npm run demo:kangaroo` in the terminal. Both use a deliberately small, synthetic scalar interval, recover the toy scalar from its public point, and verify `Q = dG`. They do not read real wallet addresses, transaction hashes, or keys. Pollard kangaroo only improves search when a credible scalar interval is already known; it does not make normal wallet private keys recoverable from public data.
+The Exchange Lab page includes a visible interactive demo card; click **Run kangaroo demo** to see a six-step trace of the tame/wild walks, collision distances, scalar equation, and final verification. You can also run `npm run demo:kangaroo` in the terminal. Both use a deliberately small, synthetic scalar interval, recover the toy scalar from its public point, and verify `Q = dG`. They do not read real wallet addresses, transaction hashes, or keys. Pollard kangaroo only improves search when a credible scalar interval is already known; it does not make normal wallet private keys recoverable from public data.
 
 ## Server-side wallet scan (upload → EC2/Lambda)
 
