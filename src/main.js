@@ -21,7 +21,7 @@ const NETWORKS = {
   bnbBeacon: { label: 'BNB Beacon Chain · Legacy', shortLabel: 'BNB Beacon', family: 'bnbBeacon', path: "m/44'/714'/0'/0/0", pathLabels: ['BIP-44 purpose', 'BNB coin type', 'account', 'external chain', 'address index'] },
 };
 let selectedNetworkId = 'ethereum';
-const SEARCH_SCALAR_LIMIT = 10_000_000;
+const SEARCH_SCALAR_LIMIT = 1_000_000_000;
 const SEARCH_WORKER_CHUNK = 8192;
 const selectedNetwork = () => NETWORKS[selectedNetworkId];
 let wallet = freshWallet();
@@ -338,7 +338,7 @@ function searchResultMarkup(result, network) {
     ? `Match found at scalar d=${result.foundScalar}; it matches target ${result.matchTargetIndex + 1} of ${targets.length}.`
     : `No match for any of the ${targets.length} target${targets.length === 1 ? '' : 's'} in the complete interval 1–${SEARCH_SCALAR_LIMIT.toLocaleString()}.`;
   const targetList = targets.map((target, index) => `<li><b>${index + 1}.</b> <code>${escapeHtml(target.display)}</code>${result.foundScalar && index === result.matchTargetIndex ? ' <strong>← MATCH</strong>' : ''}</li>`).join('');
-  return `<div class="dlog-results"><div><label>INPUT · ${targets.length} ${targets.length === 1 ? 'ADDRESS TARGET' : 'ADDRESS TARGETS'}</label><ul class="search-target-list">${targetList}</ul>${targets.length === 1 ? `<div class="hash-byte-grid address-byte-grid">${byteGrid(targets[0].bytes)}</div>${networkAddressDetails(targets[0], network)}` : '<p>Every candidate was checked against all loaded addresses in the same pass.</p>'}</div><div><label>RESULT · ${result.foundScalar ? 'MATCH' : 'FULL RANGE TESTED'}</label><p>${matchText}</p><p>${result.totalTested.toLocaleString()} candidates checked · ${result.elapsedMs.toFixed(1)} ms · ${result.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second across ${result.workers} workers.</p><p>${result.foundScalar ? `Matching public key: <code class="dlog-address-value">${result.foundPublicKey}</code>` : 'This excludes only the tested scalar interval; it does not recover or rule out keys outside it.'}</p><p>The scalar range is only about 2²³ candidates out of the secp256k1 key space. This bounded test is not a practical real-wallet recovery method.</p></div></div>`;
+  return `<div class="dlog-results"><div><label>INPUT · ${targets.length} ${targets.length === 1 ? 'ADDRESS TARGET' : 'ADDRESS TARGETS'}</label><ul class="search-target-list">${targetList}</ul>${targets.length === 1 ? `<div class="hash-byte-grid address-byte-grid">${byteGrid(targets[0].bytes)}</div>${networkAddressDetails(targets[0], network)}` : '<p>Every candidate was checked against all loaded addresses in the same pass.</p>'}</div><div><label>RESULT · ${result.foundScalar ? 'MATCH' : 'FULL RANGE TESTED'}</label><p>${matchText}</p><p>${result.totalTested.toLocaleString()} candidates checked · ${result.elapsedMs.toFixed(1)} ms · ${result.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second across ${result.workers} workers.</p><p>${result.foundScalar ? `Matching public key: <code class="dlog-address-value">${result.foundPublicKey}</code>` : 'This excludes only the tested scalar interval; it does not recover or rule out keys outside it.'}</p><p>The scalar range is only about 2³⁰ candidates out of the secp256k1 key space. This bounded test is not a practical real-wallet recovery method.</p></div></div>`;
 }
 
 function scanCardMarkup() {
@@ -707,22 +707,23 @@ function render() {
   const searchLimitReached = discreteLogResult?.status === 'valid' && !discreteLogResult.foundScalar
     && discreteLogResult.totalTested >= SEARCH_SCALAR_LIMIT;
   const publicKeyInputEntered = activeNetwork.family === 'evm' && looksLikeEvmPublicKey(labAddressInput ?? '');
+  const formattedSearchLimit = SEARCH_SCALAR_LIMIT.toLocaleString();
   const searchButtonLabel = discreteLogProgress
-    ? 'Searching all 10,000,000 candidates…'
+    ? `Searching all ${formattedSearchLimit} candidates…`
     : publicKeyInputEntered
       ? 'Calculate full Keccak-256 from public key'
       : searchAddressFile?.addresses?.length
-        ? `Search ${searchAddressFile.addresses.length} addresses through 10,000,000`
+        ? `Search ${searchAddressFile.addresses.length} addresses through ${formattedSearchLimit}`
         : searchLimitReached
-          ? 'Run the full 10,000,000 search again'
-          : 'Search all 10,000,000 candidates';
+          ? `Run the full ${formattedSearchLimit} search again`
+          : `Search all ${formattedSearchLimit} candidates`;
   const discreteLogLab = wallet.stage >= 5 ? `
     <section class="backward-panel dlog-panel">
-      <div class="backward-heading"><div><span class="eyebrow">BOUNDED ADDRESS SEARCH · LOCAL ONLY</span><h3>Search ${activeNetwork.label}</h3></div><span class="live-example">SCALARS 1–${SEARCH_SCALAR_LIMIT.toLocaleString()} · UP TO 4 WORKERS</span></div>
+      <div class="backward-heading"><div><span class="eyebrow">BOUNDED ADDRESS SEARCH · LOCAL ONLY</span><h3>Search ${activeNetwork.label}</h3></div><span class="live-example">SCALARS 1–${SEARCH_SCALAR_LIMIT.toLocaleString()} · UP TO 108 WORKERS</span></div>
       <p class="backward-intro">Paste a valid address or load a .txt list of Ethereum addresses. Search checks the entire scalar interval 1–${SEARCH_SCALAR_LIMIT.toLocaleString()} by default. If a candidate matches, other workers stop after their current small chunk. It runs in browser workers; the address and candidates are not sent to EC2.</p>
       <div class="dlog-address-control"><label for="lab-address">${activeNetwork.label} address or public key</label><input id="lab-address" type="text" spellcheck="false" autocomplete="off" placeholder="${addressPlaceholder()}" value="${escapeHtml(labAddressInput ?? wallet.address)}" ${discreteLogProgress ? 'disabled' : ''}><small>${addressInputHint()}</small>${labAddressInput?.trim() ? '<button class="reverse-toggle" id="export-public-address" type="button">Export public address</button>' : ''}</div>
       ${selectedNetworkId === 'ethereum' ? `<div class="search-file-row"><div class="search-file-copy"><strong>Search several Ethereum addresses together</strong><small>Choose a .txt file with one 0x address per line. One scalar pass checks every address in the file; loaded file targets replace the pasted address until you clear the file.</small></div><label class="search-file-button ${discreteLogProgress ? 'is-disabled' : ''}" for="search-address-file" aria-disabled="${Boolean(discreteLogProgress)}">Choose file</label><input id="search-address-file" type="file" accept=".txt,text/plain" hidden ${discreteLogProgress ? 'disabled' : ''}>${searchAddressFile ? `<span class="search-file-name">${escapeHtml(searchAddressFile.name)} · ${searchAddressFile.addresses?.length ?? 0} addresses</span><button class="search-file-clear" id="clear-search-file" type="button" ${discreteLogProgress ? 'disabled' : ''}>Clear</button>` : ''}</div>${searchAddressFile?.error ? `<p class="search-file-error" role="alert">${escapeHtml(searchAddressFile.error)}</p>` : ''}${searchAddressFile?.addresses?.length ? `<ul class="search-target-preview">${searchAddressFile.addresses.map((address, index) => `<li><b>${index + 1}.</b> <code>${escapeHtml(address)}</code></li>`).join('')}</ul>` : ''}` : ''}
-      <div class="dlog-warning"><strong>This is a bounded search, not practical wallet recovery.</strong> A match is possible only when a target was created by a scalar in this exact range. Ten million is about 2²³ candidates versus nearly 2²⁵⁶ possible secp256k1 scalars. A miss rules out only scalars 1–${SEARCH_SCALAR_LIMIT.toLocaleString()}.</div>
+      <div class="dlog-warning"><strong>This is a bounded search, not practical wallet recovery.</strong> A match is possible only when a target was created by a scalar in this exact range. One billion is about 2³⁰ candidates versus nearly 2²⁵⁶ possible secp256k1 scalars. A miss rules out only scalars 1–${SEARCH_SCALAR_LIMIT.toLocaleString()}.</div>
       <div class="dlog-actions"><button class="action-button dlog-button" id="run-dlog-lab" type="button" ${discreteLogProgress ? 'disabled' : ''}>${searchButtonLabel}<span aria-hidden="true">↗</span></button>${discreteLogProgress ? `<button class="dlog-stop-button" id="stop-search" type="button">${discreteLogProgress.stopping ? 'Stopping after current chunks…' : 'Stop search'}</button>` : ''}</div>
       ${discreteLogProgress ? `<div class="dlog-live-progress" role="status" aria-live="polite"><b>Checked ${discreteLogProgress.completed.toLocaleString()} / ${discreteLogProgress.trials.toLocaleString()} candidates</b><div class="search-progress"><span style="width:${100 * discreteLogProgress.completed / discreteLogProgress.trials}%"></span></div><p>${discreteLogProgress.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second · ${discreteLogProgress.workers} browser workers · ${discreteLogProgress.elapsedMs.toFixed(1)} ms elapsed · ${discreteLogProgress.candidatesPerSecond ? `about ${formatDuration((discreteLogProgress.trials - discreteLogProgress.completed) * 1000 / discreteLogProgress.candidatesPerSecond)} remaining at this rate` : 'measuring speed'}.</p></div>` : searchResultMarkup(discreteLogResult, activeNetwork)}
       <p class="step-explanation subtle">Each worker starts with Q=dG, then advances with Q(d+1)=Q(d)+G and compares address payload bytes directly. This avoids a fresh scalar multiplication and address encoding for every candidate. The operation stays on this device; it is not an EC2 background job.</p>
@@ -798,7 +799,7 @@ function render() {
     const button = document.querySelector('#run-dlog-lab');
     if (button && !discreteLogProgress) {
       button.disabled = false;
-      button.innerHTML = `${activeNetwork.family === 'evm' && looksLikeEvmPublicKey(labAddressInput) ? 'Calculate full Keccak-256 from public key' : 'Search all 10,000,000 candidates'}<span aria-hidden="true">↗</span>`;
+      button.innerHTML = `${activeNetwork.family === 'evm' && looksLikeEvmPublicKey(labAddressInput) ? 'Calculate full Keccak-256 from public key' : `Search all ${SEARCH_SCALAR_LIMIT.toLocaleString()} candidates`}<span aria-hidden="true">↗</span>`;
     }
   });
   document.querySelectorAll('[data-run-step]').forEach((button) => button.addEventListener('click', () => runStep(Number(button.dataset.runStep))));
@@ -1152,7 +1153,7 @@ async function runDiscreteLogLab() {
   const parsed = targets[0];
 
   const availableCores = navigator.hardwareConcurrency || 2;
-  const workerCount = Math.max(1, Math.min(4, availableCores));
+  const workerCount = Math.max(1, Math.min(108, availableCores));
   const partitionSize = Math.ceil(SEARCH_SCALAR_LIMIT / workerCount);
   const runId = ++searchRunId;
   const search = {
