@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { keccak_256 } from '@noble/hashes/sha3.js';
-import { parsePublicKeyFile, searchPublicKeys, validatePointSearchRange } from '../src/public-key-search.js';
+import { parsePublicKeyFile, searchPublicKeys, validatePointSearchRange, MAX_PRIVATE_SCALAR } from '../src/public-key-search.js';
 
 const header = 'address\ttransaction_hash\tpublic_key_uncompressed\tstatus';
 function row(n) {
@@ -35,7 +35,9 @@ test('single value, cancellation and invalid ranges', async () => {
   const partial = await searchPublicKeys(targets, validatePointSearchRange('1', '100'), { batchSize: 1, shouldStop: () => stop, onProgress: () => { stop = true; } });
   assert.equal(partial.status, 'cancelled'); assert.ok(partial.completed < partial.total);
   assert.equal(validatePointSearchRange('1', '100000000').count, 100_000_000n);
-  assert.throws(() => validatePointSearchRange('1', '100000001'), /at most/);
+  assert.equal(validatePointSearchRange('1', '100000001').count, 100_000_001n);
+  assert.equal(validatePointSearchRange('1', MAX_PRIVATE_SCALAR.toString()).end, MAX_PRIVATE_SCALAR);
+  assert.throws(() => validatePointSearchRange('1', (MAX_PRIVATE_SCALAR + 1n).toString()), /order minus one/);
   assert.equal(validatePointSearchRange('1000001', '101000000').count, 100_000_000n);
   assert.throws(() => validatePointSearchRange('0', '1'));
 });
@@ -46,4 +48,33 @@ test('search finds a scalar beyond the initial million', async () => {
   const result = await searchPublicKeys(targets, validatePointSearchRange('1000001', '1000010'));
   assert.equal(result.status, 'done');
   assert.deepEqual(result.matches.map((match) => match.scalar), ['1000003']);
+});
+
+test('chunks cover boundaries and keep matches across chunks', async () => {
+  const targets = parsePublicKeyFile([header, row(4), row(5), row(9), row(12)].join('\n'));
+  const result = await searchPublicKeys(targets, validatePointSearchRange('1', '12'), { chunkSize: 4n, batchSize: 2 });
+  assert.equal(result.status, 'done');
+  assert.equal(result.completedChunks, 3n);
+  assert.equal(result.completed, result.total);
+  assert.deepEqual(result.matches.map((m) => m.scalar).sort((a,b) => Number(a)-Number(b)), ['4', '5', '9', '12']);
+});
+
+test('full scalar range remains precise and can be stopped after a small chunk', async () => {
+  const targets = parsePublicKeyFile([header, row(3)].join('\n'));
+  let stop = false;
+  const result = await searchPublicKeys(targets, validatePointSearchRange('1', MAX_PRIVATE_SCALAR.toString()), {
+    chunkSize: 4n, shouldStop: () => stop,
+    onProgress: ({ completed }) => { if (completed >= 3n) stop = true; },
+  });
+  assert.equal(result.status, 'cancelled');
+  assert.ok(result.completed < result.total);
+  assert.equal(result.completedChunks, 1n);
+  assert.equal(result.matches[0].scalar, '3');
+});
+
+test('range near secp256k1 order finds endpoint', async () => {
+  const targets = parsePublicKeyFile([header, row(MAX_PRIVATE_SCALAR)].join('\n'));
+  const result = await searchPublicKeys(targets, validatePointSearchRange((MAX_PRIVATE_SCALAR - 4n).toString(), MAX_PRIVATE_SCALAR.toString()), { chunkSize: 3n });
+  assert.equal(result.status, 'done');
+  assert.equal(result.matches[0].scalar, MAX_PRIVATE_SCALAR.toString());
 });
