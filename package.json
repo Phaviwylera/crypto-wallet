@@ -9,7 +9,8 @@
     "preview": "vite preview --host 0.0.0.0",
     "server": "node server/index.js",
     "server:build": "node server/index.js",
-    "test:scan": "node server/test.mjs"
+    "test:scan": "node server/test.mjs",
+    "demo:kangaroo": "node scripts/pollard-kangaroo-demo.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.645.0",
