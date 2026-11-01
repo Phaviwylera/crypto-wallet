@@ -1,4 +1,5 @@
 import { secp256k1 } from '@noble/curves/secp256k1.js';
+import { createWebGpuLookup } from './webgpu-lookup.js';
 import { parsePublicKeyFile, searchPublicKeys, validatePointSearchRange } from './public-key-search.js';
 
 let stopped = false;
@@ -15,11 +16,17 @@ self.onmessage = async ({ data }) => {
       // Targets were validated in the validation worker. Recreate points after
       // structured cloning, which does not preserve point prototypes.
       const targets = data.targets.map((target) => ({ ...target, point: secp256k1.Point.fromBytes(Uint8Array.from(target.publicKey.slice(2).match(/../g), (byte) => parseInt(byte, 16))) }));
-      const result = await searchPublicKeys(targets, range, {
-        shouldStop: () => stopped,
-        onProgress: (progress) => self.postMessage({ type: 'progress', ...progress }),
-      });
-      self.postMessage({ type: 'result', ...result });
+      let gpuLookup = null;
+      try {
+        if (data.backend === 'webgpu-high' || data.backend === 'webgpu-low') {
+          gpuLookup = await createWebGpuLookup(data.backend === 'webgpu-low' ? 'low-power' : 'high-performance');
+        }
+        const result = await searchPublicKeys(targets, range, {
+          gpuLookup, shouldStop: () => stopped,
+          onProgress: (progress) => self.postMessage({ type: 'progress', ...progress }),
+        });
+        self.postMessage({ type: 'result', ...result });
+      } finally { gpuLookup?.destroy(); }
     }
   } catch (error) {
     self.postMessage({ type: 'error', message: error?.message ?? String(error) });

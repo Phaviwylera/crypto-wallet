@@ -50,13 +50,16 @@ const yieldTask = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 // Multi-target BSGS: a shared baby table, and batch-normalized giant steps.
 // Every match is checked independently against the original public point.
-async function searchChunk(targets, range, { onProgress, shouldStop, batchSize }) {
+async function searchChunk(targets, range, { onProgress, shouldStop, batchSize, gpuLookup }) {
   const m = Math.ceil(Math.sqrt(Number(range.count)));
   const baby = new Map();
   let p = Point.ZERO;
   const points = [];
   for (let i = 0; i < m; i++) { points.push(p); p = p.add(Point.BASE); }
-  normalizeZ(Point, points).forEach((point, i) => baby.set(key(point), i));
+  const normalizedBabies = normalizeZ(Point, points);
+  normalizedBabies.forEach((point, i) => baby.set(key(point), i));
+  const gpuTable = gpuLookup ? await gpuLookup.prepare(normalizedBabies) : null;
+  try {
   const lowerPoint = Point.BASE.multiply(range.start);
   const giantStep = Point.BASE.multiply(BigInt(m)).negate();
   const giantCount = Math.ceil(Number(range.count) / m);
@@ -74,10 +77,14 @@ async function searchChunk(targets, range, { onProgress, shouldStop, batchSize }
       const indices = [];
       for (let i = begin; i < end; i++) if (current[i] !== null) indices.push(i);
       const normalized = normalizeZ(Point, indices.map((i) => current[i]));
+      const gpuHits = gpuTable ? await gpuTable.lookup(normalized) : null;
       for (let n = 0; n < indices.length; n++) {
         const i = indices[n];
         const collisionPoint = key(normalized[n]);
         const babyIndex = baby.get(collisionPoint);
+        // Verify every GPU lookup, including misses, to prevent a driver or
+        // shader error from silently claiming an interval was exhausted.
+        if (gpuHits && gpuHits[n] !== babyIndex) throw new Error('WebGPU lookup disagreed with CPU verification. Search stopped.');
         const offset = BigInt(j * m + (babyIndex ?? 0));
         if (babyIndex !== undefined && offset < range.count) {
           const scalar = range.start + offset;
@@ -104,6 +111,7 @@ async function searchChunk(targets, range, { onProgress, shouldStop, batchSize }
     }
   }
   return { status: 'done', completed, total, matches, elapsedMs: performance.now() - started };
+  } finally { gpuTable?.destroy(); }
 }
 
 export function estimateSearchWork(count, targetCount, chunkSize = SEARCH_CHUNK_SIZE) {
@@ -119,7 +127,7 @@ export function estimateSearchWork(count, targetCount, chunkSize = SEARCH_CHUNK_
 
 // Split arbitrary valid intervals into memory-bounded BSGS searches. This is
 // sequential and does not make a large or full-keyspace search practical.
-export async function searchPublicKeys(targets, range, { onProgress = () => {}, shouldStop = () => false, batchSize = 128, chunkSize = SEARCH_CHUNK_SIZE } = {}) {
+export async function searchPublicKeys(targets, range, { onProgress = () => {}, shouldStop = () => false, batchSize = 128, chunkSize = SEARCH_CHUNK_SIZE, gpuLookup = null } = {}) {
   if (chunkSize < 1n || chunkSize > SEARCH_CHUNK_SIZE) throw new Error('Invalid chunk size.');
   const chunkCount = (range.count + chunkSize - 1n) / chunkSize;
   const total = estimateSearchWork(range.count, targets.length, chunkSize);
@@ -133,7 +141,7 @@ export async function searchPublicKeys(targets, range, { onProgress = () => {}, 
     const end = next + chunkSize - 1n < range.end ? next + chunkSize - 1n : range.end;
     const chunkRange = { start: next, end, count: end - next + 1n };
     const chunk = await searchChunk(targets, chunkRange, {
-      batchSize, shouldStop,
+      batchSize, shouldStop, gpuLookup,
       onProgress: (progress) => onProgress({
         completed: completed + BigInt(progress.completed), total,
         matches: matches.length + progress.matches, completedChunks, chunkCount,
