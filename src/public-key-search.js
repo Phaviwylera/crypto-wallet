@@ -2,10 +2,10 @@ import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { normalizeZ } from '@noble/curves/abstract/curve.js';
 import { keccak_256 } from '@noble/hashes/sha3.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
-import { parseSearchRange } from './search-range.js';
 
 const Point = secp256k1.Point;
-export const MAX_INTERVAL_SIZE = 100_000_000n;
+export const MAX_PRIVATE_SCALAR = BigInt('0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140');
+export const SEARCH_CHUNK_SIZE = 100_000_000n;
 export const MAX_TARGETS = 10_000;
 
 // The public-key extraction export is tab separated, with an optional header.
@@ -35,9 +35,13 @@ export function parsePublicKeyFile(text) {
 }
 
 export function validatePointSearchRange(lower, upper) {
-  const range = parseSearchRange(lower, upper);
-  if (range.count > MAX_INTERVAL_SIZE) throw new Error(`The interval can contain at most ${MAX_INTERVAL_SIZE.toLocaleString()} scalars.`);
-  return range;
+  if (!/^\d+$/.test(lower) || !/^\d+$/.test(upper)) throw new Error('Bounds must be whole decimal numbers.');
+  const start = BigInt(lower);
+  const end = BigInt(upper);
+  if (start < 1n || start > end || end > MAX_PRIVATE_SCALAR) {
+    throw new Error(`Use 1 ≤ lower ≤ upper ≤ ${MAX_PRIVATE_SCALAR.toString()} (secp256k1 order minus one).`);
+  }
+  return { start, end, count: end - start + 1n };
 }
 
 function key(point) { return point.is0() ? 'infinity' : bytesToHex(point.toBytes(true)); }
@@ -45,7 +49,7 @@ const yieldTask = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 // Multi-target BSGS: a shared baby table, and batch-normalized giant steps.
 // Every match is checked independently against the original public point.
-export async function searchPublicKeys(targets, range, { onProgress = () => {}, shouldStop = () => false, batchSize = 128 } = {}) {
+async function searchChunk(targets, range, { onProgress, shouldStop, batchSize }) {
   const m = Math.ceil(Math.sqrt(Number(range.count)));
   const baby = new Map();
   let p = Point.ZERO;
@@ -88,4 +92,43 @@ export async function searchPublicKeys(targets, range, { onProgress = () => {}, 
     }
   }
   return { status: 'done', completed, total, matches, elapsedMs: performance.now() - started };
+}
+
+// Split arbitrary valid intervals into memory-bounded BSGS searches. This is
+// sequential and does not make a large or full-keyspace search practical.
+export async function searchPublicKeys(targets, range, { onProgress = () => {}, shouldStop = () => false, batchSize = 128, chunkSize = SEARCH_CHUNK_SIZE } = {}) {
+  if (chunkSize < 1n || chunkSize > SEARCH_CHUNK_SIZE) throw new Error('Invalid chunk size.');
+  const chunkCount = (range.count + chunkSize - 1n) / chunkSize;
+  const workFor = (count) => {
+    const m = Math.ceil(Math.sqrt(Number(count)));
+    return BigInt(Math.ceil(Number(count) / m)) * BigInt(targets.length);
+  };
+  const fullChunks = range.count / chunkSize;
+  const remainder = range.count % chunkSize;
+  const total = fullChunks * workFor(chunkSize) + (remainder ? workFor(remainder) : 0n);
+  const started = performance.now();
+  let completed = 0n;
+  let completedChunks = 0n;
+  const matches = [];
+  let next = range.start;
+  while (next <= range.end) {
+    if (shouldStop()) return { status: 'cancelled', completed, total, completedChunks, chunkCount, matches, elapsedMs: performance.now() - started };
+    const end = next + chunkSize - 1n < range.end ? next + chunkSize - 1n : range.end;
+    const chunkRange = { start: next, end, count: end - next + 1n };
+    const chunk = await searchChunk(targets, chunkRange, {
+      batchSize, shouldStop,
+      onProgress: (progress) => onProgress({
+        completed: completed + BigInt(progress.completed), total,
+        matches: matches.length + progress.matches, completedChunks, chunkCount,
+        chunkStart: next.toString(), chunkEnd: end.toString(),
+        elapsedMs: performance.now() - started,
+      }),
+    });
+    completed += BigInt(chunk.completed);
+    matches.push(...chunk.matches);
+    if (chunk.status === 'cancelled') return { status: 'cancelled', completed, total, completedChunks, chunkCount, matches, elapsedMs: performance.now() - started };
+    completedChunks += 1n;
+    next = end + 1n;
+  }
+  return { status: 'done', completed, total, completedChunks, chunkCount, matches, elapsedMs: performance.now() - started };
 }
