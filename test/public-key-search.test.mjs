@@ -34,6 +34,16 @@ test('single value, cancellation and invalid ranges', async () => {
   let stop = false;
   const partial = await searchPublicKeys(targets, validatePointSearchRange('1', '100'), { batchSize: 1, shouldStop: () => stop, onProgress: () => { stop = true; } });
   assert.equal(partial.status, 'cancelled'); assert.ok(partial.completed < partial.total);
-  assert.throws(() => validatePointSearchRange('1', '1000001'), /at most/);
+  assert.equal(validatePointSearchRange('1', '100000000').count, 100_000_000n);
+  assert.throws(() => validatePointSearchRange('1', '100000001'), /at most/);
+  assert.equal(validatePointSearchRange('1000001', '101000000').count, 100_000_000n);
   assert.throws(() => validatePointSearchRange('0', '1'));
+});
+
+
+test('search finds a scalar beyond the initial million', async () => {
+  const targets = parsePublicKeyFile([header, row(1000003)].join('\n'));
+  const result = await searchPublicKeys(targets, validatePointSearchRange('1000001', '1000010'));
+  assert.equal(result.status, 'done');
+  assert.deepEqual(result.matches.map((match) => match.scalar), ['1000003']);
 });
