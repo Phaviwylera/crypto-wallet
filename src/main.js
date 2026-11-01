@@ -7,6 +7,7 @@ import { ripemd160 } from '@noble/hashes/legacy.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { keccak_256 } from '@noble/hashes/sha3.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
+import { recoverEthereumTransactionPublicKey } from './ethereum-transaction.js';
 import './style.css';
 
 const app = document.querySelector('#app');
@@ -35,6 +36,7 @@ let activeSearch = null;
 let searchRenderTimer = null;
 let labAddressInput = null;
 let searchAddressFile = null;
+let ethereumRpcEndpoint = 'https://ethereum-rpc.publicnode.com';
 let pendingFile = null;
 let scanState = { jobId: null, status: 'idle', total: 0, processed: 0, results: [], error: null, hideEmpty: true };
 const API_BASE = (import.meta.env && import.meta.env.VITE_SCAN_API_BASE) || '';
@@ -725,7 +727,12 @@ function render() {
       <div class="backward-heading"><div><span class="eyebrow">BOUNDED ADDRESS SEARCH · LOCAL ONLY</span><h3>Search ${activeNetwork.label}</h3></div><span class="live-example">SCALARS 1–${SEARCH_SCALAR_LIMIT.toLocaleString()} · 32–108 WORKERS</span></div>
       <p class="backward-intro">Paste a valid address or load a .txt list of Ethereum addresses. Search checks the entire scalar interval 1–${SEARCH_SCALAR_LIMIT.toLocaleString()} by default. If a candidate matches, other workers stop after their current small chunk. It runs in browser workers; the address and candidates are not sent to EC2.</p>
       <div class="dlog-address-control"><label for="lab-address">${activeNetwork.label} address or public key</label><input id="lab-address" type="text" spellcheck="false" autocomplete="off" placeholder="${addressPlaceholder()}" value="${escapeHtml(labAddressInput ?? wallet.address)}" ${discreteLogProgress ? 'disabled' : ''}><small>${addressInputHint()}</small>${labAddressInput?.trim() ? '<button class="reverse-toggle" id="export-public-address" type="button">Export public address</button>' : ''}</div>
-      ${selectedNetworkId === 'ethereum' ? `<div class="search-file-row"><div class="search-file-copy"><strong>Search several Ethereum addresses together</strong><small>Choose a .txt file with one 0x address per line. One scalar pass checks every address in the file; loaded file targets replace the pasted address until you clear the file.</small></div><label class="search-file-button ${discreteLogProgress ? 'is-disabled' : ''}" for="search-address-file" aria-disabled="${Boolean(discreteLogProgress)}">Choose file</label><input id="search-address-file" type="file" accept=".txt,text/plain" hidden ${discreteLogProgress ? 'disabled' : ''}>${searchAddressFile ? `<span class="search-file-name">${escapeHtml(searchAddressFile.name)} · ${searchAddressFile.addresses?.length ?? 0} addresses</span><button class="search-file-clear" id="clear-search-file" type="button" ${discreteLogProgress ? 'disabled' : ''}>Clear</button>` : ''}</div>${searchAddressFile?.error ? `<p class="search-file-error" role="alert">${escapeHtml(searchAddressFile.error)}</p>` : ''}${searchAddressFile?.addresses?.length ? `<ul class="search-target-preview">${searchAddressFile.addresses.map((address, index) => `<li><b>${index + 1}.</b> <code>${escapeHtml(address)}</code></li>`).join('')}</ul>` : ''}` : ''}
+      ${selectedNetworkId === 'ethereum' ? `
+        <div class="search-file-row"><div class="search-file-copy"><strong>Search Ethereum address lists</strong><small>Upload one address per line for the scalar search, or address,transaction-hash pairs to extract public keys. Pair format: address,tx_hash.</small></div><label class="search-file-button ${discreteLogProgress ? 'is-disabled' : ''}" for="search-address-file" aria-disabled="${Boolean(discreteLogProgress)}">Choose file</label><input id="search-address-file" type="file" accept=".txt,text/plain,.csv,text/csv" hidden ${discreteLogProgress ? 'disabled' : ''}>${searchAddressFile ? `<span class="search-file-name">${escapeHtml(searchAddressFile.name)} · ${searchAddressFile.addresses?.length ?? 0} addresses${searchAddressFile.transactions?.length ? ` · ${searchAddressFile.transactions.length} txs` : ''}</span><button class="search-file-clear" id="clear-search-file" type="button" ${discreteLogProgress ? 'disabled' : ''}>Clear</button>` : ''}</div>
+        ${searchAddressFile?.error ? `<p class="search-file-error" role="alert">${escapeHtml(searchAddressFile.error)}</p>` : ''}
+        ${searchAddressFile?.addresses?.length ? `<ul class="search-target-preview">${searchAddressFile.addresses.map((address, index) => `<li><b>${index + 1}.</b> <code>${escapeHtml(address)}</code></li>`).join('')}</ul>` : ''}
+        ${searchAddressFile?.transactions?.length ? `<div class="public-key-extract-panel"><label for="ethereum-rpc-endpoint">Ethereum JSON-RPC endpoint</label><input id="ethereum-rpc-endpoint" type="url" value="${escapeHtml(ethereumRpcEndpoint)}" spellcheck="false"><small>Extracts signer public keys from outgoing transactions. The transaction hashes are sent to this RPC provider; private keys are never requested.</small><button class="search-file-button" id="extract-public-keys" type="button">Extract public keys and download TXT</button><p id="public-key-extraction-status" role="status" aria-live="polite"></p></div>` : ''}
+      ` : ''}
       <div class="dlog-warning"><strong>This is a bounded search, not practical wallet recovery.</strong> A full 10²¹-candidate run is not practically completable on browser hardware and can heavily load the device. A match is possible only when a target was created by a scalar in this exact range. This range is about 2⁷⁰ candidates versus nearly 2²⁵⁶ possible secp256k1 scalars. A miss rules out only scalars 1–${SEARCH_SCALAR_LIMIT.toLocaleString()}.</div>
       <div class="dlog-actions"><button class="action-button dlog-button" id="run-dlog-lab" type="button" ${discreteLogProgress ? 'disabled' : ''}>${searchButtonLabel}<span aria-hidden="true">↗</span></button>${discreteLogProgress ? `<button class="dlog-stop-button" id="stop-search" type="button">${discreteLogProgress.stopping ? 'Stopping after current chunks…' : 'Stop search'}</button>` : ''}</div>
       ${discreteLogProgress ? `<div class="dlog-live-progress" role="status" aria-live="polite"><b>Checked ${discreteLogProgress.completed.toLocaleString()} / ${discreteLogProgress.trials.toLocaleString()} candidates</b><div class="search-progress"><span style="width:${100 * Number(discreteLogProgress.completed) / Number(discreteLogProgress.trials)}%"></span></div><p>${discreteLogProgress.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second · ${discreteLogProgress.workers} browser workers · ${discreteLogProgress.elapsedMs.toFixed(1)} ms elapsed · ${discreteLogProgress.candidatesPerSecond ? `about ${formatDuration(Number(discreteLogProgress.trials - discreteLogProgress.completed) * 1000 / discreteLogProgress.candidatesPerSecond)} remaining at this rate` : 'measuring speed'}.</p></div>` : searchResultMarkup(discreteLogResult, activeNetwork)}
@@ -771,13 +778,15 @@ function render() {
     backwardOpen = !backwardOpen;
     render();
   });
+  document.querySelector('#ethereum-rpc-endpoint')?.addEventListener('input', (event) => { ethereumRpcEndpoint = event.target.value; });
+  document.querySelector('#extract-public-keys')?.addEventListener('click', extractUploadedPublicKeys);
   document.querySelector('#search-address-file')?.addEventListener('change', async (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
     try {
-      const addresses = parseAddressFile(await file.text(), selectedNetworkId);
+      const parsedFile = parseAddressFile(await file.text(), selectedNetworkId);
       invalidateSearch();
-      searchAddressFile = { name: file.name, addresses, error: null };
+      searchAddressFile = { name: file.name, ...parsedFile, error: null };
       render();
     } catch (error) {
       invalidateSearch();
@@ -1059,17 +1068,29 @@ function deriveNetworkAddress() {
 function parseAddressFile(contents, networkId) {
   const lines = contents.split(/\r?\n/);
   const tokens = [];
+  const transactions = [];
+  const isAddress = (value) => /^0x[0-9a-fA-F]{40}$/.test(value);
+  const isTransactionHash = (value) => /^0x[0-9a-fA-F]{64}$/.test(value);
+
   for (const [index, line] of lines.entries()) {
     const trimmed = line.trim().replace(/^\uFEFF/, '');
     if (!trimmed || trimmed.startsWith('#')) continue;
-    const parts = trimmed.split(/[\s,;]+/).filter(Boolean);
-    for (const token of parts) {
-      if (!/^0x[0-9a-fA-F]{40}$/.test(token)) {
-        throw new Error(`Line ${index + 1} is not a 20-byte Ethereum address. Use one address per line.`);
-      }
-      tokens.push(token);
+    if (/^address[\s,;]+(?:tx_?hash|transaction_?hash)$/i.test(trimmed)) continue;
+
+    const columns = trimmed.split(/[,;\t]+/).map((value) => value.trim()).filter(Boolean);
+    if (columns.length === 2 && isAddress(columns[0]) && isTransactionHash(columns[1])) {
+      tokens.push(columns[0]);
+      transactions.push({ address: columns[0], txHash: columns[1] });
+      continue;
     }
+
+    const addressTokens = trimmed.split(/[\s,;]+/).filter(Boolean);
+    if (!addressTokens.length || addressTokens.some((token) => !isAddress(token))) {
+      throw new Error(`Line ${index + 1} must contain Ethereum addresses, or an address and transaction hash separated by a comma.`);
+    }
+    tokens.push(...addressTokens);
   }
+
   if (!tokens.length) throw new Error('The text file contains no Ethereum addresses.');
   const unique = new Map();
   for (const token of tokens) {
@@ -1077,7 +1098,81 @@ function parseAddressFile(contents, networkId) {
     if (!parsed.valid) throw new Error(`Invalid address in file: ${parsed.reason}`);
     unique.set(parsed.normalized.toLowerCase(), parsed.display);
   }
-  return [...unique.values()];
+  return { addresses: [...unique.values()], transactions };
+}
+
+async function fetchEthereumTransaction(rpcUrl, txHash, requestId) {
+  const response = await fetch(rpcUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: requestId, method: 'eth_getTransactionByHash', params: [txHash] }),
+  });
+  if (!response.ok) throw new Error(`RPC request failed with HTTP ${response.status}.`);
+  const payload = await response.json();
+  if (payload.error) throw new Error(payload.error.message || 'Ethereum RPC returned an error.');
+  if (!payload.result) throw new Error('Transaction was not found by the RPC provider.');
+  return payload.result;
+}
+
+async function extractUploadedPublicKeys() {
+  const entries = searchAddressFile?.transactions ?? [];
+  const button = document.querySelector('#extract-public-keys');
+  const endpointInput = document.querySelector('#ethereum-rpc-endpoint');
+  const status = document.querySelector('#public-key-extraction-status');
+  if (!entries.length || !button || !endpointInput || !status) return;
+
+  const rpcUrl = endpointInput.value.trim();
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(rpcUrl);
+    if (parsedUrl.protocol !== 'https:' && !(parsedUrl.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(parsedUrl.hostname))) {
+      throw new Error('Use an HTTPS RPC endpoint (HTTP is allowed only for localhost).');
+    }
+  } catch (error) {
+    status.textContent = error.message || 'Enter a valid Ethereum JSON-RPC URL.';
+    return;
+  }
+
+  ethereumRpcEndpoint = rpcUrl;
+  button.disabled = true;
+  endpointInput.disabled = true;
+  status.textContent = `Fetching ${entries.length} transactions…`;
+  const results = new Array(entries.length);
+  let nextIndex = 0;
+  let completed = 0;
+  const processNext = async () => {
+    while (nextIndex < entries.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      const entry = entries[index];
+      try {
+        const transaction = await fetchEthereumTransaction(rpcUrl, entry.txHash, index + 1);
+        if (transaction.hash?.toLowerCase() !== entry.txHash.toLowerCase()) throw new Error('RPC returned a different transaction hash.');
+        if (transaction.from?.toLowerCase() !== entry.address.toLowerCase()) throw new Error('This transaction was not sent by the listed address. Use an outgoing transaction from that account.');
+        const recovered = recoverEthereumTransactionPublicKey(transaction);
+        if (recovered.address.toLowerCase() !== entry.address.toLowerCase()) throw new Error('Recovered signer address does not match the listed address.');
+        results[index] = { ...entry, publicKey: recovered.publicKey, status: 'ok' };
+      } catch (error) {
+        results[index] = { ...entry, publicKey: '', status: (error?.message ?? String(error)).replace(/[\t\r\n]+/g, ' ') };
+      }
+      completed += 1;
+      status.textContent = `Processed ${completed} of ${entries.length} transactions…`;
+    }
+  };
+
+  try {
+    await Promise.all(Array.from({ length: Math.min(4, entries.length) }, processNext));
+    const output = [
+      'address\ttransaction_hash\tpublic_key_uncompressed\tstatus',
+      ...results.map((row) => `${row.address}\t${row.txHash}\t${row.publicKey}\t${row.status}`),
+    ].join('\n');
+    exportTextFile('ethereum-public-keys.txt', `${output}\n`);
+    const succeeded = results.filter((row) => row.status === 'ok').length;
+    status.textContent = `Downloaded public-key results: ${succeeded} extracted, ${entries.length - succeeded} failed. Public keys are not private keys.`;
+  } finally {
+    button.disabled = false;
+    endpointInput.disabled = false;
+  }
 }
 
 function invalidateSearch() {
