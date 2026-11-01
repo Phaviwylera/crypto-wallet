@@ -1,12 +1,12 @@
 // Inclusive decimal scalar ranges for the educational address search.
-export const MAX_SEARCH_SCALAR = 1_000_000_000_000_000_000_000n;
+export const MAX_SEARCH_SCALAR = BigInt('0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140');
 
 export function parseSearchRange(lower, upper) {
   if (!/^\d+$/.test(lower) || !/^\d+$/.test(upper)) throw new Error('Bounds must be whole decimal numbers.');
   const start = BigInt(lower);
   const end = BigInt(upper);
   if (start < 1n || end > MAX_SEARCH_SCALAR || start > end) {
-    throw new Error(`Use 1 ≤ lower ≤ upper ≤ ${MAX_SEARCH_SCALAR.toLocaleString()}.`);
+    throw new Error(`Use 1 ≤ lower ≤ upper ≤ ${MAX_SEARCH_SCALAR.toString()} (secp256k1 order minus one).`);
   }
   return { start, end, count: end - start + 1n };
 }

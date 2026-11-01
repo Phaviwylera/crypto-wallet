@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseSearchRange, partitionSearchRange } from '../src/search-range.js';
+import { parseSearchRange, partitionSearchRange, MAX_SEARCH_SCALAR } from '../src/search-range.js';
 import { runPollardKangarooDemo } from '../src/pollard-kangaroo-demo.js';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { keccak_256 } from '@noble/hashes/sha3.js';
@@ -9,7 +9,9 @@ import { ripemd160 } from '@noble/hashes/legacy.js';
 
 test('validates inclusive scalar ranges', () => {
   assert.deepEqual(parseSearchRange('5', '5'), { start: 5n, end: 5n, count: 1n });
-  for (const [a, b] of [['0','1'], ['3','2'], ['1.0','5'], ['1','1000000000000000000001'], ['', '1']]) assert.throws(() => parseSearchRange(a,b));
+  assert.equal(parseSearchRange('1', MAX_SEARCH_SCALAR.toString()).end, MAX_SEARCH_SCALAR);
+  assert.equal(parseSearchRange('1000000001', '1000000000000000000001').start, 1000000001n);
+  for (const [a, b] of [['0','1'], ['3','2'], ['1.0','5'], ['1',(MAX_SEARCH_SCALAR + 1n).toString()], ['', '1']]) assert.throws(() => parseSearchRange(a,b));
 });
 test('partitions cover exactly the range, including tiny and uneven ranges', () => {
   for (const [start, end, n] of [[1n, 1n, 8], [10n, 20n, 4], [1n, 100n, 8]]) {
@@ -26,6 +28,16 @@ test('worker finds inclusive endpoint and completes a miss', async () => {
   const run = (start, end) => new Promise((r) => { resolve = r; self.onmessage({ data: { workerId: 0, networkId: 'ethereum', targetBytes: payload, start, end, chunkSize: 2 } }); });
   const match = await run(1n, 3n); assert.equal(match.type, 'match'); assert.equal(match.scalar, 3n); assert.equal(match.tested, 3n);
   const miss = await run(4n, 5n); assert.equal(miss.type, 'done'); assert.equal(miss.tested, 2n);
+});
+test('address worker checks the last valid scalar', async () => {
+  const point = secp256k1.Point.BASE.multiply(MAX_SEARCH_SCALAR);
+  const payload = keccak_256(point.toBytes(false).slice(1)).slice(12);
+  const result = await new Promise((resolve) => {
+    globalThis.self.postMessage = (message) => { if (message.type !== 'progress') resolve(message); };
+    self.onmessage({ data: { workerId: 0, networkId: 'ethereum', targetBytes: payload, start: MAX_SEARCH_SCALAR, end: MAX_SEARCH_SCALAR, chunkSize: 2 } });
+  });
+  assert.equal(result.type, 'match');
+  assert.equal(result.scalar, MAX_SEARCH_SCALAR);
 });
 test('batched worker checks profiles and reports the correct target across chunks', async () => {
   const point = secp256k1.Point.BASE.multiply(7n);

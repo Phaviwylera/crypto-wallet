@@ -2,9 +2,10 @@ import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { normalizeZ } from '@noble/curves/abstract/curve.js';
 import { keccak_256 } from '@noble/hashes/sha3.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
+import { parseSearchRange, MAX_SEARCH_SCALAR } from './search-range.js';
 
 const Point = secp256k1.Point;
-export const MAX_PRIVATE_SCALAR = BigInt('0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140');
+export const MAX_PRIVATE_SCALAR = MAX_SEARCH_SCALAR;
 export const SEARCH_CHUNK_SIZE = 100_000_000n;
 export const MAX_TARGETS = 10_000;
 
@@ -35,16 +36,16 @@ export function parsePublicKeyFile(text) {
 }
 
 export function validatePointSearchRange(lower, upper) {
-  if (!/^\d+$/.test(lower) || !/^\d+$/.test(upper)) throw new Error('Bounds must be whole decimal numbers.');
-  const start = BigInt(lower);
-  const end = BigInt(upper);
-  if (start < 1n || start > end || end > MAX_PRIVATE_SCALAR) {
-    throw new Error(`Use 1 ≤ lower ≤ upper ≤ ${MAX_PRIVATE_SCALAR.toString()} (secp256k1 order minus one).`);
-  }
-  return { start, end, count: end - start + 1n };
+  return parseSearchRange(lower, upper);
 }
 
-function key(point) { return point.is0() ? 'infinity' : bytesToHex(point.toBytes(true)); }
+// Batch-normalized points expose affine coordinates without another inversion.
+// Prefix with parity to distinguish both points having the same x coordinate.
+function key(point) {
+  if (point.is0()) return 'infinity';
+  const { x, y } = point.toAffine();
+  return `${y & 1n}:${x.toString(16)}`;
+}
 const yieldTask = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 // Multi-target BSGS: a shared baby table, and batch-normalized giant steps.
@@ -64,6 +65,8 @@ async function searchChunk(targets, range, { onProgress, shouldStop, batchSize }
   let completed = 0;
   const total = targets.length * giantCount;
   const started = performance.now();
+  let lastYield = started;
+  let lastReport = -Infinity;
   for (let j = 0; j < giantCount; j++) {
     for (let begin = 0; begin < targets.length; begin += batchSize) {
       if (shouldStop()) return { status: 'cancelled', completed, total, matches, elapsedMs: performance.now() - started };
@@ -79,7 +82,7 @@ async function searchChunk(targets, range, { onProgress, shouldStop, batchSize }
         if (babyIndex !== undefined && offset < range.count) {
           const scalar = range.start + offset;
           if (Point.BASE.multiply(scalar).equals(targets[i].point)) {
-            matches.push({ index: i, address: targets[i].address, scalar: scalar.toString(), collisionPoint: collisionPoint === 'infinity' ? 'point at infinity' : `0x${collisionPoint}`, babyStep: babyIndex, giantStep: j });
+            matches.push({ index: i, address: targets[i].address, scalar: scalar.toString(), collisionPoint: collisionPoint === 'infinity' ? 'point at infinity' : `0x${bytesToHex(normalized[n].toBytes(true))}`, babyStep: babyIndex, giantStep: j });
             current[i] = null;
             continue;
           }
@@ -87,11 +90,31 @@ async function searchChunk(targets, range, { onProgress, shouldStop, batchSize }
         current[i] = current[i].add(giantStep);
       }
       completed += end - begin;
-      onProgress({ completed, total, matches: matches.length, elapsedMs: performance.now() - started });
-      await yieldTask();
+      const now = performance.now();
+      if (now - lastReport >= 100 || completed === total) {
+        onProgress({ completed, total, matches: matches.length, elapsedMs: now - started });
+        lastReport = now;
+      }
+      // Yield periodically rather than once per batch. This avoids thousands of
+      // timer-clamp delays while still processing cancellation requests promptly.
+      if (now - lastYield >= 12) {
+        await yieldTask();
+        lastYield = performance.now();
+      }
     }
   }
   return { status: 'done', completed, total, matches, elapsedMs: performance.now() - started };
+}
+
+export function estimateSearchWork(count, targetCount, chunkSize = SEARCH_CHUNK_SIZE) {
+  if (count < 1n || chunkSize < 1n || chunkSize > SEARCH_CHUNK_SIZE || !Number.isSafeInteger(targetCount) || targetCount < 0) throw new Error('Invalid search work.');
+  const workFor = (size) => {
+    const m = Math.ceil(Math.sqrt(Number(size)));
+    return BigInt(Math.ceil(Number(size) / m)) * BigInt(targetCount);
+  };
+  const fullChunks = count / chunkSize;
+  const remainder = count % chunkSize;
+  return fullChunks * workFor(chunkSize) + (remainder ? workFor(remainder) : 0n);
 }
 
 // Split arbitrary valid intervals into memory-bounded BSGS searches. This is
@@ -99,13 +122,7 @@ async function searchChunk(targets, range, { onProgress, shouldStop, batchSize }
 export async function searchPublicKeys(targets, range, { onProgress = () => {}, shouldStop = () => false, batchSize = 128, chunkSize = SEARCH_CHUNK_SIZE } = {}) {
   if (chunkSize < 1n || chunkSize > SEARCH_CHUNK_SIZE) throw new Error('Invalid chunk size.');
   const chunkCount = (range.count + chunkSize - 1n) / chunkSize;
-  const workFor = (count) => {
-    const m = Math.ceil(Math.sqrt(Number(count)));
-    return BigInt(Math.ceil(Number(count) / m)) * BigInt(targets.length);
-  };
-  const fullChunks = range.count / chunkSize;
-  const remainder = range.count % chunkSize;
-  const total = fullChunks * workFor(chunkSize) + (remainder ? workFor(remainder) : 0n);
+  const total = estimateSearchWork(range.count, targets.length, chunkSize);
   const started = performance.now();
   let completed = 0n;
   let completedChunks = 0n;
