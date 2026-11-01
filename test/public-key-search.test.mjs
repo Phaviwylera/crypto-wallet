@@ -78,3 +78,19 @@ test('range near secp256k1 order finds endpoint', async () => {
   assert.equal(result.status, 'done');
   assert.equal(result.matches[0].scalar, MAX_PRIVATE_SCALAR.toString());
 });
+
+test('collision key distinguishes opposite curve points and reports compressed collision', async () => {
+  const targets = parsePublicKeyFile([header, row(8), row(MAX_PRIVATE_SCALAR)].join('\n'));
+  const result = await searchPublicKeys(targets, validatePointSearchRange('1', '9'));
+  assert.deepEqual(result.matches.map((m) => m.scalar), ['8']);
+  assert.equal(result.matches[0].collisionPoint, '0x' + Buffer.from(secp256k1.Point.BASE.toBytes(true)).toString('hex'));
+});
+
+test('long searches yield to asynchronous stop requests', async () => {
+  const targets = Array.from({ length: 256 }, (_, i) => ({ point: secp256k1.Point.BASE.multiply(BigInt(i + 1000001)), address: 'test' }));
+  let stopped = false;
+  setTimeout(() => { stopped = true; }, 0);
+  const result = await searchPublicKeys(targets, validatePointSearchRange('1', '100000'), { shouldStop: () => stopped });
+  assert.equal(result.status, 'cancelled');
+  assert.ok(result.completed > 0n && result.completed < result.total);
+});

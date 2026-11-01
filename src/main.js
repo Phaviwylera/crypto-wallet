@@ -9,6 +9,8 @@ import { keccak_256 } from '@noble/hashes/sha3.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 import { recoverEthereumTransactionPublicKey } from './ethereum-transaction.js';
 import { parseSearchRange, partitionSearchRange } from './search-range.js';
+import { captureScalarFocus, restoreScalarFocus } from './input-focus.js';
+import { createPublicKeySearchPool } from './public-key-search-pool.js';
 import './style.css';
 
 const app = document.querySelector('#app');
@@ -40,7 +42,7 @@ let labAddressInput = null;
 let searchAddressFile = null;
 let ethereumRpcEndpoint = 'https://ethereum-rpc.publicnode.com';
 let pointSearch = { fileName: '', text: '', lower: '1', upper: '1000000', busy: false, count: 0, progress: null, result: null, error: '' };
-let pointSearchWorker = null;
+let pointSearchPool = null;
 let kangarooDemoResult = null;
 let kangarooDemoBusy = false;
 let kangarooDemoError = '';
@@ -585,8 +587,8 @@ function pointSearchStatusMarkup() {
   const { progress, result, error, busy, count } = pointSearch;
   if (error) return `<div class="dlog-warning" role="alert"><strong>Public-key search failed.</strong>${escapeHtml(error)}</div>`;
   if (busy) {
-    if (!progress) return `<div class="dlog-live-progress" role="status">Validating uploaded keys${count ? ` · ${count.toLocaleString()} valid rows` : '…'}</div>`;
-    return `<div class="dlog-live-progress" role="status"><b>Giant-step slots checked: ${progress.completed.toLocaleString()} / ${progress.total.toLocaleString()}</b><div class="search-progress"><span style="width:${Number(progress.completed * 10000n / progress.total) / 100}%"></span></div><p>Chunk ${progress.completedChunks.toLocaleString()} of ${progress.chunkCount.toLocaleString()} completed · current interval ${escapeHtml(progress.chunkStart)}–${escapeHtml(progress.chunkEnd)} · ${count.toLocaleString()} public keys · ${progress.matches} verified matches · ${Math.round(Number(progress.completed) * 1000 / Math.max(progress.elapsedMs, 1)).toLocaleString()} slots/second (includes already-matched targets; not address candidates/second).</p></div>`;
+    if (!progress) return `<div class="dlog-live-progress" role="status">Running interval ${escapeHtml(pointSearch.runningLower)}–${escapeHtml(pointSearch.runningUpper)} · Validating uploaded keys${count ? ` · ${count.toLocaleString()} valid rows` : '…'}</div>`;
+    return `<div class="dlog-live-progress" role="status"><b>Giant-step slots checked: ${progress.completed.toLocaleString()} / ${progress.total.toLocaleString()}</b><div class="search-progress"><span style="width:${Number(progress.completed * 10000n / progress.total) / 100}%"></span></div><p>Running interval ${escapeHtml(pointSearch.runningLower)}–${escapeHtml(pointSearch.runningUpper)} · ${progress.workers} workers · ${count.toLocaleString()} public keys · ${progress.matches} verified matches · ${Math.round(Number(progress.completed) * 1000 / Math.max(progress.elapsedMs, 1)).toLocaleString()} slots/second (includes already-matched targets; not address candidates/second).</p></div>`;
   }
   if (!result) return '<p class="dlog-placeholder">Upload an exported public-key TXT to begin.</p>';
   const cancelled = result.status === 'cancelled';
@@ -596,10 +598,11 @@ function pointSearchStatusMarkup() {
 
 function pointSearchMarkup() {
   return `<section class="backward-panel dlog-panel" id="public-key-search">
-    <div class="backward-heading"><div><span class="eyebrow">PUBLIC-KEY SEARCH · LOCAL ONLY</span><h3>Search uploaded Ethereum public keys</h3></div><span class="live-example">SHARED BSGS TABLE</span></div>
-    <p class="backward-intro">Upload the tab-separated TXT exported by “Extract public keys”. This uses baby-step giant-step (BSGS), not kangaroo, to search every validated public point in the same inclusive interval. The file stays in this browser.</p>
+    <div class="backward-heading"><div><span class="eyebrow">PUBLIC-KEY SEARCH · LOCAL ONLY</span><h3>Search uploaded Ethereum public keys</h3></div><span class="live-example">PARALLEL BSGS</span></div>
+    <p class="backward-intro">Upload the tab-separated TXT exported by “Extract public keys”. This uses parallel baby-step giant-step (BSGS), not kangaroo, to search every validated public point in the same inclusive interval. Up to 8 workers share the targets; each uses its own table. The file stays in this browser.</p>
     <div class="search-file-row"><div class="search-file-copy"><strong>Ethereum public-key TXT</strong><small>Columns: address, transaction_hash, public_key_uncompressed, status; tab separated, status ok. Up to 10,000 rows and 5 MB. All rows must validate.</small></div><label class="search-file-button ${pointSearch.busy ? 'is-disabled' : ''}" for="point-search-file">Choose TXT</label><input id="point-search-file" type="file" accept=".txt,text/plain,.tsv,text/tab-separated-values" hidden ${pointSearch.busy ? 'disabled' : ''}><span class="search-file-name">${escapeHtml(pointSearch.fileName || 'No file selected')}</span></div>
-    <div class="candidate-range"><label>Lower scalar (inclusive)<input id="point-search-lower" type="text" inputmode="numeric" value="${escapeHtml(pointSearch.lower)}" ${pointSearch.busy ? 'disabled' : ''}></label><label>Upper scalar (inclusive)<input id="point-search-upper" type="text" inputmode="numeric" value="${escapeHtml(pointSearch.upper)}" ${pointSearch.busy ? 'disabled' : ''}></label></div>
+    <div class="candidate-range"><label>Lower scalar (inclusive)<input id="point-search-lower" type="text" inputmode="numeric" value="${escapeHtml(pointSearch.lower)}"></label><label>Upper scalar (inclusive)<input id="point-search-upper" type="text" inputmode="numeric" value="${escapeHtml(pointSearch.upper)}"></label></div>
+    <p class="step-explanation subtle">You can edit bounds during a run; changes apply to the next search. Current run bounds remain unchanged.</p>
     <div class="dlog-warning"><strong>Bounded test only.</strong> Bounds may span the valid secp256k1 private scalar range: 1 to curve order minus one, which is slightly below 2²⁵⁶. The search processes at most 100,000,000 scalars per internal chunk. Large intervals can take vastly longer than a human lifetime; a full-range search is infeasible. No interval is more likely for a randomly generated key. Use only keys you are authorized to test.</div>
     <div class="dlog-actions"><button class="action-button" id="point-search-start" type="button" ${pointSearch.busy || !pointSearch.text ? 'disabled' : ''}>Search uploaded public keys <span aria-hidden="true">↗</span></button>${pointSearch.busy ? '<button class="dlog-stop-button" id="point-search-stop" type="button">Stop search</button>' : ''}</div>
     <div id="point-search-status">${pointSearchStatusMarkup()}</div>
@@ -608,35 +611,28 @@ function pointSearchMarkup() {
 
 function startPointSearch() {
   if (!pointSearch.text || pointSearch.busy) return;
-  pointSearch = { ...pointSearch, busy: true, progress: null, result: null, error: '', count: 0 };
+  pointSearch = { ...pointSearch, busy: true, progress: null, result: null, error: '', count: 0, runningLower: pointSearch.lower.trim(), runningUpper: pointSearch.upper.trim() };
   render();
-  try {
-    const worker = new Worker(new URL('./public-key-search-worker.js', import.meta.url), { type: 'module' });
-    pointSearchWorker = worker;
-    worker.onmessage = ({ data }) => {
-      if (pointSearchWorker !== worker) return;
-      if (data.type === 'validated') pointSearch.count = data.count;
-      if (data.type === 'progress') pointSearch.progress = data;
-      if (data.type === 'result' || data.type === 'error') {
-        worker.terminate(); pointSearchWorker = null;
-        pointSearch.busy = false;
-        if (data.type === 'result') pointSearch.result = data; else pointSearch.error = data.message;
-        render();
-        return;
-      }
+  const pool = createPublicKeySearchPool({
+    createWorker: () => new Worker(new URL('./public-key-search-worker.js', import.meta.url), { type: 'module' }),
+    text: pointSearch.text, lower: pointSearch.runningLower, upper: pointSearch.runningUpper,
+    cores: navigator.hardwareConcurrency,
+    onUpdate: (progress) => {
+      if (pointSearchPool !== pool) return;
+      pointSearch.count = progress.count;
+      pointSearch.progress = progress;
       const status = document.querySelector('#point-search-status');
       if (status) status.innerHTML = pointSearchStatusMarkup();
-    };
-    worker.onerror = (error) => {
-      if (pointSearchWorker !== worker) return;
-      worker.terminate(); pointSearchWorker = null; pointSearch.busy = false;
-      pointSearch.error = error.message || 'Search worker failed.'; render();
-    };
-    worker.postMessage({ type: 'start', text: pointSearch.text, lower: pointSearch.lower.trim(), upper: pointSearch.upper.trim() });
-  } catch (error) {
-    pointSearchWorker?.terminate(); pointSearchWorker = null; pointSearch.busy = false;
-    pointSearch.error = error?.message ?? String(error); render();
-  }
+    },
+    onFinish: ({ result, error }) => {
+      if (pointSearchPool !== pool) return;
+      pointSearchPool = null; pointSearch.busy = false;
+      if (result) pointSearch.result = result; else pointSearch.error = error;
+      render();
+    },
+  });
+  pointSearchPool = pool;
+  pool.start();
 }
 
 function kangarooDemoMarkup() {
@@ -682,6 +678,7 @@ function runKangarooDemoFromUi() {
 }
 
 function render() {
+  const scalarFocus = captureScalarFocus(document);
   const activeNetwork = selectedNetwork();
   const pathSegments = activeNetwork.path.slice(2).split('/');
   const entropyReady = wallet.stage >= 1;
@@ -830,10 +827,11 @@ function render() {
         ${searchAddressFile?.addresses?.length ? `<ul class="search-target-preview">${searchAddressFile.addresses.map((address, index) => `<li><b>${index + 1}.</b> <code>${escapeHtml(address)}</code></li>`).join('')}</ul>` : ''}
         ${searchAddressFile?.transactions?.length ? `<div class="public-key-extract-panel"><label for="ethereum-rpc-endpoint">Ethereum JSON-RPC endpoint</label><input id="ethereum-rpc-endpoint" type="url" value="${escapeHtml(ethereumRpcEndpoint)}" spellcheck="false"><small>Extracts signer public keys from outgoing transactions. The transaction hashes are sent to this RPC provider; private keys are never requested.</small><button class="search-file-button" id="extract-public-keys" type="button">Extract public keys and download TXT</button><p id="public-key-extraction-status" role="status" aria-live="polite"></p></div>` : ''}
       ` : ''}
-      <div class="candidate-range"><label>Lower scalar (inclusive)<input id="search-lower" type="text" inputmode="numeric" value="${escapeHtml(searchLower)}" ${discreteLogProgress ? 'disabled' : ''}></label><label>Upper scalar (inclusive)<input id="search-upper" type="text" inputmode="numeric" value="${escapeHtml(searchUpper)}" ${discreteLogProgress ? 'disabled' : ''}></label></div>
+      <div class="candidate-range"><label>Lower scalar (inclusive)<input id="search-lower" type="text" inputmode="numeric" value="${escapeHtml(searchLower)}"></label><label>Upper scalar (inclusive)<input id="search-upper" type="text" inputmode="numeric" value="${escapeHtml(searchUpper)}"></label></div>
+      <p class="step-explanation subtle">You can edit bounds during a run; changes apply to the next search. Current run bounds remain unchanged.</p>
       <div class="dlog-warning"><strong>Bounded test only—not wallet recovery.</strong> Only a match in the chosen interval can be found; a miss says nothing about other scalars. Even a small-looking range can take a long time. Pollard kangaroo requires a public point and a known interval; it cannot search an address hash. One million candidates per second is not guaranteed; the actual rate depends on the device.</div>
       <div class="dlog-actions"><button class="action-button dlog-button" id="run-dlog-lab" type="button" ${discreteLogProgress ? 'disabled' : ''}>${searchButtonLabel}<span aria-hidden="true">↗</span></button>${discreteLogProgress ? `<button class="dlog-stop-button" id="stop-search" type="button">${discreteLogProgress.stopping ? 'Stopping after current chunks…' : 'Stop search'}</button>` : ''}</div>
-      ${discreteLogProgress ? `<div class="dlog-live-progress" role="status" aria-live="polite"><b>Checked ${discreteLogProgress.completed.toLocaleString()} / ${discreteLogProgress.trials.toLocaleString()} candidates</b><div class="search-progress"><span style="width:${100 * Number(discreteLogProgress.completed) / Number(discreteLogProgress.trials)}%"></span></div><p>${discreteLogProgress.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second · ${discreteLogProgress.workers} browser workers · ${discreteLogProgress.elapsedMs.toFixed(1)} ms elapsed · ${discreteLogProgress.candidatesPerSecond ? `about ${formatDuration(Number(discreteLogProgress.trials - discreteLogProgress.completed) * 1000 / discreteLogProgress.candidatesPerSecond)} remaining at this rate` : 'measuring speed'}.</p></div>` : searchResultMarkup(discreteLogResult, activeNetwork)}
+      ${discreteLogProgress ? `<div class="dlog-live-progress" role="status" aria-live="polite"><b>Checked ${discreteLogProgress.completed.toLocaleString()} / ${discreteLogProgress.trials.toLocaleString()} candidates</b><p>Running interval ${discreteLogProgress.startScalar.toLocaleString()}–${discreteLogProgress.endScalar.toLocaleString()}</p><div class="search-progress"><span style="width:${100 * Number(discreteLogProgress.completed) / Number(discreteLogProgress.trials)}%"></span></div><p>${discreteLogProgress.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second · ${discreteLogProgress.workers} browser workers · ${discreteLogProgress.elapsedMs.toFixed(1)} ms elapsed · ${discreteLogProgress.candidatesPerSecond ? `about ${formatDuration(Number(discreteLogProgress.trials - discreteLogProgress.completed) * 1000 / discreteLogProgress.candidatesPerSecond)} remaining at this rate` : 'measuring speed'}.</p></div>` : searchResultMarkup(discreteLogResult, activeNetwork)}
       <p class="step-explanation subtle">Each worker starts with Q=dG, then advances with Q(d+1)=Q(d)+G and compares address payload bytes directly. Workers batch-normalize points to reduce field inversions, avoiding a fresh scalar multiplication and address encoding for every candidate. The operation stays on this device; it is not an EC2 background job.</p>
     </section>`;
 
@@ -874,7 +872,7 @@ function render() {
   document.querySelector('#generate')?.addEventListener('click', generateWallet);
   document.querySelector('#run-kangaroo-demo')?.addEventListener('click', runKangarooDemoFromUi);
   document.querySelector('#point-search-start')?.addEventListener('click', startPointSearch);
-  document.querySelector('#point-search-stop')?.addEventListener('click', (event) => { pointSearchWorker?.postMessage({ type: 'cancel' }); event.target.disabled = true; event.target.textContent = 'Stopping…'; });
+  document.querySelector('#point-search-stop')?.addEventListener('click', (event) => { event.target.disabled = true; event.target.textContent = 'Stopping…'; pointSearchPool?.cancel(); });
   document.querySelector('#point-search-lower')?.addEventListener('input', (event) => { pointSearch.lower = event.target.value; });
   document.querySelector('#point-search-upper')?.addEventListener('input', (event) => { pointSearch.upper = event.target.value; });
   document.querySelector('#point-search-file')?.addEventListener('change', async (event) => {
@@ -949,6 +947,7 @@ function render() {
   document.querySelector('#scan-start')?.addEventListener('click', startScan);
   setScanStatus();
   renderScanResults();
+  restoreScalarFocus(document, scalarFocus);
 }
 
 function selectNetwork(event) {
