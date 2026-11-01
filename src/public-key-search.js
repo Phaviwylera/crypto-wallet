@@ -127,8 +127,10 @@ export function estimateSearchWork(count, targetCount, chunkSize = SEARCH_CHUNK_
 
 // Split arbitrary valid intervals into memory-bounded BSGS searches. This is
 // sequential and does not make a large or full-keyspace search practical.
-export async function searchPublicKeys(targets, range, { onProgress = () => {}, shouldStop = () => false, batchSize = 128, chunkSize = SEARCH_CHUNK_SIZE, gpuLookup = null } = {}) {
+export async function searchPublicKeys(targets, range, { onProgress = () => {}, shouldStop = () => false, batchSize = null, chunkSize = SEARCH_CHUNK_SIZE, gpuLookup = null } = {}) {
   if (chunkSize < 1n || chunkSize > SEARCH_CHUNK_SIZE) throw new Error('Invalid chunk size.');
+  batchSize ??= gpuLookup ? 1024 : 128;
+  if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 4096) throw new Error('Invalid batch size.');
   const chunkCount = (range.count + chunkSize - 1n) / chunkSize;
   const total = estimateSearchWork(range.count, targets.length, chunkSize);
   const started = performance.now();

@@ -8,7 +8,7 @@ const Point = secp256k1.Point;
 // Software emulator for the WebGPU command interface. This tests buffer layout,
 // host-side dispatch and result handling, not actual shader execution or hardware.
 function fakeGpu() {
-  let usedPreference, dispatched = 0, destroyed = 0;
+  let usedPreference, dispatched = 0, destroyed = 0, allocated = 0;
   class Buffer {
     constructor(size) { this.data = new Uint32Array(size / 4); }
     async mapAsync() {}
@@ -20,7 +20,7 @@ function fakeGpu() {
     lost: new Promise(() => {}),
     createShaderModule: () => ({ getCompilationInfo: async () => ({ messages: [] }) }),
     createComputePipelineAsync: async () => ({ getBindGroupLayout: () => ({}) }),
-    createBuffer: ({ size }) => new Buffer(size),
+    createBuffer: ({ size }) => { allocated++; return new Buffer(size); },
     createBindGroup: ({ entries }) => entries.map((e) => e.resource.buffer),
     createCommandEncoder: () => {
       let buffers, output, dest;
@@ -33,6 +33,7 @@ function fakeGpu() {
       submit: ([{ buffers, output, dest }]) => {
         const [table, query, , params] = buffers.map((b) => b.data);
         for (let i = 0; i < params[0]; i++) {
+          output.data[i] = 0;
           let h = 2166136261;
           for (let k = 0; k < 9; k++) h = Math.imul(h ^ query[i * 9 + k], 16777619) >>> 0;
           let slot = h & params[1];
@@ -48,7 +49,7 @@ function fakeGpu() {
     },
     destroy() { destroyed++; },
   };
-  return { gpu: { requestAdapter: async ({ powerPreference }) => { usedPreference = powerPreference; return { requestDevice: async () => device }; } }, get usedPreference() { return usedPreference; }, get dispatched() { return dispatched; }, get destroyed() { return destroyed; } };
+  return { gpu: { requestAdapter: async ({ powerPreference }) => { usedPreference = powerPreference; return { info: { vendor: 'test-vendor', architecture: 'test-architecture' }, requestDevice: async () => device }; } }, get usedPreference() { return usedPreference; }, get dispatched() { return dispatched; }, get destroyed() { return destroyed; }, get allocated() { return allocated; } };
 }
 
 test('WebGPU is explicit about missing support', async () => {
@@ -150,5 +151,85 @@ test('worker without navigator.gpu completes using window bridge', async () => {
   assert.equal(result.status, 'done');
   assert.deepEqual(result.matches.map((match) => match.scalar).sort(), ['2', '8']);
   assert.equal(result.completed, result.total);
+  assert.ok(emulated.dispatched > 0);
+});
+
+
+test('reused GPU buffers produce correct smaller results and grow only when necessary', async () => {
+  const emulated = fakeGpu();
+  const gpu = await createWebGpuLookup('low-power', emulated.gpu);
+  const table = await gpu.prepare([Point.ZERO, Point.BASE]);
+  assert.deepEqual(await table.lookup([Point.BASE, Point.ZERO]), [1, 0]);
+  const firstAllocation = emulated.allocated;
+  assert.deepEqual(await table.lookup([Point.BASE.multiply(3n)]), [undefined]);
+  assert.equal(emulated.allocated, firstAllocation);
+  assert.deepEqual(await table.lookup([Point.ZERO, Point.BASE, Point.BASE.multiply(3n)]), [0, 1, undefined]);
+  assert.equal(emulated.allocated, firstAllocation + 4);
+  table.destroy(); gpu.destroy();
+});
+
+test('GPU searches batch up to 1024 keys and verify all GPU results', async () => {
+  const counts = [];
+  const gpuLookup = { prepare: async () => ({
+    lookup: async (points) => { counts.push(points.length); return points.map(() => undefined); },
+    destroy() {},
+  }) };
+  const targets = Array.from({ length: 300 }, (_, i) => ({ address: String(i), point: Point.BASE.multiply(BigInt(i + 100)) }));
+  const result = await searchPublicKeys(targets, validatePointSearchRange('1', '1'), { gpuLookup });
+  assert.equal(result.status, 'done');
+  assert.equal(result.completed, result.total);
+  assert.deepEqual(counts, [300]);
+});
+
+
+test('synthetic GPU benchmark verifies warm-up and measurements', async () => {
+  const { benchmarkGpuLookup } = await import('../src/gpu-benchmark.js');
+  const emulated = fakeGpu();
+  const gpu = await createWebGpuLookup('low-power', emulated.gpu);
+  const updates = [];
+  const result = await benchmarkGpuLookup(gpu, { batchSize: 32, rounds: 3, onProgress: (value) => updates.push(value.completedRounds) });
+  assert.equal(result.status, 'done'); assert.equal(result.verified, true);
+  assert.equal(result.lookups, 96); assert.ok(result.lookupsPerSecond > 0);
+  assert.equal(emulated.dispatched, 4); // Includes the excluded warm-up.
+  assert.equal(gpu.adapterInfo.vendor, 'test-vendor');
+  assert.deepEqual(updates, [1, 2, 3]);
+  gpu.destroy();
+});
+
+test('GPU benchmark handles cancellation and mismatch without a throughput result', async () => {
+  const { benchmarkGpuLookup } = await import('../src/gpu-benchmark.js');
+  let destroyed = false, cancelled = false;
+  const gpu = { prepare: async () => ({
+    lookup: async (points) => points.map((_, i) => i % 2 === 0 ? i : undefined),
+    destroy: () => { destroyed = true; },
+  }) };
+  const result = await benchmarkGpuLookup(gpu, { batchSize: 16, rounds: 5, shouldStop: () => cancelled, onProgress: () => { cancelled = true; } });
+  assert.equal(result.status, 'cancelled'); assert.equal(result.completedRounds, 1);
+  assert.equal(result.lookupsPerSecond, undefined); assert.equal(destroyed, true);
+  let cleaned = false;
+  const wrong = { prepare: async () => ({ lookup: async (points) => points.map(() => undefined), destroy: () => { cleaned = true; } }) };
+  await assert.rejects(benchmarkGpuLookup(wrong, { batchSize: 16, rounds: 1 }), /verification failed/);
+  assert.equal(cleaned, true);
+});
+
+test('GPU benchmark worker uses window bridge when worker WebGPU is unavailable', async () => {
+  const { Worker } = await import('node:worker_threads');
+  const { createGpuBridgeHost } = await import('../src/webgpu-bridge.js');
+  const emulated = fakeGpu();
+  const thread = new Worker(new URL('./gpu-benchmark-worker-adapter.mjs', import.meta.url));
+  const worker = { postMessage: (data) => thread.postMessage(data), terminate: () => thread.terminate() };
+  const host = createGpuBridgeHost(worker, (preference) => createWebGpuLookup(preference, emulated.gpu));
+  const result = await new Promise((resolve, reject) => {
+    thread.on('error', reject);
+    thread.on('message', (data) => {
+      if (data.type === 'gpu-request') void host.handle(data);
+      if (data.type === 'error') reject(new Error(data.message));
+      if (data.type === 'result') resolve(data.result);
+    });
+    thread.postMessage({ type: 'start', preference: 'low-power' });
+  });
+  host.close(); await worker.terminate();
+  assert.equal(result.status, 'done'); assert.equal(result.path, 'window bridge');
+  assert.equal(result.adapter.vendor, 'test-vendor'); assert.equal(result.lookups, 48 * 1024);
   assert.ok(emulated.dispatched > 0);
 });
