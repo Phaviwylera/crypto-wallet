@@ -1,3 +1,4 @@
+import { createGpuBridgeHost } from './webgpu-bridge.js';
 import { estimateSearchWork, validatePointSearchRange } from './public-key-search.js';
 
 export const MAX_PUBLIC_KEY_WORKERS = 32;
@@ -19,8 +20,9 @@ export function partitionTargets(targets, workerCount) {
 // The validation worker checks the entire file first, then each search worker
 // processes a disjoint group of targets over the same interval. Each has its
 // own baby table; aggregate counters are exact BigInts.
-export function createPublicKeySearchPool({ createWorker, text, lower, upper, cores, requestedWorkers = null, backend = 'cpu', onUpdate, onFinish, now = () => performance.now() }) {
+export function createPublicKeySearchPool({ createWorker, text, lower, upper, cores, requestedWorkers = null, backend = 'cpu', onUpdate, onFinish, createGpuHost = createGpuBridgeHost, now = () => performance.now() }) {
   let workers = [];
+  let gpuHosts = [];
   let cancelled = false;
   let finished = false;
   const started = now();
@@ -30,7 +32,7 @@ export function createPublicKeySearchPool({ createWorker, text, lower, upper, co
   let cpuWorkers = 0;
   let gpuWorkers = 0;
   let range;
-  const cleanup = () => { workers.forEach((w) => w.terminate()); workers = []; };
+  const cleanup = () => { gpuHosts.forEach((host) => host.close()); gpuHosts = []; workers.forEach((w) => w.terminate()); workers = []; };
   const fail = (message) => { if (finished) return; finished = true; cleanup(); onFinish({ error: message }); };
   const finish = (result) => { if (finished) return; finished = true; cleanup(); onFinish({ result }); };
   const aggregate = () => ({
@@ -67,10 +69,13 @@ export function createPublicKeySearchPool({ createWorker, text, lower, upper, co
         try {
           groups.forEach((group, index) => {
             const worker = createWorker(); workers.push(worker);
+            const gpuHost = index < gpuWorkers ? createGpuHost(worker) : null;
+            if (gpuHost) gpuHosts.push(gpuHost);
             worker.onerror = (error) => fail(error.message || 'Search worker failed.');
             worker.onmessage = ({ data }) => {
               if (finished) return;
               const state = states[index];
+              if (data.type === 'gpu-request' && gpuHost) { void gpuHost.handle(data); return; }
               if (data.type === 'error') { fail(data.message); return; }
               if (data.type === 'progress') {
                 state.completed = data.completed; state.matches = data.matches;

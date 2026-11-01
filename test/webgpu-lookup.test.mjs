@@ -81,3 +81,74 @@ test('mismatched GPU results stop the search and clean up the table', async () =
   await assert.rejects(searchPublicKeys(targets, validatePointSearchRange('1', '3'), { gpuLookup: gpu }), /disagreed/);
   assert.equal(destroyed, true);
 });
+
+test('worker bridge routes lookups to a window GPU and cleans up', async () => {
+  const { createGpuBridgeHost, createGpuBridgeClient } = await import('../src/webgpu-bridge.js');
+  const emulated = fakeGpu();
+  let host, client;
+  const mainSide = { postMessage: (message) => queueMicrotask(() => client.handle(message)) };
+  host = createGpuBridgeHost(mainSide, (preference) => createWebGpuLookup(preference, emulated.gpu));
+  client = createGpuBridgeClient((message) => queueMicrotask(() => host.handle(message)));
+  const gpu = await client.create('low-power');
+  const targets = [2n, 8n, 11n].map((n) => ({ address: String(n), point: Point.BASE.multiply(n) }));
+  const range = validatePointSearchRange('1', '10');
+  const expected = await searchPublicKeys(targets, range, { chunkSize: 6n });
+  const result = await searchPublicKeys(targets, range, { chunkSize: 6n, gpuLookup: gpu });
+  assert.deepEqual(result.matches, expected.matches);
+  assert.equal(result.status, 'done');
+  assert.equal(emulated.usedPreference, 'low-power');
+  assert.ok(emulated.dispatched > 0);
+  gpu.destroy();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  host.close();
+  assert.ok(emulated.destroyed > 0);
+});
+
+test('worker bridge propagates unavailable WebGPU rather than silently falling back', async () => {
+  const { createGpuBridgeHost, createGpuBridgeClient } = await import('../src/webgpu-bridge.js');
+  let host, client;
+  host = createGpuBridgeHost({ postMessage: (message) => queueMicrotask(() => client.handle(message)) }, async () => { throw new Error('WebGPU unavailable on window'); });
+  client = createGpuBridgeClient((message) => queueMicrotask(() => host.handle(message)));
+  await assert.rejects(client.create('high-performance'), /unavailable on window/);
+  host.close();
+});
+
+test('closing the bridge while adapter is pending destroys the device', async () => {
+  const { createGpuBridgeHost } = await import('../src/webgpu-bridge.js');
+  let resolveDevice, destroyed = false, replied = false;
+  const host = createGpuBridgeHost({ postMessage: () => { replied = true; } }, () => new Promise((resolve) => { resolveDevice = resolve; }));
+  const task = host.handle({ operation: 'init', id: 1, preference: 'low-power' });
+  host.close(); resolveDevice({ destroy: () => { destroyed = true; } });
+  await task;
+  assert.equal(destroyed, true); assert.equal(replied, false);
+});
+
+test('worker without navigator.gpu completes using window bridge', async () => {
+  const { Worker } = await import('node:worker_threads');
+  const { keccak_256 } = await import('@noble/hashes/sha3.js');
+  const { createGpuBridgeHost } = await import('../src/webgpu-bridge.js');
+  const { createPublicKeySearchPool } = await import('../src/public-key-search-pool.js');
+  const emulated = fakeGpu();
+  const header = 'address\ttransaction_hash\tpublic_key_uncompressed\tstatus';
+  const rows = [2n, 8n, 11n].map((n) => {
+    const pub = Point.BASE.multiply(n).toBytes(false);
+    return `0x${Buffer.from(keccak_256(pub.slice(1)).slice(12)).toString('hex')}\t0x${'01'.repeat(32)}\t0x${Buffer.from(pub).toString('hex')}\tok`;
+  });
+  const createWorker = () => {
+    const thread = new Worker(new URL('./browser-worker-adapter.mjs', import.meta.url));
+    const worker = { postMessage: (data) => thread.postMessage(data), terminate: () => thread.terminate() };
+    thread.on('message', (data) => worker.onmessage?.({ data }));
+    thread.on('error', (error) => worker.onerror?.(error));
+    return worker;
+  };
+  const { result, error } = await new Promise((resolve) => {
+    const pool = createPublicKeySearchPool({ createWorker, text: [header, ...rows].join('\n'), lower: '1', upper: '10', backend: 'webgpu-low', requestedWorkers: 1, cores: 1,
+      createGpuHost: (worker) => createGpuBridgeHost(worker, (preference) => createWebGpuLookup(preference, emulated.gpu)), onUpdate: () => {}, onFinish: resolve });
+    pool.start();
+  });
+  assert.equal(error, undefined);
+  assert.equal(result.status, 'done');
+  assert.deepEqual(result.matches.map((match) => match.scalar).sort(), ['2', '8']);
+  assert.equal(result.completed, result.total);
+  assert.ok(emulated.dispatched > 0);
+});
