@@ -1,10 +1,13 @@
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { createWebGpuLookup } from './webgpu-lookup.js';
+import { createGpuBridgeClient } from './webgpu-bridge.js';
 import { parsePublicKeyFile, searchPublicKeys, validatePointSearchRange } from './public-key-search.js';
 
 let stopped = false;
+const gpuBridge = createGpuBridgeClient((message) => self.postMessage(message));
 self.onmessage = async ({ data }) => {
   if (data.type === 'cancel') { stopped = true; return; }
+  if (data.type === 'gpu-response') { gpuBridge.handle(data); return; }
   try {
     if (data.type === 'validate') {
       validatePointSearchRange(data.lower, data.upper);
@@ -19,7 +22,8 @@ self.onmessage = async ({ data }) => {
       let gpuLookup = null;
       try {
         if (data.backend === 'webgpu-high' || data.backend === 'webgpu-low') {
-          gpuLookup = await createWebGpuLookup(data.backend === 'webgpu-low' ? 'low-power' : 'high-performance');
+          const preference = data.backend === 'webgpu-low' ? 'low-power' : 'high-performance';
+          gpuLookup = globalThis.navigator?.gpu ? await createWebGpuLookup(preference) : await gpuBridge.create(preference);
         }
         const result = await searchPublicKeys(targets, range, {
           gpuLookup, shouldStop: () => stopped,

@@ -5,6 +5,7 @@ const ENTRY_WORDS = 10;
 const STORAGE = 0x80, COPY_SRC = 0x04, COPY_DST = 0x08, MAP_READ = 0x01;
 
 export function pointWords(point) {
+  if (point instanceof Uint32Array && point.length === WORDS) return point;
   const words = new Uint32Array(WORDS);
   if (point.is0()) { words[8] = 2; return words; }
   let { x, y } = point.toAffine();
@@ -59,7 +60,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }`;
 
 export async function createWebGpuLookup(preference = 'high-performance', gpu = globalThis.navigator?.gpu) {
-  if (!gpu) throw new Error('WebGPU is unavailable in this browser/worker. Use HTTPS or localhost and a supported browser, or select CPU mode.');
+  if (!gpu) throw new Error('WebGPU is unavailable in this browser context. Use HTTPS or localhost, enable WebGPU in a supported browser, or select CPU mode.');
   const adapter = await gpu.requestAdapter({ powerPreference: preference });
   if (!adapter) throw new Error('No compatible WebGPU adapter found. Select CPU mode.');
   const device = await adapter.requestDevice();
