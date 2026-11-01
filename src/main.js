@@ -719,7 +719,7 @@ function render() {
           : `Search all ${formattedSearchLimit} candidates`;
   const discreteLogLab = wallet.stage >= 5 ? `
     <section class="backward-panel dlog-panel">
-      <div class="backward-heading"><div><span class="eyebrow">BOUNDED ADDRESS SEARCH · LOCAL ONLY</span><h3>Search ${activeNetwork.label}</h3></div><span class="live-example">SCALARS 1–${SEARCH_SCALAR_LIMIT.toLocaleString()} · UP TO 108 WORKERS</span></div>
+      <div class="backward-heading"><div><span class="eyebrow">BOUNDED ADDRESS SEARCH · LOCAL ONLY</span><h3>Search ${activeNetwork.label}</h3></div><span class="live-example">SCALARS 1–${SEARCH_SCALAR_LIMIT.toLocaleString()} · 32–108 WORKERS</span></div>
       <p class="backward-intro">Paste a valid address or load a .txt list of Ethereum addresses. Search checks the entire scalar interval 1–${SEARCH_SCALAR_LIMIT.toLocaleString()} by default. If a candidate matches, other workers stop after their current small chunk. It runs in browser workers; the address and candidates are not sent to EC2.</p>
       <div class="dlog-address-control"><label for="lab-address">${activeNetwork.label} address or public key</label><input id="lab-address" type="text" spellcheck="false" autocomplete="off" placeholder="${addressPlaceholder()}" value="${escapeHtml(labAddressInput ?? wallet.address)}" ${discreteLogProgress ? 'disabled' : ''}><small>${addressInputHint()}</small>${labAddressInput?.trim() ? '<button class="reverse-toggle" id="export-public-address" type="button">Export public address</button>' : ''}</div>
       ${selectedNetworkId === 'ethereum' ? `<div class="search-file-row"><div class="search-file-copy"><strong>Search several Ethereum addresses together</strong><small>Choose a .txt file with one 0x address per line. One scalar pass checks every address in the file; loaded file targets replace the pasted address until you clear the file.</small></div><label class="search-file-button ${discreteLogProgress ? 'is-disabled' : ''}" for="search-address-file" aria-disabled="${Boolean(discreteLogProgress)}">Choose file</label><input id="search-address-file" type="file" accept=".txt,text/plain" hidden ${discreteLogProgress ? 'disabled' : ''}>${searchAddressFile ? `<span class="search-file-name">${escapeHtml(searchAddressFile.name)} · ${searchAddressFile.addresses?.length ?? 0} addresses</span><button class="search-file-clear" id="clear-search-file" type="button" ${discreteLogProgress ? 'disabled' : ''}>Clear</button>` : ''}</div>${searchAddressFile?.error ? `<p class="search-file-error" role="alert">${escapeHtml(searchAddressFile.error)}</p>` : ''}${searchAddressFile?.addresses?.length ? `<ul class="search-target-preview">${searchAddressFile.addresses.map((address, index) => `<li><b>${index + 1}.</b> <code>${escapeHtml(address)}</code></li>`).join('')}</ul>` : ''}` : ''}
@@ -1153,7 +1153,7 @@ async function runDiscreteLogLab() {
   const parsed = targets[0];
 
   const availableCores = navigator.hardwareConcurrency || 2;
-  const workerCount = Math.max(1, Math.min(108, availableCores));
+  const workerCount = Math.max(32, Math.min(108, availableCores));
   const partitionSize = Math.ceil(SEARCH_SCALAR_LIMIT / workerCount);
   const runId = ++searchRunId;
   const search = {
