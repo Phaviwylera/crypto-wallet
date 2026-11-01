@@ -8,7 +8,7 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { keccak_256 } from '@noble/hashes/sha3.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 import { recoverEthereumTransactionPublicKey } from './ethereum-transaction.js';
-import { runPollardKangarooDemo } from './pollard-kangaroo-demo.js';
+import { parseSearchRange, partitionSearchRange } from './search-range.js';
 import './style.css';
 
 const app = document.querySelector('#app');
@@ -23,8 +23,9 @@ const NETWORKS = {
   bnbBeacon: { label: 'BNB Beacon Chain · Legacy', shortLabel: 'BNB Beacon', family: 'bnbBeacon', path: "m/44'/714'/0'/0/0", pathLabels: ['BIP-44 purpose', 'BNB coin type', 'account', 'external chain', 'address index'] },
 };
 let selectedNetworkId = 'ethereum';
-const SEARCH_SCALAR_LIMIT = 1_000_000_000_000_000_000_000n;
-const SEARCH_WORKER_CHUNK = 8192;
+const SEARCH_WORKER_CHUNK = 256;
+let searchLower = '1';
+let searchUpper = '10000';
 const selectedNetwork = () => NETWORKS[selectedNetworkId];
 let wallet = freshWallet();
 let passphrase = '';
@@ -337,17 +338,17 @@ function stepCard({ number, title, caption, step, body, action }) {
 
 
 function searchResultMarkup(result, network) {
-  if (!result) return '<p class="dlog-placeholder">Enter an address or public key and run the full bounded search.</p>';
+  if (!result) return '<p class="dlog-placeholder">Enter an address or public key and search a bounded test range.</p>';
   if (result.status === 'invalid') return `<div class="dlog-warning result-error"><strong>Invalid ${network.label} input.</strong> ${escapeHtml(result.reason)}</div>`;
   if (result.status === 'publicKey') return `<div class="dlog-results"><div><label>INPUT · VALIDATED SECP256K1 PUBLIC KEY</label><code class="dlog-address-value">${hex(result.parsed.publicKey)}</code>${copyButton('searchPublicKey', 'Copy public key')}<p>Point validation succeeded. No private key was derived.</p></div><div><label>FULL ADDRESS-GENERATION DIGEST · 32 BYTES</label><p>Keccak-256(public key body X || Y):</p><div class="hash-byte-grid output-byte-grid">${byteGrid(result.parsed.keyKeccakHash, result.parsed.keyKeccakHash.length)}</div>${copyButton('searchKeyDigest', 'Copy 32-byte digest')}</div><div><label>DERIVED ETHEREUM ADDRESS</label><code class="dlog-address-value">${result.parsed.display}</code>${networkAddressDetails(result.parsed, network)}<p>No scalar search was run.</p></div></div>`;
-  if (result.status === 'cancelled') return `<div class="dlog-warning"><strong>Search stopped.</strong> Checked ${result.totalTested.toLocaleString()} of ${SEARCH_SCALAR_LIMIT.toLocaleString()} candidates in ${result.elapsedMs.toFixed(1)} ms (${result.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second). This partial run cannot rule out the untested scalars.</div>`;
+  if (result.status === 'cancelled') return `<div class="dlog-warning"><strong>Search stopped.</strong> Checked ${result.totalTested.toLocaleString()} of ${result.rangeCount.toLocaleString()} candidates in ${result.elapsedMs.toFixed(1)} ms (${result.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second). This partial run cannot rule out the untested scalars.</div>`;
   if (result.status === 'error') return `<div class="dlog-warning result-error"><strong>Search failed.</strong> ${escapeHtml(result.message)}</div>`;
   const targets = result.targets?.length ? result.targets : [result.parsed];
   const matchText = result.foundScalar
     ? `Match found at scalar d=${result.foundScalar}; it matches target ${result.matchTargetIndex + 1} of ${targets.length}.`
-    : `No match for any of the ${targets.length} target${targets.length === 1 ? '' : 's'} in the complete interval 1–${SEARCH_SCALAR_LIMIT.toLocaleString()}.`;
+    : `No match for any of the ${targets.length} target${targets.length === 1 ? '' : 's'} in the complete interval ${result.startScalar.toLocaleString()}–${result.endScalar.toLocaleString()}.`;
   const targetList = targets.map((target, index) => `<li><b>${index + 1}.</b> <code>${escapeHtml(target.display)}</code>${result.foundScalar && index === result.matchTargetIndex ? ' <strong>← MATCH</strong>' : ''}</li>`).join('');
-  return `<div class="dlog-results"><div><label>INPUT · ${targets.length} ${targets.length === 1 ? 'ADDRESS TARGET' : 'ADDRESS TARGETS'}</label><ul class="search-target-list">${targetList}</ul>${targets.length === 1 ? `<div class="hash-byte-grid address-byte-grid">${byteGrid(targets[0].bytes)}</div>${networkAddressDetails(targets[0], network)}` : '<p>Every candidate was checked against all loaded addresses in the same pass.</p>'}</div><div><label>RESULT · ${result.foundScalar ? 'MATCH' : 'FULL RANGE TESTED'}</label><p>${matchText}</p><p>${result.totalTested.toLocaleString()} candidates checked · ${result.elapsedMs.toFixed(1)} ms · ${result.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second across ${result.workers} workers.</p><p>${result.foundScalar ? `Matching public key: <code class="dlog-address-value">${result.foundPublicKey}</code>` : 'This excludes only the tested scalar interval; it does not recover or rule out keys outside it.'}</p><p>The scalar range is about 2⁷⁰ candidates out of the secp256k1 key space. This bounded test is not a practical real-wallet recovery method.</p></div></div>`;
+  return `<div class="dlog-results"><div><label>INPUT · ${targets.length} ${targets.length === 1 ? 'ADDRESS TARGET' : 'ADDRESS TARGETS'}</label><ul class="search-target-list">${targetList}</ul>${targets.length === 1 ? `<div class="hash-byte-grid address-byte-grid">${byteGrid(targets[0].bytes)}</div>${networkAddressDetails(targets[0], network)}` : '<p>Every candidate was checked against all loaded addresses in the same pass.</p>'}</div><div><label>RESULT · ${result.foundScalar ? 'MATCH' : 'FULL RANGE TESTED'}</label><p>${matchText}</p><p>${result.totalTested.toLocaleString()} candidates checked · ${result.elapsedMs.toFixed(1)} ms · ${result.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second across ${result.workers} workers.</p><p>${result.foundScalar ? `Matching public key: <code class="dlog-address-value">${result.foundPublicKey}</code>` : 'This excludes only the tested scalar interval; it does not recover or rule out keys outside it.'}</p><p>This bounded test is not a practical real-wallet recovery method.</p></div></div>`;
 }
 
 function scanCardMarkup() {
@@ -583,7 +584,7 @@ function kangarooDemoMarkup() {
   return `<section class="kangaroo-demo-card exchange-card" id="kangaroo-demo">
     <div class="exchange-panel-heading"><div><span class="eyebrow">ALGORITHM LAB · BOUNDED DISCRETE LOG</span><h2>Pollard kangaroo</h2><p>Watch a toy tame/wild walk collide and recover a deliberately small test scalar.</p></div><span class="demo-mode-pill">SYNTHETIC TEST ONLY</span></div>
     <div class="kangaroo-summary-grid"><div><span>TOY INTERVAL</span><b>100,000 — 1,100,000</b></div><div><span>PUBLIC POINT</span><b>Q = dG</b></div><div><span>WORK PROFILE</span><b>O(√N) · probabilistic</b></div></div>
-    <div class="kangaroo-steps"><div><i>01</i><span><b>Tame walk</b><small>Stores distinguished points from N·G.</small></span></div><div><i>02</i><span><b>Wild walk</b><small>Starts from Q − L·G and follows the same jumps.</small></span></div><div><i>03</i><span><b>Collision</b><small>Uses the distance difference, then verifies Q = dG.</small></span></div></div>
+    <div class="kangaroo-steps"><div><i>01</i><span><b>Tame walk</b><small>Stores visited points from N·G.</small></span></div><div><i>02</i><span><b>Wild walk</b><small>Starts from Q − L·G and follows the same jumps.</small></span></div><div><i>03</i><span><b>Collision</b><small>Uses the distance difference, then verifies Q = dG.</small></span></div></div>
     <div class="kangaroo-run-row"><button class="action-button kangaroo-run-button" id="run-kangaroo-demo" type="button" ${kangarooDemoBusy ? 'disabled' : ''}>${kangarooDemoBusy ? 'Running toy walk…' : result ? 'Run demo again' : 'Run kangaroo demo'}<span aria-hidden="true">↗</span></button><span class="kangaroo-run-note">No wallet addresses, transaction hashes, or user keys are used.</span></div>
     ${kangarooDemoError ? `<p class="kangaroo-error" role="alert">${escapeHtml(kangarooDemoError)}</p>` : ''}
     ${result ? `<div class="kangaroo-result"><div><span>RECOVERED TOY PRIVATE SCALAR</span><b>${BigInt(result.recovered).toLocaleString()}</b></div><div><span>TAME / WILD STEPS</span><b>${result.tameSteps.toLocaleString()} / ${result.wildSteps.toLocaleString()}</b></div><div><span>VERIFY Q = dG</span><b class="${result.verified ? 'verified' : 'unverified'}">${result.verified ? 'PASSED' : 'FAILED'}</b></div></div>
@@ -594,7 +595,7 @@ function kangarooDemoMarkup() {
         <li><i>04</i><div><b>Run the wild walk</b><p>Start from <code>Q′</code>, choose the same deterministic jumps, and reach that point at step ${result.collision.wildStep.toLocaleString()} with distance <code>w = ${BigInt(result.collision.wildDistance).toLocaleString()}</code>.</p></div></li>
         <li><i>05</i><div><b>Use the collision to solve for the scalar</b><p>At collision, <code>N + t = (d − L) + w</code>, therefore:</p><code class="trace-equation">d = L + N + t − w = ${BigInt(result.lower).toLocaleString()} + ${BigInt(result.width).toLocaleString()} + ${BigInt(result.collision.tameDistance).toLocaleString()} − ${BigInt(result.collision.wildDistance).toLocaleString()} = ${BigInt(result.recovered).toLocaleString()}</code></div></li>
         <li><i>06</i><div><b>Verify the answer</b><p>Recompute <code>d·G</code> and compare it to <code>Q</code>: <strong class="${result.verified ? 'verified' : 'unverified'}">${result.verified ? 'MATCH' : 'NO MATCH'}</strong>. This recovered value is only the fixed synthetic demo scalar.</p></div></li>
-      </ol><details><summary>Show toy public point and collision</summary><div class="trace-point-pair"><code>Q = ${escapeHtml(result.targetPoint)}</code><code>collision = ${escapeHtml(result.collision.point)}</code></div></details></div>` : '<div class="kangaroo-placeholder"><span class="pulse-ring"></span><div><b>Demo ready</b><small>Run it to see every tame/wild step and the collision equation.</small></div></div>'}
+      </ol><details><summary>Show toy public point and collision</summary><div class="trace-point-pair"><code>Q = ${escapeHtml(result.targetPoint)}</code><code>collision = ${escapeHtml(result.collision.point)}</code></div></details></div>` : '<div class="kangaroo-placeholder"><span class="pulse-ring"></span><div><b>Demo ready</b><small>Run it to see a walk summary and the collision equation.</small></div></div>'}
   </section>`;
 }
 
@@ -602,18 +603,22 @@ function runKangarooDemoFromUi() {
   kangarooDemoBusy = true;
   kangarooDemoError = '';
   render();
-  setTimeout(() => {
-    try {
-      kangarooDemoResult = runPollardKangarooDemo();
-      if (!kangarooDemoResult.verified || !kangarooDemoResult.recovered) throw new Error('The toy walk did not find a verified result. Run it again.');
-    } catch (error) {
-      kangarooDemoResult = null;
-      kangarooDemoError = error?.message ?? String(error);
-    } finally {
-      kangarooDemoBusy = false;
-      render();
-    }
-  }, 30);
+  let worker;
+  const finish = (result, error) => {
+    worker?.terminate();
+    kangarooDemoResult = result?.verified && result.recovered ? result : null;
+    kangarooDemoError = error || (!kangarooDemoResult ? 'The toy walk did not find a verified result.' : '');
+    kangarooDemoBusy = false;
+    render();
+  };
+  try {
+    worker = new Worker(new URL('./kangaroo-worker.js', import.meta.url), { type: 'module' });
+    worker.onmessage = ({ data }) => finish(data.result, data.error);
+    worker.onerror = (error) => finish(null, error.message || 'The demo worker failed.');
+    worker.postMessage({});
+  } catch (error) {
+    finish(null, error?.message ?? String(error));
+  }
 }
 
 function render() {
@@ -751,42 +756,33 @@ function render() {
       </div>
       <div class="takeaway"><strong>Why address → phrase search is not practical</strong><span>With no phrase words known, a search must try up to 2<sup>128</sup> valid mnemonics (and know the passphrase and derivation path), derive each address, then compare. This is not a useful workload for the $85 EC2 budget.</span></div>
     </section>` : '';
-  const searchLimitReached = discreteLogResult?.status === 'valid' && !discreteLogResult.foundScalar
-    && discreteLogResult.totalTested >= SEARCH_SCALAR_LIMIT;
   const publicKeyInputEntered = activeNetwork.family === 'evm' && looksLikeEvmPublicKey(labAddressInput ?? '');
-  const formattedSearchLimit = SEARCH_SCALAR_LIMIT.toLocaleString();
-  const searchButtonLabel = discreteLogProgress
-    ? `Searching all ${formattedSearchLimit} candidates…`
-    : publicKeyInputEntered
-      ? 'Calculate full Keccak-256 from public key'
-      : searchAddressFile?.addresses?.length
-        ? `Search ${searchAddressFile.addresses.length} addresses through ${formattedSearchLimit}`
-        : searchLimitReached
-          ? `Run the full ${formattedSearchLimit} search again`
-          : `Search all ${formattedSearchLimit} candidates`;
-  const discreteLogLab = wallet.stage >= 5 ? `
+  const searchButtonLabel = discreteLogProgress ? 'Searching candidates…' : publicKeyInputEntered && !searchAddressFile?.addresses?.length
+    ? 'Calculate full Keccak-256 from public key' : 'Search candidate range';
+  const discreteLogLab = `
     <section class="backward-panel dlog-panel" id="search-lab">
-      <div class="backward-heading"><div><span class="eyebrow">BOUNDED ADDRESS SEARCH · LOCAL ONLY</span><h3>Search ${activeNetwork.label}</h3></div><span class="live-example">SCALARS 1–${SEARCH_SCALAR_LIMIT.toLocaleString()} · 32–108 WORKERS</span></div>
-      <p class="backward-intro">Paste a valid address or load a .txt list of Ethereum addresses. Search checks the entire scalar interval 1–${SEARCH_SCALAR_LIMIT.toLocaleString()} by default. If a candidate matches, other workers stop after their current small chunk. It runs in browser workers; the address and candidates are not sent to EC2.</p>
-      <div class="dlog-address-control"><label for="lab-address">${activeNetwork.label} address or public key</label><input id="lab-address" type="text" spellcheck="false" autocomplete="off" placeholder="${addressPlaceholder()}" value="${escapeHtml(labAddressInput ?? wallet.address)}" ${discreteLogProgress ? 'disabled' : ''}><small>${addressInputHint()}</small>${labAddressInput?.trim() ? '<button class="reverse-toggle" id="export-public-address" type="button">Export public address</button>' : ''}</div>
+      <div class="backward-heading"><div><span class="eyebrow">BOUNDED ADDRESS SEARCH · LOCAL ONLY</span><h3>Search ${activeNetwork.label}</h3></div><span class="live-example">INCLUSIVE RANGE · LOCAL WORKERS</span></div>
+      <p class="backward-intro">Paste a valid address or load a .txt list of Ethereum addresses. Search checks the inclusive scalar range below; choose a small test range. If a candidate matches, other workers stop after their current small chunk. It runs in browser workers; the address and candidates are not sent to EC2.</p>
+      <div class="dlog-address-control"><label for="lab-address">${activeNetwork.label} address or public key</label><input id="lab-address" type="text" spellcheck="false" autocomplete="off" placeholder="${addressPlaceholder()}" value="${escapeHtml(labAddressInput ?? wallet.address ?? '')}" ${discreteLogProgress ? 'disabled' : ''}><small>${addressInputHint()}</small>${labAddressInput?.trim() ? '<button class="reverse-toggle" id="export-public-address" type="button">Export public address</button>' : ''}</div>
       ${selectedNetworkId === 'ethereum' ? `
         <div class="search-file-row"><div class="search-file-copy"><strong>Search Ethereum address lists</strong><small>Upload one address per line for the scalar search, or address,transaction-hash pairs to extract public keys. Pair format: address,tx_hash.</small></div><label class="search-file-button ${discreteLogProgress ? 'is-disabled' : ''}" for="search-address-file" aria-disabled="${Boolean(discreteLogProgress)}">Choose file</label><input id="search-address-file" type="file" accept=".txt,text/plain,.csv,text/csv" hidden ${discreteLogProgress ? 'disabled' : ''}>${searchAddressFile ? `<span class="search-file-name">${escapeHtml(searchAddressFile.name)} · ${searchAddressFile.addresses?.length ?? 0} addresses${searchAddressFile.transactions?.length ? ` · ${searchAddressFile.transactions.length} txs` : ''}</span><button class="search-file-clear" id="clear-search-file" type="button" ${discreteLogProgress ? 'disabled' : ''}>Clear</button>` : ''}</div>
         ${searchAddressFile?.error ? `<p class="search-file-error" role="alert">${escapeHtml(searchAddressFile.error)}</p>` : ''}
         ${searchAddressFile?.addresses?.length ? `<ul class="search-target-preview">${searchAddressFile.addresses.map((address, index) => `<li><b>${index + 1}.</b> <code>${escapeHtml(address)}</code></li>`).join('')}</ul>` : ''}
         ${searchAddressFile?.transactions?.length ? `<div class="public-key-extract-panel"><label for="ethereum-rpc-endpoint">Ethereum JSON-RPC endpoint</label><input id="ethereum-rpc-endpoint" type="url" value="${escapeHtml(ethereumRpcEndpoint)}" spellcheck="false"><small>Extracts signer public keys from outgoing transactions. The transaction hashes are sent to this RPC provider; private keys are never requested.</small><button class="search-file-button" id="extract-public-keys" type="button">Extract public keys and download TXT</button><p id="public-key-extraction-status" role="status" aria-live="polite"></p></div>` : ''}
       ` : ''}
-      <div class="dlog-warning"><strong>This is a bounded search, not practical wallet recovery.</strong> A full 10²¹-candidate run is not practically completable on browser hardware and can heavily load the device. A match is possible only when a target was created by a scalar in this exact range. This range is about 2⁷⁰ candidates versus nearly 2²⁵⁶ possible secp256k1 scalars. A miss rules out only scalars 1–${SEARCH_SCALAR_LIMIT.toLocaleString()}.</div>
+      <div class="candidate-range"><label>Lower scalar (inclusive)<input id="search-lower" type="text" inputmode="numeric" value="${escapeHtml(searchLower)}" ${discreteLogProgress ? 'disabled' : ''}></label><label>Upper scalar (inclusive)<input id="search-upper" type="text" inputmode="numeric" value="${escapeHtml(searchUpper)}" ${discreteLogProgress ? 'disabled' : ''}></label></div>
+      <div class="dlog-warning"><strong>Bounded test only—not wallet recovery.</strong> Only a match in the chosen interval can be found; a miss says nothing about other scalars. Even a small-looking range can take a long time. Pollard kangaroo requires a public point and a known interval; it cannot search an address hash.</div>
       <div class="dlog-actions"><button class="action-button dlog-button" id="run-dlog-lab" type="button" ${discreteLogProgress ? 'disabled' : ''}>${searchButtonLabel}<span aria-hidden="true">↗</span></button>${discreteLogProgress ? `<button class="dlog-stop-button" id="stop-search" type="button">${discreteLogProgress.stopping ? 'Stopping after current chunks…' : 'Stop search'}</button>` : ''}</div>
       ${discreteLogProgress ? `<div class="dlog-live-progress" role="status" aria-live="polite"><b>Checked ${discreteLogProgress.completed.toLocaleString()} / ${discreteLogProgress.trials.toLocaleString()} candidates</b><div class="search-progress"><span style="width:${100 * Number(discreteLogProgress.completed) / Number(discreteLogProgress.trials)}%"></span></div><p>${discreteLogProgress.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second · ${discreteLogProgress.workers} browser workers · ${discreteLogProgress.elapsedMs.toFixed(1)} ms elapsed · ${discreteLogProgress.candidatesPerSecond ? `about ${formatDuration(Number(discreteLogProgress.trials - discreteLogProgress.completed) * 1000 / discreteLogProgress.candidatesPerSecond)} remaining at this rate` : 'measuring speed'}.</p></div>` : searchResultMarkup(discreteLogResult, activeNetwork)}
       <p class="step-explanation subtle">Each worker starts with Q=dG, then advances with Q(d+1)=Q(d)+G and compares address payload bytes directly. This avoids a fresh scalar multiplication and address encoding for every candidate. The operation stays on this device; it is not an EC2 background job.</p>
-    </section>` : '';
+    </section>`;
 
   app.innerHTML = `
     <header class="topbar"><a class="brand" href="#overview" aria-label="Seedlab home"><span class="brand-mark">S</span><span>SEEDLAB<span class="brand-sub">/ EXCHANGE LAB</span></span></a><nav class="exchange-nav" aria-label="Main navigation"><a class="active" href="#overview">Overview</a><a href="#setup-card">Wallet lab</a><a href="#derivation-pipeline">Derivation</a><a href="#kangaroo-demo">Kangaroo demo</a><a href="#search-lab">Address search</a></nav><div class="topbar-meta"><span class="live-dot"></span><span>LOCAL SESSION</span><span class="network-chip">${activeNetwork.shortLabel}</span></div></header>
     <main class="page-shell" id="overview">
       <div class="page-heading"><div><div class="eyebrow">WALLET ENGINE <span class="eyebrow-slash">/</span> DERIVATION & SEARCH</div><h1>Crypto Wallet Lab</h1><p>Explore address derivation, public-key recovery, and bounded-search algorithms in a trading-terminal style workspace.</p></div><div class="session-chip"><span class="session-dot"></span>${wallet.stage ? `DERIVATION ${String(Math.min(wallet.stage, 5)).padStart(2, '0')} / 05` : 'ENGINE READY'}</div></div>
       <div class="security-banner"><span class="alert-mark">!</span><p><strong>Public HTTP learning demo.</strong> The local derivation lab keeps secret values in this browser. The “Scan on server” upload sends your file to the server (S3 + Lambda) for scanning and is <strong>not</strong> stored permanently — only send test data, never real wallet secrets.</p></div>
-      <div class="market-strip" aria-label="Workspace status"><div><span>ACTIVE NETWORK</span><b><i class="network-dot"></i>${activeNetwork.label}</b></div><div><span>CURVE</span><b>SECP256K1</b></div><div><span>KEY FLOW</span><b>BIP-39 <em>→</em> BIP-32</b></div><div><span>SEARCH ENGINE</span><b>LOCAL WORKERS · 32–108</b></div></div>
+      <div class="market-strip" aria-label="Workspace status"><div><span>ACTIVE NETWORK</span><b><i class="network-dot"></i>${activeNetwork.label}</b></div><div><span>CURVE</span><b>SECP256K1</b></div><div><span>KEY FLOW</span><b>BIP-39 <em>→</em> BIP-32</b></div><div><span>SEARCH ENGINE</span><b>LOCAL WORKERS · UP TO 8</b></div></div>
       <div class="layout-grid">
         <div class="lesson-column">
           <section class="setup-card" id="setup-card"><div class="setup-copy"><span class="eyebrow">START HERE</span><h2>Make a fresh demo wallet</h2><p>Uses browser cryptographic randomness. Nothing is saved or sent to EC2.</p></div><div class="setup-controls"><label for="network-select">Derive an address for</label><select id="network-select">${Object.entries(NETWORKS).map(([id, network]) => `<option value="${id}" ${selectedNetworkId === id ? 'selected' : ''}>${network.label}</option>`).join('')}</select><small class="network-note">Includes BTC Legacy, Nested SegWit, Native SegWit and Taproot; TRON; BNB Smart Chain (EVM) and BNB Beacon (BEP2).</small><label for="passphrase">Optional BIP-39 passphrase</label><input id="passphrase" type="password" autocomplete="new-password" placeholder="Leave blank for no passphrase" value="${passphrase.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;')}" ${wallet.stage ? 'disabled' : ''}><small>${wallet.stage ? 'Locked for this derivation; reset to change it.' : 'Case-sensitive. It creates a different wallet.'}</small><button class="action-button generate-button" id="generate">${wallet.stage ? 'Generate another demo wallet' : 'Generate demo wallet'}<span aria-hidden="true">↗</span></button></div></section>
@@ -844,6 +840,8 @@ function render() {
     searchAddressFile = null;
     render();
   });
+  document.querySelector('#search-lower')?.addEventListener('input', (event) => { searchLower = event.target.value; });
+  document.querySelector('#search-upper')?.addEventListener('input', (event) => { searchUpper = event.target.value; });
   document.querySelector('#run-dlog-lab')?.addEventListener('click', runDiscreteLogLab);
   document.querySelector('#stop-search')?.addEventListener('click', requestSearchStop);
   document.querySelector('#lab-address')?.addEventListener('input', (event) => {
@@ -856,7 +854,7 @@ function render() {
     const button = document.querySelector('#run-dlog-lab');
     if (button && !discreteLogProgress) {
       button.disabled = false;
-      button.innerHTML = `${activeNetwork.family === 'evm' && looksLikeEvmPublicKey(labAddressInput) ? 'Calculate full Keccak-256 from public key' : `Search all ${SEARCH_SCALAR_LIMIT.toLocaleString()} candidates`}<span aria-hidden="true">↗</span>`;
+      button.innerHTML = `${activeNetwork.family === 'evm' && looksLikeEvmPublicKey(labAddressInput) ? 'Calculate full Keccak-256 from public key' : 'Search candidate range'}<span aria-hidden="true">↗</span>`;
     }
   });
   document.querySelectorAll('[data-run-step]').forEach((button) => button.addEventListener('click', () => runStep(Number(button.dataset.runStep))));
@@ -1251,7 +1249,7 @@ function finishSearch(search, status, match = null, message = '') {
   discreteLogProgress = null;
   discreteLogResult = {
     status, addressInput: search.addressInput, networkId: search.networkId, parsed: search.parsed,
-    startScalar: 1n, lastScalar: status === 'valid' && match ? match.scalar : totalTested,
+    startScalar: search.range.start, endScalar: search.range.end, rangeCount: search.range.count,
     trials: totalTested, totalTested, elapsedMs, candidatesPerSecond,
     foundScalar: match?.scalar ?? null, foundPublicKey: match?.publicKey ?? null,
     foundAddress: match ? search.targets[match.targetIndex]?.display ?? '' : '',
@@ -1294,26 +1292,30 @@ async function runDiscreteLogLab() {
   }
   const parsed = targets[0];
 
-  const availableCores = navigator.hardwareConcurrency || 2;
-  const workerCount = Math.max(32, Math.min(108, availableCores));
-  const workerCountBigInt = BigInt(workerCount);
-  const partitionSize = (SEARCH_SCALAR_LIMIT + workerCountBigInt - 1n) / workerCountBigInt;
+  let range;
+  try {
+    range = parseSearchRange(searchLower.trim(), searchUpper.trim());
+  } catch (error) {
+    discreteLogResult = { status: 'invalid', addressInput, reason: error.message };
+    render();
+    return;
+  }
+  const partitions = partitionSearchRange(range.start, range.end, Math.max(1, Math.min(8, navigator.hardwareConcurrency || 2)));
+  const workerCount = partitions.length;
   const runId = ++searchRunId;
   const search = {
-    runId, networkId: selectedNetworkId, addressInput, parsed, targets,
+    runId, networkId: selectedNetworkId, addressInput, parsed, targets, range,
     workers: [], progressByWorker: new Map(), finishedWorkers: new Set(),
     foundMatch: null, cancelRequested: false, manualStop: false, startedAt: performance.now(),
   };
   activeSearch = search;
-  discreteLogProgress = { completed: 0n, trials: SEARCH_SCALAR_LIMIT, startScalar: 1n, endScalar: SEARCH_SCALAR_LIMIT, elapsedMs: 0, candidatesPerSecond: 0, workers: workerCount };
+  discreteLogProgress = { completed: 0n, trials: range.count, startScalar: range.start, endScalar: range.end, elapsedMs: 0, candidatesPerSecond: 0, workers: workerCount };
   discreteLogResult = null;
   render();
 
   try {
     for (let workerId = 0; workerId < workerCount; workerId += 1) {
-      const start = 1n + BigInt(workerId) * partitionSize;
-      const proposedEnd = start + partitionSize - 1n;
-      const end = proposedEnd < SEARCH_SCALAR_LIMIT ? proposedEnd : SEARCH_SCALAR_LIMIT;
+      const { start, end } = partitions[workerId];
       const worker = new Worker(new URL('./search-worker.js', import.meta.url), { type: 'module' });
       search.workers.push(worker);
       search.progressByWorker.set(workerId, 0n);
@@ -1339,7 +1341,7 @@ async function runDiscreteLogLab() {
 
         const completed = [...search.progressByWorker.values()].reduce((sum, count) => sum + count, 0n);
         const elapsedMs = Math.max(performance.now() - search.startedAt, 0.01);
-        discreteLogProgress = { completed, trials: SEARCH_SCALAR_LIMIT, startScalar: 1n, endScalar: SEARCH_SCALAR_LIMIT, elapsedMs, candidatesPerSecond: Number(completed) * 1000 / elapsedMs, workers: workerCount, stopping: search.cancelRequested };
+        discreteLogProgress = { completed, trials: range.count, startScalar: range.start, endScalar: range.end, elapsedMs, candidatesPerSecond: Number(completed) * 1000 / elapsedMs, workers: workerCount, stopping: search.cancelRequested };
         if (search.finishedWorkers.size === workerCount) {
           if (search.foundMatch) finishSearch(search, 'valid', search.foundMatch);
           else if (search.manualStop) finishSearch(search, 'cancelled');

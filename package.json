@@ -10,7 +10,8 @@
     "server": "node server/index.js",
     "server:build": "node server/index.js",
     "test:scan": "node server/test.mjs",
-    "demo:kangaroo": "node scripts/pollard-kangaroo-demo.mjs"
+    "demo:kangaroo": "node scripts/pollard-kangaroo-demo.mjs",
+    "test:search": "node --test test/search.test.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.645.0",
