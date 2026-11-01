@@ -8,6 +8,7 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { keccak_256 } from '@noble/hashes/sha3.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 import { recoverEthereumTransactionPublicKey } from './ethereum-transaction.js';
+import { runPollardKangarooDemo } from './pollard-kangaroo-demo.js';
 import './style.css';
 
 const app = document.querySelector('#app');
@@ -37,6 +38,9 @@ let searchRenderTimer = null;
 let labAddressInput = null;
 let searchAddressFile = null;
 let ethereumRpcEndpoint = 'https://ethereum-rpc.publicnode.com';
+let kangarooDemoResult = null;
+let kangarooDemoBusy = false;
+let kangarooDemoError = '';
 let pendingFile = null;
 let scanState = { jobId: null, status: 'idle', total: 0, processed: 0, results: [], error: null, hideEmpty: true };
 const API_BASE = (import.meta.env && import.meta.env.VITE_SCAN_API_BASE) || '';
@@ -574,6 +578,36 @@ async function pollScan(jobId) {
   }
 }
 
+function kangarooDemoMarkup() {
+  const result = kangarooDemoResult;
+  return `<section class="kangaroo-demo-card exchange-card" id="kangaroo-demo">
+    <div class="exchange-panel-heading"><div><span class="eyebrow">ALGORITHM LAB · BOUNDED DISCRETE LOG</span><h2>Pollard kangaroo</h2><p>Watch a toy tame/wild walk collide and recover a deliberately small test scalar.</p></div><span class="demo-mode-pill">SYNTHETIC TEST ONLY</span></div>
+    <div class="kangaroo-summary-grid"><div><span>TOY INTERVAL</span><b>100,000 — 1,100,000</b></div><div><span>PUBLIC POINT</span><b>Q = dG</b></div><div><span>WORK PROFILE</span><b>O(√N) · probabilistic</b></div></div>
+    <div class="kangaroo-steps"><div><i>01</i><span><b>Tame walk</b><small>Stores distinguished points from N·G.</small></span></div><div><i>02</i><span><b>Wild walk</b><small>Starts from Q − L·G and follows the same jumps.</small></span></div><div><i>03</i><span><b>Collision</b><small>Uses the distance difference, then verifies Q = dG.</small></span></div></div>
+    <div class="kangaroo-run-row"><button class="action-button kangaroo-run-button" id="run-kangaroo-demo" type="button" ${kangarooDemoBusy ? 'disabled' : ''}>${kangarooDemoBusy ? 'Running toy walk…' : result ? 'Run demo again' : 'Run kangaroo demo'}<span aria-hidden="true">↗</span></button><span class="kangaroo-run-note">No wallet addresses, transaction hashes, or user keys are used.</span></div>
+    ${kangarooDemoError ? `<p class="kangaroo-error" role="alert">${escapeHtml(kangarooDemoError)}</p>` : ''}
+    ${result ? `<div class="kangaroo-result"><div><span>RECOVERED TOY SCALAR</span><b>${BigInt(result.recovered).toLocaleString()}</b></div><div><span>TAME / WILD STEPS</span><b>${result.tameSteps.toLocaleString()} / ${result.wildSteps.toLocaleString()}</b></div><div><span>VERIFY Q = dG</span><b class="${result.verified ? 'verified' : 'unverified'}">${result.verified ? 'PASSED' : 'FAILED'}</b></div><details><summary>View the toy public point</summary><code>${escapeHtml(result.targetPoint)}</code></details></div>` : '<div class="kangaroo-placeholder"><span class="pulse-ring"></span><div><b>Demo ready</b><small>Run it to see the toy scalar recovered from its synthetic public point.</small></div></div>'}
+  </section>`;
+}
+
+function runKangarooDemoFromUi() {
+  kangarooDemoBusy = true;
+  kangarooDemoError = '';
+  render();
+  setTimeout(() => {
+    try {
+      kangarooDemoResult = runPollardKangarooDemo();
+      if (!kangarooDemoResult.verified || !kangarooDemoResult.recovered) throw new Error('The toy walk did not find a verified result. Run it again.');
+    } catch (error) {
+      kangarooDemoResult = null;
+      kangarooDemoError = error?.message ?? String(error);
+    } finally {
+      kangarooDemoBusy = false;
+      render();
+    }
+  }, 30);
+}
+
 function render() {
   const activeNetwork = selectedNetwork();
   const pathSegments = activeNetwork.path.slice(2).split('/');
@@ -723,7 +757,7 @@ function render() {
           ? `Run the full ${formattedSearchLimit} search again`
           : `Search all ${formattedSearchLimit} candidates`;
   const discreteLogLab = wallet.stage >= 5 ? `
-    <section class="backward-panel dlog-panel">
+    <section class="backward-panel dlog-panel" id="search-lab">
       <div class="backward-heading"><div><span class="eyebrow">BOUNDED ADDRESS SEARCH · LOCAL ONLY</span><h3>Search ${activeNetwork.label}</h3></div><span class="live-example">SCALARS 1–${SEARCH_SCALAR_LIMIT.toLocaleString()} · 32–108 WORKERS</span></div>
       <p class="backward-intro">Paste a valid address or load a .txt list of Ethereum addresses. Search checks the entire scalar interval 1–${SEARCH_SCALAR_LIMIT.toLocaleString()} by default. If a candidate matches, other workers stop after their current small chunk. It runs in browser workers; the address and candidates are not sent to EC2.</p>
       <div class="dlog-address-control"><label for="lab-address">${activeNetwork.label} address or public key</label><input id="lab-address" type="text" spellcheck="false" autocomplete="off" placeholder="${addressPlaceholder()}" value="${escapeHtml(labAddressInput ?? wallet.address)}" ${discreteLogProgress ? 'disabled' : ''}><small>${addressInputHint()}</small>${labAddressInput?.trim() ? '<button class="reverse-toggle" id="export-public-address" type="button">Export public address</button>' : ''}</div>
@@ -740,15 +774,16 @@ function render() {
     </section>` : '';
 
   app.innerHTML = `
-    <header class="topbar"><a class="brand" href="#" aria-label="Seedlab home"><span class="brand-mark">S</span><span>seedlab</span></a><div class="topbar-meta"><span class="live-dot"></span> DERIVATION LAB <span class="topbar-divider">/</span> TEST DATA ONLY</div></header>
-    <main class="page-shell">
-      <div class="page-heading"><div><div class="eyebrow">WALLET BUILD · 5 CALCULATIONS</div><h1>Trace a wallet to its address.</h1><p>Run each calculation in order. Every value is generated in this browser session.</p></div><div class="session-chip"><span class="session-dot"></span>${wallet.stage ? `STEP ${String(Math.min(wallet.stage + 1, 5)).padStart(2, '0')} OF 05` : 'READY TO START'}</div></div>
+    <header class="topbar"><a class="brand" href="#overview" aria-label="Seedlab home"><span class="brand-mark">S</span><span>SEEDLAB<span class="brand-sub">/ EXCHANGE LAB</span></span></a><nav class="exchange-nav" aria-label="Main navigation"><a class="active" href="#overview">Overview</a><a href="#setup-card">Wallet lab</a><a href="#derivation-pipeline">Derivation</a><a href="#kangaroo-demo">Kangaroo demo</a><a href="#search-lab">Address search</a></nav><div class="topbar-meta"><span class="live-dot"></span><span>LOCAL SESSION</span><span class="network-chip">${activeNetwork.shortLabel}</span></div></header>
+    <main class="page-shell" id="overview">
+      <div class="page-heading"><div><div class="eyebrow">WALLET ENGINE <span class="eyebrow-slash">/</span> DERIVATION & SEARCH</div><h1>Crypto Wallet Lab</h1><p>Explore address derivation, public-key recovery, and bounded-search algorithms in a trading-terminal style workspace.</p></div><div class="session-chip"><span class="session-dot"></span>${wallet.stage ? `DERIVATION ${String(Math.min(wallet.stage, 5)).padStart(2, '0')} / 05` : 'ENGINE READY'}</div></div>
       <div class="security-banner"><span class="alert-mark">!</span><p><strong>Public HTTP learning demo.</strong> The local derivation lab keeps secret values in this browser. The “Scan on server” upload sends your file to the server (S3 + Lambda) for scanning and is <strong>not</strong> stored permanently — only send test data, never real wallet secrets.</p></div>
+      <div class="market-strip" aria-label="Workspace status"><div><span>ACTIVE NETWORK</span><b><i class="network-dot"></i>${activeNetwork.label}</b></div><div><span>CURVE</span><b>SECP256K1</b></div><div><span>KEY FLOW</span><b>BIP-39 <em>→</em> BIP-32</b></div><div><span>SEARCH ENGINE</span><b>LOCAL WORKERS · 32–108</b></div></div>
       <div class="layout-grid">
         <div class="lesson-column">
-          ${scanCardMarkup()}
-          <section class="setup-card"><div class="setup-copy"><span class="eyebrow">START HERE</span><h2>Make a fresh demo wallet</h2><p>Uses browser cryptographic randomness. Nothing is saved or sent to EC2.</p></div><div class="setup-controls"><label for="network-select">Derive an address for</label><select id="network-select">${Object.entries(NETWORKS).map(([id, network]) => `<option value="${id}" ${selectedNetworkId === id ? 'selected' : ''}>${network.label}</option>`).join('')}</select><small class="network-note">Includes BTC Legacy, Nested SegWit, Native SegWit and Taproot; TRON; BNB Smart Chain (EVM) and BNB Beacon (BEP2).</small><label for="passphrase">Optional BIP-39 passphrase</label><input id="passphrase" type="password" autocomplete="new-password" placeholder="Leave blank for no passphrase" value="${passphrase.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;')}" ${wallet.stage ? 'disabled' : ''}><small>${wallet.stage ? 'Locked for this derivation; reset to change it.' : 'Case-sensitive. It creates a different wallet.'}</small><button class="action-button generate-button" id="generate">${wallet.stage ? 'Generate another demo wallet' : 'Generate demo wallet'}<span aria-hidden="true">↗</span></button></div></section>
-          <div class="steps-heading"><div><span class="eyebrow">THE PIPELINE</span><h2>Five steps, one address</h2></div><div class="steps-actions">${wallet.stage >= 5 ? `<button class="reverse-toggle" id="backward-toggle">${backwardOpen ? 'Hide backward trace' : 'Trace backward'}</button>` : ''}${wallet.stage ? '<button class="reset-button" id="reset">Reset session</button>' : ''}</div></div>
+          <section class="setup-card" id="setup-card"><div class="setup-copy"><span class="eyebrow">START HERE</span><h2>Make a fresh demo wallet</h2><p>Uses browser cryptographic randomness. Nothing is saved or sent to EC2.</p></div><div class="setup-controls"><label for="network-select">Derive an address for</label><select id="network-select">${Object.entries(NETWORKS).map(([id, network]) => `<option value="${id}" ${selectedNetworkId === id ? 'selected' : ''}>${network.label}</option>`).join('')}</select><small class="network-note">Includes BTC Legacy, Nested SegWit, Native SegWit and Taproot; TRON; BNB Smart Chain (EVM) and BNB Beacon (BEP2).</small><label for="passphrase">Optional BIP-39 passphrase</label><input id="passphrase" type="password" autocomplete="new-password" placeholder="Leave blank for no passphrase" value="${passphrase.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;')}" ${wallet.stage ? 'disabled' : ''}><small>${wallet.stage ? 'Locked for this derivation; reset to change it.' : 'Case-sensitive. It creates a different wallet.'}</small><button class="action-button generate-button" id="generate">${wallet.stage ? 'Generate another demo wallet' : 'Generate demo wallet'}<span aria-hidden="true">↗</span></button></div></section>
+          ${kangarooDemoMarkup()}
+          <div class="steps-heading" id="derivation-pipeline"><div><span class="eyebrow">THE PIPELINE</span><h2>Five steps, one address</h2></div><div class="steps-actions">${wallet.stage >= 5 ? `<button class="reverse-toggle" id="backward-toggle">${backwardOpen ? 'Hide backward trace' : 'Trace backward'}</button>` : ''}${wallet.stage ? '<button class="reset-button" id="reset">Reset session</button>' : ''}</div></div>
           ${stepCard({ number: '01', title: 'Entropy → mnemonic', caption: 'Create randomness and encode twelve words', step: 1, body: entropyBody, action: 'Generate 128-bit entropy & phrase' })}
           ${stepCard({ number: '02', title: 'Mnemonic → seed', caption: 'PBKDF2-HMAC-SHA512 · BIP-39', step: 2, body: seedBody, action: 'Derive 512-bit seed' })}
           ${stepCard({ number: '03', title: 'Seed → master node', caption: 'HMAC-SHA512 · BIP-32', step: 3, body: masterBody, action: 'Create BIP-32 master node' })}
@@ -756,12 +791,13 @@ function render() {
           ${stepCard({ number: '05', title: `${activeNetwork.label} public key → address`, caption: addressCaption(activeNetwork), step: 5, body: addressBody, action: `Compute ${activeNetwork.label} address` })}${wallet.stage >= 5 ? '<button class="reverse-toggle" id="export-seed-wallet" type="button">Export wallet details</button><p class="hash-footnote">Includes the address and BIP-39 recovery phrase. Anyone with the phrase can control the wallet; save it only somewhere secure.</p>' : ''}
           ${backwardPanel}
           ${discreteLogLab}
+          ${scanCardMarkup()}
         </div>
         <aside class="side-rail">
           <section class="rail-card"><div class="rail-title"><span class="eyebrow">MAP</span><span class="rail-index">01—05</span></div><ol class="flow-list"><li class="${wallet.stage >= 1 ? 'visited' : ''}"><b>01</b><span>128-bit entropy</span></li><li class="${wallet.stage >= 1 ? 'visited' : ''}"><b>02</b><span>12 BIP-39 words</span></li><li class="${wallet.stage >= 2 ? 'visited' : ''}"><b>03</b><span>512-bit seed</span></li><li class="${wallet.stage >= 3 ? 'visited' : ''}"><b>04</b><span>BIP-32 master node</span></li><li class="${wallet.stage >= 4 ? 'visited' : ''}"><b>05</b><span>${activeNetwork.shortLabel} keypair</span></li><li class="${wallet.stage >= 5 ? 'visited current' : ''}"><b>↳</b><span>${activeNetwork.shortLabel} address</span></li></ol></section>
           <section class="rail-card path-card"><span class="eyebrow">${activeNetwork.shortLabel} PATH</span><code>${activeNetwork.path}</code><p>Switching networks selects a different derivation path or address encoding.</p></section>
           <section class="rail-card note-card"><span class="note-icon">i</span><div><strong>Keep the direction clear</strong><p>Each step derives new material from the prior value. The process does not provide a practical way to reverse a seed into its original phrase.</p></div></section>
-          <div class="rail-foot">LOCAL SESSION <span>·</span> NO SERVER API</div>
+          <div class="rail-foot">LOCAL COMPUTE <span>·</span> OPTIONAL RPC</div>
         </aside>
       </div>
       <footer class="page-footer"><span>SEEDLAB <span class="footer-muted">· INTERACTIVE CRYPTOGRAPHY PRIMER</span></span><span>TEST VALUES ONLY · NEVER FOR FUNDS</span></footer>
@@ -771,6 +807,7 @@ function render() {
   passInput?.addEventListener('input', (event) => { passphrase = event.target.value; });
   document.querySelector('#network-select')?.addEventListener('change', selectNetwork);
   document.querySelector('#generate')?.addEventListener('click', generateWallet);
+  document.querySelector('#run-kangaroo-demo')?.addEventListener('click', runKangarooDemoFromUi);
   document.querySelector('#export-seed-wallet')?.addEventListener('click', () => exportTextFile('wallet-export.txt', `Wallet address: ${wallet.address}\nNetwork: ${activeNetwork.label}\nBIP-39 recovery phrase: ${wallet.phrase}\n\nSECURITY: This phrase controls the wallet. Keep it private.`));
   document.querySelector('#export-public-address')?.addEventListener('click', () => exportTextFile('public-address.txt', `Public address: ${(labAddressInput ?? '').trim()}\nNetwork: ${activeNetwork.label}\n`));
   document.querySelector('#reset')?.addEventListener('click', resetWallet);
