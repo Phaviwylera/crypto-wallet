@@ -39,6 +39,8 @@ let searchRenderTimer = null;
 let labAddressInput = null;
 let searchAddressFile = null;
 let ethereumRpcEndpoint = 'https://ethereum-rpc.publicnode.com';
+let pointSearch = { fileName: '', text: '', lower: '1', upper: '1000000', busy: false, count: 0, progress: null, result: null, error: '' };
+let pointSearchWorker = null;
 let kangarooDemoResult = null;
 let kangarooDemoBusy = false;
 let kangarooDemoError = '';
@@ -579,6 +581,64 @@ async function pollScan(jobId) {
   }
 }
 
+function pointSearchStatusMarkup() {
+  const { progress, result, error, busy, count } = pointSearch;
+  if (error) return `<div class="dlog-warning" role="alert"><strong>Public-key search failed.</strong>${escapeHtml(error)}</div>`;
+  if (busy) {
+    if (!progress) return `<div class="dlog-live-progress" role="status">Validating uploaded keys${count ? ` · ${count.toLocaleString()} valid rows` : '…'}</div>`;
+    return `<div class="dlog-live-progress" role="status"><b>Giant-step slots checked: ${progress.completed.toLocaleString()} / ${progress.total.toLocaleString()}</b><div class="search-progress"><span style="width:${100 * progress.completed / progress.total}%"></span></div><p>${count.toLocaleString()} public keys · ${progress.matches} verified matches · ${Math.round(progress.completed * 1000 / Math.max(progress.elapsedMs, 1)).toLocaleString()} slots/second (includes already-matched targets; not address candidates/second).</p></div>`;
+  }
+  if (!result) return '<p class="dlog-placeholder">Upload an exported public-key TXT to begin.</p>';
+  const cancelled = result.status === 'cancelled';
+  const matches = result.matches.map((match) => `<li><strong>${escapeHtml(match.address)}</strong><br>Decimal scalar: <code>${escapeHtml(match.scalar)}</code><br>Collision point: <code>${escapeHtml(match.collisionPoint)}</code><br>Baby step ${match.babyStep}; giant step ${match.giantStep} · Q = dG verified</li>`).join('');
+  return `<div class="dlog-live-progress" role="status"><b>${cancelled ? 'Stopped — partial search' : 'Complete'} · ${result.matches.length} verified match(es)</b><p>${result.completed.toLocaleString()} / ${result.total.toLocaleString()} giant-step slots · ${result.targetCount.toLocaleString()} targets · interval ${escapeHtml(result.lower)}–${escapeHtml(result.upper)} · ${(result.elapsedMs / 1000).toFixed(1)} seconds.</p><p>${cancelled ? 'No conclusions can be drawn about unsearched steps.' : 'A miss rules out only this interval for the supplied public keys.'}</p>${matches ? `<p>Matching scalars are sensitive private-key material. Do not share them.</p><ul class="point-matches">${matches}</ul>` : ''}</div>`;
+}
+
+function pointSearchMarkup() {
+  return `<section class="backward-panel dlog-panel" id="public-key-search">
+    <div class="backward-heading"><div><span class="eyebrow">PUBLIC-KEY SEARCH · LOCAL ONLY</span><h3>Search uploaded Ethereum public keys</h3></div><span class="live-example">SHARED BSGS TABLE</span></div>
+    <p class="backward-intro">Upload the tab-separated TXT exported by “Extract public keys”. This uses baby-step giant-step (BSGS), not kangaroo, to search every validated public point in the same inclusive interval. The file stays in this browser.</p>
+    <div class="search-file-row"><div class="search-file-copy"><strong>Ethereum public-key TXT</strong><small>Columns: address, transaction_hash, public_key_uncompressed, status; tab separated, status ok. Up to 10,000 rows and 5 MB. All rows must validate.</small></div><label class="search-file-button ${pointSearch.busy ? 'is-disabled' : ''}" for="point-search-file">Choose TXT</label><input id="point-search-file" type="file" accept=".txt,text/plain,.tsv,text/tab-separated-values" hidden ${pointSearch.busy ? 'disabled' : ''}><span class="search-file-name">${escapeHtml(pointSearch.fileName || 'No file selected')}</span></div>
+    <div class="candidate-range"><label>Lower scalar (inclusive)<input id="point-search-lower" type="text" inputmode="numeric" value="${escapeHtml(pointSearch.lower)}" ${pointSearch.busy ? 'disabled' : ''}></label><label>Upper scalar (inclusive)<input id="point-search-upper" type="text" inputmode="numeric" value="${escapeHtml(pointSearch.upper)}" ${pointSearch.busy ? 'disabled' : ''}></label></div>
+    <div class="dlog-warning"><strong>Bounded test only.</strong> Maximum interval size: 1,000,000 scalars. This range is not more likely than any other for a randomly generated key. An unrestricted search remains infeasible. Use only keys you are authorized to test.</div>
+    <div class="dlog-actions"><button class="action-button" id="point-search-start" type="button" ${pointSearch.busy || !pointSearch.text ? 'disabled' : ''}>Search uploaded public keys <span aria-hidden="true">↗</span></button>${pointSearch.busy ? '<button class="dlog-stop-button" id="point-search-stop" type="button">Stop search</button>' : ''}</div>
+    <div id="point-search-status">${pointSearchStatusMarkup()}</div>
+  </section>`;
+}
+
+function startPointSearch() {
+  if (!pointSearch.text || pointSearch.busy) return;
+  pointSearch = { ...pointSearch, busy: true, progress: null, result: null, error: '', count: 0 };
+  render();
+  try {
+    const worker = new Worker(new URL('./public-key-search-worker.js', import.meta.url), { type: 'module' });
+    pointSearchWorker = worker;
+    worker.onmessage = ({ data }) => {
+      if (pointSearchWorker !== worker) return;
+      if (data.type === 'validated') pointSearch.count = data.count;
+      if (data.type === 'progress') pointSearch.progress = data;
+      if (data.type === 'result' || data.type === 'error') {
+        worker.terminate(); pointSearchWorker = null;
+        pointSearch.busy = false;
+        if (data.type === 'result') pointSearch.result = data; else pointSearch.error = data.message;
+        render();
+        return;
+      }
+      const status = document.querySelector('#point-search-status');
+      if (status) status.innerHTML = pointSearchStatusMarkup();
+    };
+    worker.onerror = (error) => {
+      if (pointSearchWorker !== worker) return;
+      worker.terminate(); pointSearchWorker = null; pointSearch.busy = false;
+      pointSearch.error = error.message || 'Search worker failed.'; render();
+    };
+    worker.postMessage({ type: 'start', text: pointSearch.text, lower: pointSearch.lower.trim(), upper: pointSearch.upper.trim() });
+  } catch (error) {
+    pointSearchWorker?.terminate(); pointSearchWorker = null; pointSearch.busy = false;
+    pointSearch.error = error?.message ?? String(error); render();
+  }
+}
+
 function kangarooDemoMarkup() {
   const result = kangarooDemoResult;
   return `<section class="kangaroo-demo-card exchange-card" id="kangaroo-demo">
@@ -778,7 +838,7 @@ function render() {
     </section>`;
 
   app.innerHTML = `
-    <header class="topbar"><a class="brand" href="#overview" aria-label="Seedlab home"><span class="brand-mark">S</span><span>SEEDLAB<span class="brand-sub">/ EXCHANGE LAB</span></span></a><nav class="exchange-nav" aria-label="Main navigation"><a class="active" href="#overview">Overview</a><a href="#setup-card">Wallet lab</a><a href="#derivation-pipeline">Derivation</a><a href="#kangaroo-demo">Kangaroo demo</a><a href="#search-lab">Address search</a></nav><div class="topbar-meta"><span class="live-dot"></span><span>LOCAL SESSION</span><span class="network-chip">${activeNetwork.shortLabel}</span></div></header>
+    <header class="topbar"><a class="brand" href="#overview" aria-label="Seedlab home"><span class="brand-mark">S</span><span>SEEDLAB<span class="brand-sub">/ EXCHANGE LAB</span></span></a><nav class="exchange-nav" aria-label="Main navigation"><a class="active" href="#overview">Overview</a><a href="#setup-card">Wallet lab</a><a href="#derivation-pipeline">Derivation</a><a href="#kangaroo-demo">Kangaroo demo</a><a href="#public-key-search">Public-key search</a><a href="#search-lab">Address search</a></nav><div class="topbar-meta"><span class="live-dot"></span><span>LOCAL SESSION</span><span class="network-chip">${activeNetwork.shortLabel}</span></div></header>
     <main class="page-shell" id="overview">
       <div class="page-heading"><div><div class="eyebrow">WALLET ENGINE <span class="eyebrow-slash">/</span> DERIVATION & SEARCH</div><h1>Crypto Wallet Lab</h1><p>Explore address derivation, public-key recovery, and bounded-search algorithms in a trading-terminal style workspace.</p></div><div class="session-chip"><span class="session-dot"></span>${wallet.stage ? `DERIVATION ${String(Math.min(wallet.stage, 5)).padStart(2, '0')} / 05` : 'ENGINE READY'}</div></div>
       <div class="security-banner"><span class="alert-mark">!</span><p><strong>Public HTTP learning demo.</strong> The local derivation lab keeps secret values in this browser. The “Scan on server” upload sends your file to the server (S3 + Lambda) for scanning and is <strong>not</strong> stored permanently — only send test data, never real wallet secrets.</p></div>
@@ -787,6 +847,7 @@ function render() {
         <div class="lesson-column">
           <section class="setup-card" id="setup-card"><div class="setup-copy"><span class="eyebrow">START HERE</span><h2>Make a fresh demo wallet</h2><p>Uses browser cryptographic randomness. Nothing is saved or sent to EC2.</p></div><div class="setup-controls"><label for="network-select">Derive an address for</label><select id="network-select">${Object.entries(NETWORKS).map(([id, network]) => `<option value="${id}" ${selectedNetworkId === id ? 'selected' : ''}>${network.label}</option>`).join('')}</select><small class="network-note">Includes BTC Legacy, Nested SegWit, Native SegWit and Taproot; TRON; BNB Smart Chain (EVM) and BNB Beacon (BEP2).</small><label for="passphrase">Optional BIP-39 passphrase</label><input id="passphrase" type="password" autocomplete="new-password" placeholder="Leave blank for no passphrase" value="${passphrase.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;')}" ${wallet.stage ? 'disabled' : ''}><small>${wallet.stage ? 'Locked for this derivation; reset to change it.' : 'Case-sensitive. It creates a different wallet.'}</small><button class="action-button generate-button" id="generate">${wallet.stage ? 'Generate another demo wallet' : 'Generate demo wallet'}<span aria-hidden="true">↗</span></button></div></section>
           ${kangarooDemoMarkup()}
+          ${pointSearchMarkup()}
           <div class="steps-heading" id="derivation-pipeline"><div><span class="eyebrow">THE PIPELINE</span><h2>Five steps, one address</h2></div><div class="steps-actions">${wallet.stage >= 5 ? `<button class="reverse-toggle" id="backward-toggle">${backwardOpen ? 'Hide backward trace' : 'Trace backward'}</button>` : ''}${wallet.stage ? '<button class="reset-button" id="reset">Reset session</button>' : ''}</div></div>
           ${stepCard({ number: '01', title: 'Entropy → mnemonic', caption: 'Create randomness and encode twelve words', step: 1, body: entropyBody, action: 'Generate 128-bit entropy & phrase' })}
           ${stepCard({ number: '02', title: 'Mnemonic → seed', caption: 'PBKDF2-HMAC-SHA512 · BIP-39', step: 2, body: seedBody, action: 'Derive 512-bit seed' })}
@@ -812,6 +873,20 @@ function render() {
   document.querySelector('#network-select')?.addEventListener('change', selectNetwork);
   document.querySelector('#generate')?.addEventListener('click', generateWallet);
   document.querySelector('#run-kangaroo-demo')?.addEventListener('click', runKangarooDemoFromUi);
+  document.querySelector('#point-search-start')?.addEventListener('click', startPointSearch);
+  document.querySelector('#point-search-stop')?.addEventListener('click', (event) => { pointSearchWorker?.postMessage({ type: 'cancel' }); event.target.disabled = true; event.target.textContent = 'Stopping…'; });
+  document.querySelector('#point-search-lower')?.addEventListener('input', (event) => { pointSearch.lower = event.target.value; });
+  document.querySelector('#point-search-upper')?.addEventListener('input', (event) => { pointSearch.upper = event.target.value; });
+  document.querySelector('#point-search-file')?.addEventListener('change', async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    pointSearch.text = ''; pointSearch.result = null; pointSearch.error = ''; pointSearch.fileName = file.name;
+    try {
+      if (file.size > 5 * 1024 * 1024) throw new Error('File exceeds the 5 MB limit.');
+      pointSearch.text = await file.text();
+    } catch (error) { pointSearch.error = error?.message ?? String(error); }
+    render();
+  });
   document.querySelector('#export-seed-wallet')?.addEventListener('click', () => exportTextFile('wallet-export.txt', `Wallet address: ${wallet.address}\nNetwork: ${activeNetwork.label}\nBIP-39 recovery phrase: ${wallet.phrase}\n\nSECURITY: This phrase controls the wallet. Keep it private.`));
   document.querySelector('#export-public-address')?.addEventListener('click', () => exportTextFile('public-address.txt', `Public address: ${(labAddressInput ?? '').trim()}\nNetwork: ${activeNetwork.label}\n`));
   document.querySelector('#reset')?.addEventListener('click', resetWallet);
