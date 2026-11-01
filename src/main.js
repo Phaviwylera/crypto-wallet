@@ -21,8 +21,8 @@ const NETWORKS = {
   bnbBeacon: { label: 'BNB Beacon Chain · Legacy', shortLabel: 'BNB Beacon', family: 'bnbBeacon', path: "m/44'/714'/0'/0/0", pathLabels: ['BIP-44 purpose', 'BNB coin type', 'account', 'external chain', 'address index'] },
 };
 let selectedNetworkId = 'ethereum';
-const SEARCH_BATCH_SIZE = 256;
 const SEARCH_SCALAR_LIMIT = 10_000_000;
+const SEARCH_WORKER_CHUNK = 8192;
 const selectedNetwork = () => NETWORKS[selectedNetworkId];
 let wallet = freshWallet();
 let passphrase = '';
@@ -30,8 +30,9 @@ let copied = new Set();
 let backwardOpen = false;
 let discreteLogResult = null;
 let discreteLogProgress = null;
-let autoSearchEnabled = false;
 let searchRunId = 0;
+let activeSearch = null;
+let searchRenderTimer = null;
 let labAddressInput = null;
 let pendingFile = null;
 let scanState = { jobId: null, status: 'idle', total: 0, processed: 0, results: [], error: null, hideEmpty: true };
@@ -87,6 +88,12 @@ function spacedHex(bytes) {
 function shortHex(bytes, head = 14, tail = 10) {
   const value = hex(bytes);
   return value.length > head + tail ? `${value.slice(0, head)}…${value.slice(-tail)}` : value;
+}
+
+function formatDuration(milliseconds) {
+  const seconds = Math.max(0, Math.round(milliseconds / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, '0')}s`;
 }
 
 function byteGrid(bytes, addressStart = -1) {
@@ -318,11 +325,17 @@ function stepCard({ number, title, caption, step, body, action }) {
   </section>`;
 }
 
-function searchResultMarkup(result, network, searchLimitReached) {
-  if (!result) return '<p class="dlog-placeholder">Enter an address or public key and run the appropriate local calculation.</p>';
+
+function searchResultMarkup(result, network) {
+  if (!result) return '<p class="dlog-placeholder">Enter an address or public key and run the full bounded search.</p>';
   if (result.status === 'invalid') return `<div class="dlog-warning result-error"><strong>Invalid ${network.label} input.</strong> ${escapeHtml(result.reason)}</div>`;
-  if (result.status === 'publicKey') return `<div class="dlog-results"><div><label>INPUT · VALIDATED SECP256K1 PUBLIC KEY</label><code class="dlog-address-value">${hex(result.parsed.publicKey)}</code>${copyButton('searchPublicKey', 'Copy public key')}<p>Point validation succeeded. The app uses only this public key; it does not need or derive the private key.</p></div><div><label>FULL ADDRESS-GENERATION DIGEST · 32 BYTES</label><p>Keccak-256(public key body X || Y):</p><div class="hash-byte-grid output-byte-grid">${byteGrid(result.parsed.keyKeccakHash, result.parsed.keyKeccakHash.length)}</div>${copyButton('searchKeyDigest', 'Copy 32-byte digest')}<p>The final 20 bytes are the address payload:</p><code class="dlog-address-value">${hex(result.parsed.bytes)}</code></div><div><label>DERIVED ETHEREUM ADDRESS</label><code class="dlog-address-value">${result.parsed.display}</code>${networkAddressDetails(result.parsed, network)}<p>No private-scalar search was run; this is the direct public-key-to-address calculation.</p></div></div>`;
-  return `<div class="dlog-results"><div><label>INPUT · ${network.shortLabel} ADDRESS BYTES</label><code class="dlog-address-value">${escapeHtml(result.parsed.display)}</code><div class="hash-byte-grid address-byte-grid">${byteGrid(result.parsed.bytes)}</div>${networkAddressDetails(result.parsed, network)}</div><div><label>SEARCH · REAL SECP256K1 CANDIDATES</label><p>${result.foundScalar ? `Match found at private scalar d=${result.foundScalar}; this candidate reproduces the entered address.` : `No match in scalars ${result.startScalar}–${result.lastScalar}; ${result.totalTested.toLocaleString()} candidates tested in total.`}</p><p>A miss excludes only the tested interval. Scalars outside it remain untested; request another batch to continue the next range.</p><div class="search-progress"><span style="width:100%"></span></div><p>Latest batch: ${result.trials}/${result.trials} candidates · ${result.elapsedMs.toFixed(2)} ms · ${result.candidatesPerSecond.toFixed(0)} candidates/s. Tested through scalar ${result.totalTested.toLocaleString()} of ${SEARCH_SCALAR_LIMIT.toLocaleString()} max.</p><p>Address-preimage work estimate: average ≈2<sup>${result.addressBits}</sup> candidate addresses${result.addressBits === 255 ? ' (Taproot x-only output space).' : ' (20-byte address output).'} At the latest measured rate, roughly 10<sup>${result.log10ExpectedYears.toFixed(1)}</sup> years. Extrapolation only—not practical private-key recovery or a full secp256k1 attack.</p>${result.foundPublicKey ? `<p>Matched public key: <code class="dlog-address-value">${result.foundPublicKey}</code></p>` : '<p>The target public key was not found in this bounded interval.</p>'}${searchLimitReached ? '<p><strong>The app’s maximum scalar bound has been reached; no further candidates will be tested.</strong></p>' : ''}</div><div><label>THIS BATCH · BOUNDARY CANDIDATES</label><p>d=${result.startScalar} → <code>${result.firstCandidateAddress}</code></p><p>d=${result.lastScalar} → <code>${result.lastCandidateAddress}</code></p><p>These are real addresses computed under ${network.label} rules.</p></div></div>`;
+  if (result.status === 'publicKey') return `<div class="dlog-results"><div><label>INPUT · VALIDATED SECP256K1 PUBLIC KEY</label><code class="dlog-address-value">${hex(result.parsed.publicKey)}</code>${copyButton('searchPublicKey', 'Copy public key')}<p>Point validation succeeded. No private key was derived.</p></div><div><label>FULL ADDRESS-GENERATION DIGEST · 32 BYTES</label><p>Keccak-256(public key body X || Y):</p><div class="hash-byte-grid output-byte-grid">${byteGrid(result.parsed.keyKeccakHash, result.parsed.keyKeccakHash.length)}</div>${copyButton('searchKeyDigest', 'Copy 32-byte digest')}</div><div><label>DERIVED ETHEREUM ADDRESS</label><code class="dlog-address-value">${result.parsed.display}</code>${networkAddressDetails(result.parsed, network)}<p>No scalar search was run.</p></div></div>`;
+  if (result.status === 'cancelled') return `<div class="dlog-warning"><strong>Search stopped.</strong> Checked ${result.totalTested.toLocaleString()} of ${SEARCH_SCALAR_LIMIT.toLocaleString()} candidates in ${result.elapsedMs.toFixed(1)} ms (${result.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second). This partial run cannot rule out the untested scalars.</div>`;
+  if (result.status === 'error') return `<div class="dlog-warning result-error"><strong>Search failed.</strong> ${escapeHtml(result.message)}</div>`;
+  const matchText = result.foundScalar
+    ? `Match found at scalar d=${result.foundScalar}. This candidate reproduces the entered address.`
+    : `No match in the complete interval 1–${SEARCH_SCALAR_LIMIT.toLocaleString()}.`;
+  return `<div class="dlog-results"><div><label>INPUT · ${network.shortLabel} ADDRESS</label><code class="dlog-address-value">${escapeHtml(result.parsed.display)}</code><div class="hash-byte-grid address-byte-grid">${byteGrid(result.parsed.bytes)}</div>${networkAddressDetails(result.parsed, network)}</div><div><label>RESULT · ${result.foundScalar ? 'MATCH' : 'FULL RANGE TESTED'}</label><p>${matchText}</p><p>${result.totalTested.toLocaleString()} candidates checked · ${result.elapsedMs.toFixed(1)} ms · ${result.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second across ${result.workers} workers.</p><p>${result.foundScalar ? `Matching public key: <code class="dlog-address-value">${result.foundPublicKey}</code>` : 'This excludes only the tested scalar interval; it does not recover or rule out keys outside it.'}</p><p>The scalar range is only about 2²³ candidates out of the secp256k1 key space. This bounded test is not a practical real-wallet recovery method.</p></div></div>`;
 }
 
 function scanCardMarkup() {
@@ -688,34 +701,25 @@ function render() {
       </div>
       <div class="takeaway"><strong>Why address → phrase search is not practical</strong><span>With no phrase words known, a search must try up to 2<sup>128</sup> valid mnemonics (and know the passphrase and derivation path), derive each address, then compare. This is not a useful workload for the $85 EC2 budget.</span></div>
     </section>` : '';
-  const previousSearchMatchesInput = discreteLogResult?.status === 'valid'
-    && discreteLogResult.networkId === selectedNetworkId
-    && discreteLogResult.addressInput === (labAddressInput ?? wallet.address);
-  const nextSearchScalar = previousSearchMatchesInput && !discreteLogResult.foundScalar ? discreteLogResult.lastScalar + 1 : 1;
-  const canContinueSearch = previousSearchMatchesInput && !discreteLogResult.foundScalar && nextSearchScalar <= SEARCH_SCALAR_LIMIT;
-  const searchLimitReached = previousSearchMatchesInput && !discreteLogResult.foundScalar && discreteLogResult.lastScalar >= SEARCH_SCALAR_LIMIT;
-  const nextSearchEnd = Math.min(nextSearchScalar + SEARCH_BATCH_SIZE - 1, SEARCH_SCALAR_LIMIT);
+  const searchLimitReached = discreteLogResult?.status === 'valid' && !discreteLogResult.foundScalar
+    && discreteLogResult.totalTested >= SEARCH_SCALAR_LIMIT;
   const publicKeyInputEntered = activeNetwork.family === 'evm' && looksLikeEvmPublicKey(labAddressInput ?? '');
   const searchButtonLabel = discreteLogProgress
-    ? autoSearchEnabled ? 'Automatic search running…' : discreteLogProgress.auto ? 'Stopping after current block…' : 'Search running…'
+    ? 'Searching all 10,000,000 candidates…'
     : publicKeyInputEntered
       ? 'Calculate full Keccak-256 from public key'
-      : canContinueSearch
-      ? `Search next batch · ${nextSearchScalar}–${nextSearchEnd}`
       : searchLimitReached
-        ? 'Maximum bounded range reached'
-        : discreteLogResult?.foundScalar
-          ? 'Start again from scalar 1'
-          : `Run ${SEARCH_BATCH_SIZE}-candidate ${activeNetwork.shortLabel} search`;
+        ? 'Run the full 10,000,000 search again'
+        : 'Search all 10,000,000 candidates';
   const discreteLogLab = wallet.stage >= 5 ? `
     <section class="backward-panel dlog-panel">
-      <div class="backward-heading"><div><span class="eyebrow">ADDRESS SEARCH · LOCAL ONLY</span><h3>Inspect a ${activeNetwork.label} address or public key</h3></div><span class="live-example">${SEARCH_BATCH_SIZE} PER BATCH · ${SEARCH_SCALAR_LIMIT.toLocaleString()} TOTAL CAP</span></div>
-      <p class="backward-intro">Enter an address to test consecutive bounded scalar batches, or paste a public key to calculate its full address-generation Keccak-256 digest directly. Public-key input does not run a scalar search. Address batches remain capped at 1–${SEARCH_SCALAR_LIMIT.toLocaleString()}.</p>
+      <div class="backward-heading"><div><span class="eyebrow">BOUNDED ADDRESS SEARCH · LOCAL ONLY</span><h3>Search ${activeNetwork.label}</h3></div><span class="live-example">SCALARS 1–${SEARCH_SCALAR_LIMIT.toLocaleString()} · UP TO 4 WORKERS</span></div>
+      <p class="backward-intro">Paste a valid address. Search checks the entire scalar interval 1–${SEARCH_SCALAR_LIMIT.toLocaleString()} by default. If a candidate matches, other workers stop after their current small chunk. It runs in browser workers; the address and candidates are not sent to EC2.</p>
       <div class="dlog-address-control"><label for="lab-address">${activeNetwork.label} address or public key</label><input id="lab-address" type="text" spellcheck="false" autocomplete="off" placeholder="${addressPlaceholder()}" value="${escapeHtml(labAddressInput ?? wallet.address)}" ${discreteLogProgress ? 'disabled' : ''}><small>${addressInputHint()}</small>${labAddressInput?.trim() ? '<button class="reverse-toggle" id="export-public-address" type="button">Export public address</button>' : ''}</div>
-      <div class="dlog-warning"><strong>This is a bounded address search—not a full secp256k1 break.</strong> An address alone does not reveal its public key or private key. If you provide a public key, the app can compute its address digest, but cannot derive the private key. Address search runs in batches of ${SEARCH_BATCH_SIZE} and cannot test beyond scalar ${SEARCH_SCALAR_LIMIT.toLocaleString()}. Everything runs in this browser; automatic search requires this tab/device to stay awake and is not an EC2 background job.</div>
-      <div class="dlog-actions"><button class="action-button dlog-button" id="run-dlog-lab" type="button" ${discreteLogProgress || searchLimitReached ? 'disabled' : ''}>${searchButtonLabel}<span aria-hidden="true">↗</span></button><button class="dlog-auto-button" id="run-auto-search" type="button" ${discreteLogProgress || searchLimitReached || publicKeyInputEntered ? 'disabled' : ''}>Auto-search ${canContinueSearch ? `${nextSearchScalar}–${SEARCH_SCALAR_LIMIT.toLocaleString()}` : `1–${SEARCH_SCALAR_LIMIT.toLocaleString()}`}<span aria-hidden="true">↗</span></button></div>
-      ${discreteLogProgress ? `<div class="dlog-live-progress" role="status" aria-live="polite"><b>Testing scalars ${discreteLogProgress.startScalar}–${discreteLogProgress.endScalar}</b><div class="search-progress"><span style="width:${100 * discreteLogProgress.completed / discreteLogProgress.trials}%"></span></div><p>${discreteLogProgress.completed}/${discreteLogProgress.trials} ${discreteLogProgress.auto ? 'in this automatic run' : 'in this batch'} · ${discreteLogProgress.elapsedMs.toFixed(2)} ms elapsed · ${discreteLogProgress.candidatesPerSecond.toFixed(0)} candidates/s measured. Overall tested-through scalar: ${discreteLogProgress.startScalar + discreteLogProgress.completed - 1} of ${SEARCH_SCALAR_LIMIT.toLocaleString()} max.</p>${discreteLogProgress.auto && autoSearchEnabled ? '<button class="dlog-stop-button" id="stop-auto-search" type="button">Stop after this progress block (max 4,096 candidates)</button>' : ''}</div>` : searchResultMarkup(discreteLogResult, activeNetwork, searchLimitReached)}
-      <p class="step-explanation subtle">${publicKeyInputEntered ? 'For a supplied public key, validate the secp256k1 point, compute Keccak-256 of X || Y, and take the final 20 bytes for the Ethereum address. No private key is derived.' : 'For each candidate d, compute Q=dG on secp256k1, apply the selected network’s public-key/address encoding, then compare. A miss rules out only the exact interval tested—not any private scalars beyond it and not the curve.'}</p>
+      <div class="dlog-warning"><strong>This is a bounded search, not practical wallet recovery.</strong> A match is possible only when the target was created by a scalar in this exact range. Ten million is about 2²³ candidates versus nearly 2²⁵⁶ possible secp256k1 scalars. A miss rules out only scalars 1–${SEARCH_SCALAR_LIMIT.toLocaleString()}.</div>
+      <div class="dlog-actions"><button class="action-button dlog-button" id="run-dlog-lab" type="button" ${discreteLogProgress ? 'disabled' : ''}>${searchButtonLabel}<span aria-hidden="true">↗</span></button>${discreteLogProgress ? `<button class="dlog-stop-button" id="stop-search" type="button">${discreteLogProgress.stopping ? 'Stopping after current chunks…' : 'Stop search'}</button>` : ''}</div>
+      ${discreteLogProgress ? `<div class="dlog-live-progress" role="status" aria-live="polite"><b>Checked ${discreteLogProgress.completed.toLocaleString()} / ${discreteLogProgress.trials.toLocaleString()} candidates</b><div class="search-progress"><span style="width:${100 * discreteLogProgress.completed / discreteLogProgress.trials}%"></span></div><p>${discreteLogProgress.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second · ${discreteLogProgress.workers} browser workers · ${discreteLogProgress.elapsedMs.toFixed(1)} ms elapsed · ${discreteLogProgress.candidatesPerSecond ? `about ${formatDuration((discreteLogProgress.trials - discreteLogProgress.completed) * 1000 / discreteLogProgress.candidatesPerSecond)} remaining at this rate` : 'measuring speed'}.</p></div>` : searchResultMarkup(discreteLogResult, activeNetwork)}
+      <p class="step-explanation subtle">Each worker starts with Q=dG, then advances with Q(d+1)=Q(d)+G and compares address payload bytes directly. This avoids a fresh scalar multiplication and address encoding for every candidate. The operation stays on this device; it is not an EC2 background job.</p>
     </section>` : '';
 
   app.innerHTML = `
@@ -757,9 +761,8 @@ function render() {
     backwardOpen = !backwardOpen;
     render();
   });
-  document.querySelector('#run-dlog-lab')?.addEventListener('click', () => { autoSearchEnabled = false; runDiscreteLogLab(); });
-  document.querySelector('#run-auto-search')?.addEventListener('click', () => { autoSearchEnabled = true; runDiscreteLogLab(); });
-  document.querySelector('#stop-auto-search')?.addEventListener('click', () => { autoSearchEnabled = false; });
+  document.querySelector('#run-dlog-lab')?.addEventListener('click', runDiscreteLogLab);
+  document.querySelector('#stop-search')?.addEventListener('click', requestSearchStop);
   document.querySelector('#lab-address')?.addEventListener('input', (event) => {
     labAddressInput = event.target.value;
     if (discreteLogResult && labAddressInput.trim() !== discreteLogResult.addressInput) {
@@ -770,7 +773,7 @@ function render() {
     const button = document.querySelector('#run-dlog-lab');
     if (button && !discreteLogProgress) {
       button.disabled = false;
-      button.innerHTML = `${activeNetwork.family === 'evm' && looksLikeEvmPublicKey(labAddressInput) ? 'Calculate full Keccak-256 from public key' : `Run ${SEARCH_BATCH_SIZE}-candidate ${selectedNetwork().shortLabel} search`}<span aria-hidden="true">↗</span>`;
+      button.innerHTML = `${activeNetwork.family === 'evm' && looksLikeEvmPublicKey(labAddressInput) ? 'Calculate full Keccak-256 from public key' : 'Search all 10,000,000 candidates'}<span aria-hidden="true">↗</span>`;
     }
   });
   document.querySelectorAll('[data-run-step]').forEach((button) => button.addEventListener('click', () => runStep(Number(button.dataset.runStep))));
@@ -793,9 +796,7 @@ function render() {
 }
 
 function selectNetwork(event) {
-  autoSearchEnabled = false;
-  searchRunId += 1;
-  discreteLogProgress = null;
+  invalidateSearch();
   selectedNetworkId = event.target.value;
   discreteLogResult = null;
   labAddressInput = null;
@@ -808,9 +809,7 @@ function selectNetwork(event) {
 }
 
 function generateWallet() {
-  autoSearchEnabled = false;
-  searchRunId += 1;
-  discreteLogProgress = null;
+  invalidateSearch();
   try {
     const passInput = document.querySelector('#passphrase');
     if (passInput) passphrase = passInput.value;
@@ -1027,105 +1026,125 @@ function deriveNetworkAddress() {
   wallet.address = data.address;
 }
 
-function smallScalarBytes(scalar) {
-  const bytes = new Uint8Array(32);
-  let value = BigInt(scalar);
-  for (let index = bytes.length - 1; index >= 0; index -= 1) {
-    bytes[index] = Number(value & 0xffn);
-    value >>= 8n;
-  }
-  return bytes;
+function invalidateSearch() {
+  searchRunId += 1;
+  if (searchRenderTimer) clearTimeout(searchRenderTimer);
+  searchRenderTimer = null;
+  activeSearch?.workers.forEach((worker) => worker.terminate());
+  activeSearch = null;
+  discreteLogProgress = null;
+  discreteLogResult = null;
+}
+
+function requestSearchStop() {
+  if (!activeSearch || activeSearch.cancelRequested) return;
+  activeSearch.manualStop = true;
+  activeSearch.cancelRequested = true;
+  activeSearch.workers.forEach((worker) => worker.postMessage({ type: 'cancel' }));
+  discreteLogProgress = { ...discreteLogProgress, stopping: true };
+  render();
+}
+
+function finishSearch(search, status, match = null, message = '') {
+  if (activeSearch !== search) return;
+  if (searchRenderTimer) clearTimeout(searchRenderTimer);
+  searchRenderTimer = null;
+  const totalTested = [...search.progressByWorker.values()].reduce((sum, count) => sum + count, 0);
+  const elapsedMs = Math.max(performance.now() - search.startedAt, 0.01);
+  const candidatesPerSecond = totalTested * 1000 / elapsedMs;
+  search.workers.forEach((worker) => worker.terminate());
+  activeSearch = null;
+  discreteLogProgress = null;
+  discreteLogResult = {
+    status, addressInput: search.addressInput, networkId: search.networkId, parsed: search.parsed,
+    startScalar: 1, lastScalar: status === 'valid' && match ? match.scalar : totalTested,
+    trials: totalTested, totalTested, elapsedMs, candidatesPerSecond,
+    foundScalar: match?.scalar ?? null, foundPublicKey: match?.publicKey ?? null,
+    foundAddress: match ? search.parsed.display : '', workers: search.workers.length, message,
+  };
+  render();
 }
 
 async function runDiscreteLogLab() {
-  const runAuto = autoSearchEnabled;
+  invalidateSearch();
   const addressInput = document.querySelector('#lab-address')?.value.trim() ?? '';
   labAddressInput = addressInput;
   const parsed = parseNetworkAddress(addressInput);
   if (!parsed.valid) {
-    autoSearchEnabled = false;
     discreteLogResult = { status: 'invalid', addressInput, reason: parsed.reason, networkId: selectedNetworkId };
-    discreteLogProgress = null;
     render();
     return;
   }
   if (parsed.inputKind === 'publicKey') {
-    autoSearchEnabled = false;
     discreteLogResult = { status: 'publicKey', addressInput, networkId: selectedNetworkId, parsed };
-    discreteLogProgress = null;
     render();
     return;
   }
 
-  const networkId = selectedNetworkId;
-  const previous = discreteLogResult?.status === 'valid'
-    && !discreteLogResult.foundScalar
-    && discreteLogResult.networkId === networkId
-    && discreteLogResult.addressInput === addressInput
-    && discreteLogResult.lastScalar < SEARCH_SCALAR_LIMIT
-    ? discreteLogResult
-    : null;
-  const startScalar = previous ? previous.lastScalar + 1 : 1;
-  if (startScalar > SEARCH_SCALAR_LIMIT) {
-    autoSearchEnabled = false;
-    return;
-  }
-  const endScalar = runAuto ? SEARCH_SCALAR_LIMIT : Math.min(startScalar + SEARCH_BATCH_SIZE - 1, SEARCH_SCALAR_LIMIT);
-  const plannedTrials = endScalar - startScalar + 1;
-  const progressStride = runAuto ? 4096 : 16;
+  const availableCores = navigator.hardwareConcurrency || 2;
+  const workerCount = Math.max(1, Math.min(4, availableCores));
+  const partitionSize = Math.ceil(SEARCH_SCALAR_LIMIT / workerCount);
   const runId = ++searchRunId;
-  const startedAt = performance.now();
-  discreteLogResult = null;
-  discreteLogProgress = { completed: 0, trials: plannedTrials, startScalar, endScalar, elapsedMs: 0, candidatesPerSecond: 0, networkId, parsed, auto: runAuto };
-  render();
-  let firstCandidateAddress = '';
-  let lastCandidateAddress = '';
-  let lastScalarTested = startScalar - 1;
-  let testedCount = 0;
-  let foundScalar = null;
-  let foundPublicKey = null;
-  const network = NETWORKS[networkId];
-  const normalize = (address) => network.family === 'evm' || network.family === 'bnbBeacon' || (network.family === 'bitcoin' && ['p2wpkh', 'p2tr'].includes(network.format)) ? address.toLowerCase() : address;
-  for (let candidate = startScalar; candidate <= endScalar; candidate += 1) {
-    const privateKey = smallScalarBytes(candidate);
-    const candidateData = calculateAddressData(privateKey, networkId);
-    const candidateAddress = candidateData.address;
-    if (candidate === startScalar) firstCandidateAddress = candidateAddress;
-    lastCandidateAddress = candidateAddress;
-    lastScalarTested = candidate;
-    testedCount += 1;
-    if (normalize(candidateAddress) === normalize(parsed.display)) {
-      foundScalar = candidate;
-      foundPublicKey = `0x${hex(candidateData.publicKey)}`;
-    }
-    privateKey.fill(0);
-    if (candidateData.taprootData) wipeTaprootData(candidateData.taprootData);
-    const completed = candidate - startScalar + 1;
-    if (foundScalar || completed % progressStride === 0 || candidate === endScalar) {
-      const elapsedMs = Math.max(performance.now() - startedAt, 0.01);
-      discreteLogProgress = { completed, trials: plannedTrials, startScalar, endScalar, elapsedMs, candidatesPerSecond: completed * 1000 / elapsedMs, networkId, parsed, auto: runAuto };
-      render();
-      if (candidate < endScalar && !foundScalar) await new Promise((resolve) => setTimeout(resolve, 0));
-      if (runId !== searchRunId) return;
-      if (runAuto && !autoSearchEnabled) break;
-    }
-    if (foundScalar) break;
-  }
-  const elapsedMs = Math.max(performance.now() - startedAt, 0.01);
-  const candidatesPerSecond = testedCount * 1000 / elapsedMs;
-  const addressBits = NETWORKS[networkId].format === 'p2tr' ? 255 : 160;
-  const log10ExpectedYears = addressBits * Math.log10(2) - Math.log10(candidatesPerSecond) - Math.log10(365.25 * 24 * 60 * 60);
-
-  discreteLogResult = {
-    status: 'valid', addressInput, networkId, parsed, startScalar, lastScalar: lastScalarTested,
-    trials: testedCount, totalTested: lastScalarTested, elapsedMs, candidatesPerSecond, addressBits,
-    log10ExpectedYears, firstCandidateAddress, lastCandidateAddress, foundScalar, foundPublicKey,
+  const search = {
+    runId, networkId: selectedNetworkId, addressInput, parsed,
+    workers: [], progressByWorker: new Map(), finishedWorkers: new Set(),
+    foundMatch: null, cancelRequested: false, manualStop: false, startedAt: performance.now(),
   };
-  autoSearchEnabled = false;
-  discreteLogProgress = null;
+  activeSearch = search;
+  discreteLogProgress = { completed: 0, trials: SEARCH_SCALAR_LIMIT, startScalar: 1, endScalar: SEARCH_SCALAR_LIMIT, elapsedMs: 0, candidatesPerSecond: 0, workers: workerCount };
+  discreteLogResult = null;
   render();
-}
 
+  try {
+    for (let workerId = 0; workerId < workerCount; workerId += 1) {
+      const start = 1 + workerId * partitionSize;
+      const end = Math.min(SEARCH_SCALAR_LIMIT, start + partitionSize - 1);
+      const worker = new Worker(new URL('./search-worker.js', import.meta.url), { type: 'module' });
+      search.workers.push(worker);
+      search.progressByWorker.set(workerId, 0);
+      worker.onmessage = ({ data }) => {
+        if (activeSearch !== search || search.runId !== runId) return;
+        if (data.type === 'error') {
+          finishSearch(search, 'error', null, data.message);
+          return;
+        }
+        search.progressByWorker.set(data.workerId, data.tested);
+        if (data.type === 'match') {
+          search.finishedWorkers.add(data.workerId);
+          if (!search.foundMatch) {
+            search.foundMatch = data;
+            search.cancelRequested = true;
+            search.workers.forEach((other, index) => {
+              if (index !== data.workerId) other.postMessage({ type: 'cancel' });
+            });
+          }
+        } else if (data.type === 'done' || data.type === 'cancelled') {
+          search.finishedWorkers.add(data.workerId);
+        }
+
+        const completed = [...search.progressByWorker.values()].reduce((sum, count) => sum + count, 0);
+        const elapsedMs = Math.max(performance.now() - search.startedAt, 0.01);
+        discreteLogProgress = { completed, trials: SEARCH_SCALAR_LIMIT, startScalar: 1, endScalar: SEARCH_SCALAR_LIMIT, elapsedMs, candidatesPerSecond: completed * 1000 / elapsedMs, workers: workerCount, stopping: search.cancelRequested };
+        if (search.finishedWorkers.size === workerCount) {
+          if (search.foundMatch) finishSearch(search, 'valid', search.foundMatch);
+          else if (search.manualStop) finishSearch(search, 'cancelled');
+          else finishSearch(search, 'valid');
+          return;
+        }
+        if (!searchRenderTimer) {
+          searchRenderTimer = setTimeout(() => {
+            searchRenderTimer = null;
+            if (activeSearch === search) render();
+          }, 150);
+        }
+      };
+      worker.onerror = (error) => finishSearch(search, 'error', null, error.message || 'A search worker failed.');
+      worker.postMessage({ workerId, networkId: search.networkId, targetBytes: parsed.bytes, start, end, chunkSize: SEARCH_WORKER_CHUNK });
+    }
+  } catch (error) {
+    finishSearch(search, 'error', null, error?.message ?? String(error));
+  }
+}
 
 function wipeWalletSecrets() {
   wipeTaprootData();
@@ -1139,9 +1158,7 @@ function wipeWalletSecrets() {
 }
 
 function resetWallet() {
-  autoSearchEnabled = false;
-  searchRunId += 1;
-  discreteLogProgress = null;
+  invalidateSearch();
   wipeWalletSecrets();
   wallet = freshWallet();
   passphrase = '';

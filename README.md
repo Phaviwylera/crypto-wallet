@@ -1,6 +1,6 @@
 # Seedlab — an interactive wallet primer
 
-A browser-based, step-by-step crypto wallet learning demo. It generates BIP-39 entropy and a 12-word phrase, derives the 512-bit seed and BIP-32 keys, then shows address-construction traces for Ethereum, Bitcoin, TRON, and BNB profiles. All derivations and the bounded address-search lab run locally in the browser.
+A browser-based, step-by-step crypto wallet learning demo. It generates BIP-39 entropy and a 12-word phrase, derives the 512-bit seed and BIP-32 keys, then shows address-construction traces for Ethereum, Bitcoin, TRON, and BNB profiles. Derivations and the bounded address search run locally in the browser; the full 10-million-scalar search uses a capped Web Worker pool.
 
 ## Run locally
 
@@ -40,7 +40,11 @@ This is a publicly known test mnemonic only. Never use it or any sample phrase t
 
 ## Bounded address search
 
-For EVM profiles, the input also accepts a validated 33-byte compressed or 64/65-byte uncompressed secp256k1 public key; it computes the full public-key Keccak-256 digest and address directly, without attempting private-key recovery. Otherwise, the lab validates an address and tests secp256k1 scalars in batches of 256. After a miss, you can explicitly continue with the next interval (257–512, and so on) up to the strict overall cap of `1–10,000,000`; it never searches beyond that bound. The Auto-search button can run from the next untested scalar through the cap and be stopped from the page; it is browser-side only, so the tab/device must stay awake. It does not run on EC2. Each run reports measured elapsed time and candidate rate. The time estimate extrapolates blind address-preimage work (about `2^160` candidates for 20-byte address outputs, about `2^255` for Taproot x-only outputs) at the latest measured rate. This is not a practical key-recovery method, does not test arbitrary private keys, and is not a full secp256k1 break. A miss rules out only the tested interval. If a public key is exposed, generic discrete-log attacks are a different problem and remain infeasible at these scales.
+For EVM profiles, the input also accepts a validated 33-byte compressed or 64/65-byte uncompressed secp256k1 public key and calculates its address directly. Otherwise, pasting a valid address and pressing **Search all 10,000,000 candidates** tests the complete scalar interval `1–10,000,000` by default. A match stops the other workers after their current small chunk and reports the scalar and public key; a miss covers only that interval. The operation runs entirely in browser Web Workers (up to four, depending on device cores); it does not send the address to EC2.
+
+Workers partition the range and update each public point incrementally (`Q_(d+1) = Q_d + G`) instead of recomputing `dG` from scratch for every candidate. They compare address payload bytes directly, avoiding per-candidate address-string encoding. The measured rate and a device-specific remaining-time estimate are shown during the run. Full 10M runs can still take several minutes and consume substantial device CPU. The Stop control cancels at worker-chunk boundaries.
+
+This is not practical recovery for a randomly generated real wallet: 10,000,000 is about `2^23` scalars, while secp256k1 has nearly `2^256` possible private scalars. A miss rules out only the tested interval. Keep this as a browser-side educational/test-range tool. A server-side EC2 search would require a compute API, expose the instance to abuse and unexpected CPU charges, and disclose the searched address to that server; it is not recommended for the public static site.
 
 ## Server-side wallet scan (upload → EC2/Lambda)
 
