@@ -1,4 +1,5 @@
 import { secp256k1 } from '@noble/curves/secp256k1.js';
+import { normalizeZ } from '@noble/curves/abstract/curve.js';
 import { ripemd160 } from '@noble/hashes/legacy.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { keccak_256 } from '@noble/hashes/sha3.js';
@@ -88,40 +89,51 @@ function runWorker({ workerId, networkId, targetBytesList: targetInputs, targetB
   });
 
   const runChunk = () => {
-    if (stopRequested) {
-      reportCancelled();
-      return;
-    }
-    const proposedChunkEnd = scalar + chunkSizeBigInt - 1n;
-    const chunkEnd = proposedChunkEnd < endScalar ? proposedChunkEnd : endScalar;
-    while (scalar <= chunkEnd) {
-      const payload = addressPayloadForPoint(point, networkId);
-      tested += 1n;
-      const bucket = payload ? targetBuckets.get(prefixKey(payload)) : null;
-      const found = bucket?.find(({ bytes }) => matchesBytes(payload, bytes));
-      if (found) {
-        self.postMessage({
-          type: 'match', workerId, tested, scalar, targetIndex: found.index,
-          publicKey: `0x${hex(point.toBytes(false))}`,
-          elapsedMs: Math.max(performance.now() - startedAt, 0.01),
-        });
+    try {
+      if (stopRequested) {
+        reportCancelled();
         return;
       }
-      scalar += 1n;
-      if (scalar <= endScalar) point = point.add(BASE);
-    }
+      const proposedChunkEnd = scalar + chunkSizeBigInt - 1n;
+      const chunkEnd = proposedChunkEnd < endScalar ? proposedChunkEnd : endScalar;
+      // Batch-normalize projective points: one field inversion for the chunk
+      // instead of one inversion per candidate when serializing public keys.
+      const points = [];
+      for (let nextScalar = scalar; nextScalar <= chunkEnd; nextScalar += 1n) {
+        points.push(point);
+        if (nextScalar < endScalar) point = point.add(BASE);
+      }
+      const normalized = normalizeZ(secp256k1.Point, points);
+      for (const candidatePoint of normalized) {
+        const payload = addressPayloadForPoint(candidatePoint, networkId);
+        tested += 1n;
+        const bucket = payload ? targetBuckets.get(prefixKey(payload)) : null;
+        const found = bucket?.find(({ bytes }) => matchesBytes(payload, bytes));
+        if (found) {
+          self.postMessage({
+            type: 'match', workerId, tested, scalar, targetIndex: found.index,
+            publicKey: `0x${hex(candidatePoint.toBytes(false))}`,
+            elapsedMs: Math.max(performance.now() - startedAt, 0.01),
+          });
+          return;
+        }
+        scalar += 1n;
+      }
 
-    const message = { workerId, tested, currentScalar: scalar - 1n, elapsedMs: Math.max(performance.now() - startedAt, 0.01) };
-    if (stopRequested) {
-      self.postMessage({ type: 'cancelled', ...message });
-      return;
+      const message = { workerId, tested, currentScalar: scalar - 1n, elapsedMs: Math.max(performance.now() - startedAt, 0.01) };
+      if (stopRequested) {
+        self.postMessage({ type: 'cancelled', ...message });
+        return;
+      }
+      if (scalar > endScalar) {
+        self.postMessage({ type: 'done', ...message });
+        return;
+      }
+      self.postMessage({ type: 'progress', ...message });
+      setTimeout(runChunk, 0);
+    } catch (error) {
+      self.postMessage({ type: 'error', workerId, message: error?.message ?? String(error) });
     }
-    if (scalar > endScalar) {
-      self.postMessage({ type: 'done', ...message });
-      return;
-    }
-    self.postMessage({ type: 'progress', ...message });
-    setTimeout(runChunk, 0);
   };
 
   setTimeout(runChunk, 0);
