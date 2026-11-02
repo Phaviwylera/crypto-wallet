@@ -19,7 +19,7 @@ import { bitcoinPuzzlePointSearchText, createBitcoinPuzzleMatchExport } from './
 import { MAX_BATCH_FILE_BYTES, parseAddressBatch, parseRecoveryBatch, publicKeyResultsTsv } from './batch-files.js';
 import { runRecoveryBatch } from './recovery-batch.js';
 import { createPuzzleCampaignSnapshot, puzzleCampaignContentMarkup, puzzleCampaignStatusMarkup } from './puzzle-campaigns.js';
-import { randomScalarInRange, scalarWalletExport } from './scalar-wallet.js';
+import { generateScalarBatch, parseScalarBatchRange } from './scalar-wallet.js';
 import './style.css';
 
 const app = document.querySelector('#app');
@@ -37,7 +37,8 @@ let selectedNetworkId = 'ethereum';
 const SEARCH_WORKER_CHUNK = 256;
 let searchLower = '1';
 let searchUpper = '10000';
-let boundedWallet = { result: null, error: '' };
+let boundedWallet = { result: null, error: '', busy: false, completed: 0, total: 0 };
+let boundedWalletRunId = 0;
 const selectedNetwork = () => NETWORKS[selectedNetworkId];
 let wallet = freshWallet();
 let passphrase = '';
@@ -806,42 +807,86 @@ async function recoverBatchPublicKeys() {
 
 function boundedWalletGeneratorMarkup() {
   const result = boundedWallet.result;
+  const progressPercent = boundedWallet.total ? Math.min(100, 100 * boundedWallet.completed / boundedWallet.total) : 0;
   return `<div class="public-key-extract-panel bounded-wallet-panel" id="bounded-wallet-generator">
-    <strong>Random private key + address within these bounds</strong>
-    <p>Uses the inclusive lower/upper fields above and ${escapeHtml(selectedNetwork().label)}. Web Crypto samples uniformly within the interval; nothing is uploaded or persisted automatically. Small or known intervals can be brute-forced—use bounded keys for testing/recovery only, not real funds.</p>
-    <div class="dlog-actions"><button class="search-file-button" id="generate-bounded-wallet" type="button">Generate key + address</button>${result ? '<button class="search-file-button" id="download-bounded-wallet" type="button">Download private key + address TXT</button>' : ''}</div>
+    <strong>All addresses + public keys within these bounds</strong>
+    <p>Enumerates every scalar from lower through upper (up to 10,000 per run) for ${escapeHtml(selectedNetwork().label)}. The TXT contains only <code>address → tab → uncompressed public key</code> on each line, with no header or other information. Small or known intervals can be brute-forced; never use their keys for real funds.</p>
+    <div class="dlog-actions"><button class="search-file-button" id="generate-bounded-wallet" type="button" ${boundedWallet.busy ? 'disabled' : ''}>${boundedWallet.busy ? 'Generating…' : 'Generate all addresses + public keys'}</button>${boundedWallet.busy ? '<button class="dlog-stop-button" id="stop-bounded-wallet" type="button">Cancel generation</button>' : ''}${result ? '<button class="search-file-button" id="download-bounded-wallet" type="button">Download TXT</button>' : ''}</div>
     ${boundedWallet.error ? `<p class="search-file-error" role="alert">${escapeHtml(boundedWallet.error)}</p>` : ''}
-    ${result ? `<div class="dlog-live-progress bounded-wallet-result" aria-live="polite"><b>Generated locally · ${escapeHtml(result.networkLabel)}</b><p>Inclusive range: <code>${escapeHtml(result.lower)}</code> – <code>${escapeHtml(result.upper)}</code></p><label>Private scalar · decimal</label><code class="dlog-address-value">${escapeHtml(result.scalar)}</code><label>Private key · 32-byte hex</label><code class="dlog-address-value">${escapeHtml(result.privateKey)}</code><label>Derived address</label><code class="dlog-address-value">${escapeHtml(result.address)}</code><p><strong>Sensitive:</strong> the TXT controls this address. Anyone with the private key can spend its funds.</p></div>` : ''}
+    ${boundedWallet.busy ? `<div class="dlog-live-progress bounded-wallet-result" role="status" aria-live="polite"><b id="bounded-wallet-progress">Generated ${boundedWallet.completed.toLocaleString()} / ${boundedWallet.total.toLocaleString()} rows</b><div class="search-progress"><span id="bounded-wallet-progress-bar" style="width:${progressPercent}%"></span></div><p>Derivation runs in small chunks to keep the page responsive. Cancel discards the partial output.</p></div>` : ''}
+    ${result ? `<div class="dlog-live-progress bounded-wallet-result" aria-live="polite"><b>${result.count.toLocaleString()} rows ready · ${escapeHtml(result.networkLabel)}</b><p>Inclusive scalar range: <code>${escapeHtml(result.lower)}</code> – <code>${escapeHtml(result.upper)}</code></p><p>Headerless TXT: address first, uncompressed public key second, one pair per line.</p></div>` : ''}
   </div>`;
 }
 
-function generateBoundedWallet() {
-  try {
-    const range = parseSearchRange(searchLower.trim(), searchUpper.trim());
-    const scalar = randomScalarInRange(searchLower.trim(), searchUpper.trim());
-    const privateKeyBytes = bigIntToBytes(scalar);
-    try {
-      const privateKey = `0x${hex(privateKeyBytes)}`;
-      const derived = calculateAddressData(privateKeyBytes);
-      boundedWallet = {
-        error: '',
-        result: {
-          networkId: selectedNetworkId,
-          networkLabel: selectedNetwork().label,
-          lower: range.start.toString(),
-          upper: range.end.toString(),
-          scalar: scalar.toString(),
-          privateKey,
-          address: derived.address,
-        },
-      };
-    } finally {
-      privateKeyBytes.fill(0);
-    }
-  } catch (error) {
-    boundedWallet = { result: null, error: error?.message ?? String(error) };
-  }
+function resetBoundedWallet(error = '') {
+  boundedWalletRunId += 1;
+  boundedWallet = { result: null, error, busy: false, completed: 0, total: 0 };
+}
+
+function stopBoundedWalletGeneration() {
+  if (!boundedWallet.busy) return;
+  resetBoundedWallet('Generation cancelled; no TXT was created.');
   render();
+}
+
+async function generateBoundedWallet() {
+  if (boundedWallet.busy) return;
+  let range;
+  try {
+    range = parseScalarBatchRange(searchLower.trim(), searchUpper.trim());
+  } catch (error) {
+    resetBoundedWallet(error?.message ?? String(error));
+    render();
+    return;
+  }
+
+  const runId = ++boundedWalletRunId;
+  const networkId = selectedNetworkId;
+  const networkLabel = selectedNetwork().label;
+  boundedWallet = { result: null, error: '', busy: true, completed: 0, total: Number(range.count) };
+  render();
+
+  try {
+    const output = await generateScalarBatch({
+      lower: range.start.toString(),
+      upper: range.end.toString(),
+      derive: (scalar) => {
+        const privateKeyBytes = bigIntToBytes(scalar);
+        try {
+          const derived = calculateAddressData(privateKeyBytes, networkId);
+          return { address: derived.address, publicKey: `0x${hex(derived.publicKey)}` };
+        } finally {
+          privateKeyBytes.fill(0);
+        }
+      },
+      onProgress: (completed, total) => {
+        if (runId !== boundedWalletRunId) return;
+        boundedWallet.completed = completed;
+        boundedWallet.total = total;
+        const progress = document.querySelector('#bounded-wallet-progress');
+        if (progress) progress.textContent = `Generated ${completed.toLocaleString()} / ${total.toLocaleString()} rows`;
+        const bar = document.querySelector('#bounded-wallet-progress-bar');
+        if (bar) bar.style.width = `${total ? Math.min(100, 100 * completed / total) : 0}%`;
+      },
+      shouldCancel: () => runId !== boundedWalletRunId,
+    });
+    if (runId !== boundedWalletRunId) return;
+    boundedWallet = {
+      result: {
+        text: output.text,
+        count: output.count,
+        lower: output.range.start.toString(),
+        upper: output.range.end.toString(),
+        networkId,
+        networkLabel,
+      },
+      error: '', busy: false, completed: output.count, total: output.count,
+    };
+  } catch (error) {
+    if (runId !== boundedWalletRunId) return;
+    boundedWallet = { result: null, error: error?.message ?? String(error), busy: false, completed: 0, total: 0 };
+  }
+  if (runId === boundedWalletRunId) render();
 }
 
 function searchGuideMarkup() {
@@ -1316,9 +1361,10 @@ function render() {
   document.querySelector('#search-lower')?.addEventListener('input', (event) => { searchLower = event.target.value; });
   document.querySelector('#search-upper')?.addEventListener('input', (event) => { searchUpper = event.target.value; });
   document.querySelector('#generate-bounded-wallet')?.addEventListener('click', generateBoundedWallet);
+  document.querySelector('#stop-bounded-wallet')?.addEventListener('click', stopBoundedWalletGeneration);
   document.querySelector('#download-bounded-wallet')?.addEventListener('click', () => {
     const result = boundedWallet.result;
-    if (result) exportTextFile(`bounded-scalar-wallet-${result.networkId}.txt`, scalarWalletExport(result));
+    if (result) exportTextFile(`address-public-keys-${result.networkId}-${result.lower}-${result.upper}.txt`, result.text);
   });
   document.querySelector('#run-dlog-lab')?.addEventListener('click', runDiscreteLogLab);
   document.querySelector('#stop-search')?.addEventListener('click', requestSearchStop);
@@ -1360,7 +1406,7 @@ function selectNetwork(event) {
   searchAddressFile = null;
   selectedNetworkId = event.target.value;
   discreteLogResult = null;
-  boundedWallet = { result: null, error: '' };
+  resetBoundedWallet();
   labAddressInput = null;
   copied = new Set();
   if (wallet.stage >= 4) {
@@ -1835,7 +1881,7 @@ function resetWallet() {
   passphrase = '';
   backwardOpen = false;
   discreteLogResult = null;
-  boundedWallet = { result: null, error: '' };
+  resetBoundedWallet();
   labAddressInput = null;
   copied = new Set();
   render();
