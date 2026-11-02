@@ -1,35 +1,55 @@
 import { parseSearchRange } from './search-range.js';
 
-function secureRandomBytes(bytes) {
-  if (!globalThis.crypto?.getRandomValues) {
-    throw new Error('Secure browser randomness is unavailable. Use HTTPS or localhost.');
+export const MAX_SCALAR_BATCH_SIZE = 10_000;
+
+export function parseScalarBatchRange(lower, upper) {
+  const range = parseSearchRange(lower, upper);
+  if (range.count > BigInt(MAX_SCALAR_BATCH_SIZE)) {
+    throw new Error(`Generate at most ${MAX_SCALAR_BATCH_SIZE.toLocaleString('en-US')} scalars at once; choose a smaller inclusive interval.`);
   }
-  return globalThis.crypto.getRandomValues(bytes);
+  return range;
 }
 
-// Rejection sampling avoids modulo bias. The interval itself may still be
-// deliberately small and therefore unsuitable for storing real funds.
-export function randomScalarInRange(lower, upper, randomBytes = secureRandomBytes) {
-  const { start, count } = parseSearchRange(lower, upper);
-  if (count === 1n) return start;
+export function scalarBatchRow(address, publicKey) {
+  if (typeof address !== 'string' || !address || typeof publicKey !== 'string' || !publicKey) {
+    throw new Error('Derivation did not return an address and public key.');
+  }
+  // Headerless TSV: address first, uncompressed public key second.
+  return `${address}\t${publicKey}\n`;
+}
 
-  const bits = (count - 1n).toString(2).length;
-  const byteLength = Math.ceil(bits / 8);
-  const unusedBits = byteLength * 8 - bits;
-  const firstByteMask = 0xff >>> unusedBits;
+export async function generateScalarBatch({
+  lower,
+  upper,
+  derive,
+  onProgress = () => {},
+  shouldCancel = () => false,
+  yieldEvery = 25,
+}) {
+  const range = parseScalarBatchRange(lower, upper);
+  if (typeof derive !== 'function') throw new Error('An address derivation function is required.');
+  if (!Number.isInteger(yieldEvery) || yieldEvery < 1 || yieldEvery > 1000) throw new Error('Invalid generation chunk size.');
 
-  for (;;) {
-    const bytes = randomBytes(new Uint8Array(byteLength));
-    if (!(bytes instanceof Uint8Array) || bytes.length !== byteLength) {
-      throw new Error('Randomness provider returned an invalid byte array.');
+  const rows = [];
+  for (let scalar = range.start; scalar <= range.end; scalar += 1n) {
+    if (shouldCancel()) {
+      const error = new Error('Generation cancelled; no TXT was created.');
+      error.name = 'AbortError';
+      throw error;
     }
-    bytes[0] &= firstByteMask;
-    let candidate = 0n;
-    for (const byte of bytes) candidate = (candidate << 8n) | BigInt(byte);
-    if (candidate < count) return start + candidate;
-  }
-}
+    const derived = derive(scalar);
+    rows.push(scalarBatchRow(derived.address, derived.publicKey));
 
-export function scalarWalletExport(result) {
-  return `SEEDLAB BOUNDED SCALAR WALLET\n\nNetwork: ${result.networkLabel}\nLower scalar (inclusive): ${result.lower}\nUpper scalar (inclusive): ${result.upper}\nPrivate scalar (decimal): ${result.scalar}\nPrivate key (32-byte hex): ${result.privateKey}\nAddress: ${result.address}\n\nSECURITY: This private key controls the address. Keep it secret. A key drawn from a small or known interval can be brute-forced; use bounded keys for testing/recovery only, not for real funds. Generated locally in the browser.\n`;
+    if (rows.length % yieldEvery === 0 && scalar < range.end) {
+      onProgress(rows.length, Number(range.count));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
+  if (shouldCancel()) {
+    const error = new Error('Generation cancelled; no TXT was created.');
+    error.name = 'AbortError';
+    throw error;
+  }
+  onProgress(rows.length, Number(range.count));
+  return { text: rows.join(''), count: rows.length, range };
 }
