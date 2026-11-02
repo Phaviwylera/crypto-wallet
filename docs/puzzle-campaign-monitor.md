@@ -1,18 +1,27 @@
 # Local kangaroo campaign monitor
 
-`scripts/puzzle-status-server.mjs` serves a local dashboard for the five bounded pzsolve campaigns: **#140, #145, #150, #155 and #160**.
+The main Exchange Lab UI includes a **Campaign status** panel for the five bounded pzsolve campaigns: **#140, #145, #150, #155 and #160**. The synthetic kangaroo demo has been removed.
 
-## Open the monitor
+## Open the main UI
 
 From the repository root:
+
+```sh
+npm ci
+npm run dev -- --port 5173
+```
+
+The server binds to `0.0.0.0`. In Arena, use the Live Preview associated with port **5173** and select **Campaign status** in the main navigation. The page refreshes `/api/puzzle-campaigns` every second. The same endpoint is available from the Hono server and from `vite preview`. A purely static deployment cannot read workspace campaign files and displays an availability warning instead of fabricated live data.
+
+## Optional standalone monitor
+
+`scripts/puzzle-status-server.mjs` still provides a dependency-free fallback dashboard:
 
 ```sh
 PORT=4174 node scripts/puzzle-status-server.mjs
 ```
 
-The server binds to `0.0.0.0`. In Arena, use the Live Preview associated with port **4174**. On a local machine outside Arena, open `http://localhost:4174`.
-
-The dashboard refreshes `/api/status` every second. It has no external browser dependencies and makes no blockchain or remote API requests.
+On a local machine outside Arena, open `http://localhost:4174`. It refreshes `/api/status` every second, has no external browser dependencies, and makes no blockchain or remote API requests.
 
 ## What the bars mean
 
@@ -52,7 +61,7 @@ See `reports/bitcoin-puzzle-operations-2026-11-02.md` for the pinned runner sour
 ## Validate
 
 ```sh
-node --test test/puzzle-status-server.test.mjs
+node --test test/puzzle-status-server.test.mjs test/puzzle-campaigns.test.mjs
 ```
 
 The tests cover live and stale PID handling, all five API entries, found-state privacy, inline script syntax, HEAD requests, missing routes, and unsupported methods.

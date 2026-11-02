@@ -12,6 +12,7 @@ import { parseWalletFile } from './lib/parse.mjs';
 import { runScan } from './lib/scan.mjs';
 import { createStore } from './lib/store.mjs';
 import { listUploadsBucket } from './lib/s3.mjs';
+import { getStatusSnapshot } from '../scripts/puzzle-status-server.mjs';
 
 const MODE = process.env.STORE_MODE || 'memory';
 const PORT = Number(process.env.PORT || 8787);
@@ -22,6 +23,13 @@ export function createApp() {
   const store = createStore(MODE);
 
   app.get('/health', (c) => c.json({ ok: true, mode: MODE }));
+
+  // Live local puzzle workers. Static/serverless deployments without the
+  // workspace runtime return NOT_STARTED rather than a fabricated run.
+  app.get('/api/puzzle-campaigns', async (c) => {
+    c.header('cache-control', 'no-store');
+    return c.json(await getStatusSnapshot());
+  });
 
   // Start a scan job. In memory mode this reads the uploaded file directly.
   app.post('/api/scan', async (c) => {

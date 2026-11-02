@@ -1,7 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseSearchRange, partitionSearchRange, MAX_SEARCH_SCALAR } from '../src/search-range.js';
-import { runPollardKangarooDemo } from '../src/pollard-kangaroo-demo.js';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { keccak_256 } from '@noble/hashes/sha3.js';
 import { sha256 } from '@noble/hashes/sha2.js';
@@ -68,11 +67,4 @@ test('worker errors inside a chunk are reported', async () => {
     self.onmessage({ data: { workerId: 3, networkId: 'unsupported', targetBytes: new Uint8Array(20), start: 1n, end: 2n, chunkSize: 2 } });
   });
   assert.equal(result.type, 'error'); assert.equal(result.workerId, 3);
-});
-test('toy kangaroo collision verifies the synthetic point', () => {
-  const result = runPollardKangarooDemo();
-  assert.equal(result.recovered, '345678'); assert.equal(result.verified, true);
-  assert.ok(result.elapsedMs > 0); assert.ok(result.walkStepsPerSecond > 0);
-  assert.ok(result.tameSteps < 24000, 'interleaved walk stops without filling the entire tame table');
-  assert.equal(BigInt(result.lower) + BigInt(result.width) + BigInt(result.collision.tameDistance) - BigInt(result.collision.wildDistance), BigInt(result.recovered));
 });
