@@ -18,6 +18,7 @@ import { BITCOIN_PUZZLES, BITCOIN_PUZZLE_SOURCE, bitcoinPuzzleCatalogTsv, getBit
 import { bitcoinPuzzlePointSearchText, createBitcoinPuzzleMatchExport } from './bitcoin-puzzle-match.js';
 import { MAX_BATCH_FILE_BYTES, parseAddressBatch, parseRecoveryBatch, publicKeyResultsTsv } from './batch-files.js';
 import { runRecoveryBatch } from './recovery-batch.js';
+import { createPuzzleCampaignSnapshot, puzzleCampaignContentMarkup, puzzleCampaignStatusMarkup } from './puzzle-campaigns.js';
 import './style.css';
 
 const app = document.querySelector('#app');
@@ -55,9 +56,9 @@ let pointSearch = { fileName: '', text: '', lower: '1', upper: '1000000', worker
 let pointSearchPool = null;
 let gpuBenchmark = { preference: 'high-performance', busy: false, progress: null, result: null, error: '' };
 let gpuBenchmarkWorker = null;
-let kangarooDemoResult = null;
-let kangarooDemoBusy = false;
-let kangarooDemoError = '';
+let puzzleCampaignSnapshot = createPuzzleCampaignSnapshot();
+let puzzleCampaignError = '';
+let puzzleCampaignRequestInFlight = false;
 let pendingFile = null;
 let scanState = { jobId: null, status: 'idle', total: 0, processed: 0, results: [], error: null, hideEmpty: true };
 const API_BASE = (import.meta.env && import.meta.env.VITE_SCAN_API_BASE) || '';
@@ -871,45 +872,26 @@ function startPointSearch() {
   pool.start();
 }
 
-function kangarooDemoMarkup() {
-  const result = kangarooDemoResult;
-  return `<section class="kangaroo-demo-card exchange-card" id="kangaroo-demo">
-    <div class="exchange-panel-heading"><div><span class="eyebrow">ALGORITHM LAB · BOUNDED DISCRETE LOG</span><h2>Pollard kangaroo</h2><p>Watch a toy tame/wild walk collide and recover a deliberately small test scalar.</p></div><span class="demo-mode-pill">SYNTHETIC TEST ONLY</span></div>
-    <div class="kangaroo-summary-grid"><div><span>TOY INTERVAL</span><b>100,000 — 1,100,000</b></div><div><span>PUBLIC POINT</span><b>Q = dG</b></div><div><span>WORK PROFILE</span><b>O(√N) · probabilistic</b></div></div>
-    <div class="kangaroo-steps"><div><i>01</i><span><b>Tame walk</b><small>Stores visited points from N·G.</small></span></div><div><i>02</i><span><b>Wild walk</b><small>Starts from Q − L·G and follows the same jumps.</small></span></div><div><i>03</i><span><b>Collision</b><small>Uses the distance difference, then verifies Q = dG.</small></span></div></div>
-    <div class="kangaroo-run-row"><button class="action-button kangaroo-run-button" id="run-kangaroo-demo" type="button" ${kangarooDemoBusy ? 'disabled' : ''}>${kangarooDemoBusy ? 'Running toy walk…' : result ? 'Run demo again' : 'Run kangaroo demo'}<span aria-hidden="true">↗</span></button><span class="kangaroo-run-note">No wallet addresses, transaction hashes, or user keys are used.</span></div>
-    ${kangarooDemoError ? `<p class="kangaroo-error" role="alert">${escapeHtml(kangarooDemoError)}</p>` : ''}
-    ${result ? `<div class="kangaroo-result"><div><span>RECOVERED TOY PRIVATE SCALAR</span><b>${BigInt(result.recovered).toLocaleString()}</b></div><div><span>TAME / WILD STEPS</span><b>${result.tameSteps.toLocaleString()} / ${result.wildSteps.toLocaleString()}</b></div><div><span>WALK RATE · NOT CANDIDATES/S</span><b>${Math.round(result.walkStepsPerSecond).toLocaleString()} steps/s</b></div><div><span>VERIFY Q = dG</span><b class="${result.verified ? 'verified' : 'unverified'}">${result.verified ? 'PASSED' : 'FAILED'}</b></div></div>
-      <div class="kangaroo-trace"><div class="trace-heading"><div><span class="eyebrow">RUN TRACE</span><h3>How the toy scalar was recovered</h3></div><span class="trace-result-chip">COLLISION FOUND</span></div><ol>
-        <li><i>01</i><div><b>Set the bounded interval</b><p><code>L = ${BigInt(result.lower).toLocaleString()}</code>, <code>U = ${BigInt(result.upper).toLocaleString()}</code>, so <code>N = U − L = ${BigInt(result.width).toLocaleString()}</code>.</p></div></li>
-        <li><i>02</i><div><b>Shift the target point</b><p>Compute <code>Q′ = Q − L·G</code>. This moves the unknown offset into <code>[0, N]</code>.</p><code class="trace-hex">${escapeHtml(result.shiftedTarget)}</code></div></li>
-        <li><i>03</i><div><b>Run the tame walk</b><p>Start at <code>T₀ = N·G</code>; interleave the tame and wild walks and record visited points and cumulative distances. The collision table stored the matching point at step ${result.collision.tameStep.toLocaleString()} with distance <code>t = ${BigInt(result.collision.tameDistance).toLocaleString()}</code>.</p></div></li>
-        <li><i>04</i><div><b>Run the wild walk</b><p>Start from <code>Q′</code>, choose the same deterministic jumps, and reach that point at step ${result.collision.wildStep.toLocaleString()} with distance <code>w = ${BigInt(result.collision.wildDistance).toLocaleString()}</code>.</p></div></li>
-        <li><i>05</i><div><b>Use the collision to solve for the scalar</b><p>At collision, <code>N + t = (d − L) + w</code>, therefore:</p><code class="trace-equation">d = L + N + t − w = ${BigInt(result.lower).toLocaleString()} + ${BigInt(result.width).toLocaleString()} + ${BigInt(result.collision.tameDistance).toLocaleString()} − ${BigInt(result.collision.wildDistance).toLocaleString()} = ${BigInt(result.recovered).toLocaleString()}</code></div></li>
-        <li><i>06</i><div><b>Verify the answer</b><p>Recompute <code>d·G</code> and compare it to <code>Q</code>: <strong class="${result.verified ? 'verified' : 'unverified'}">${result.verified ? 'MATCH' : 'NO MATCH'}</strong>. This recovered value is only the fixed synthetic demo scalar.</p></div></li>
-      </ol><details><summary>Show toy public point and collision</summary><div class="trace-point-pair"><code>Q = ${escapeHtml(result.targetPoint)}</code><code>collision = ${escapeHtml(result.collision.point)}</code></div></details></div>` : '<div class="kangaroo-placeholder"><span class="pulse-ring"></span><div><b>Demo ready</b><small>Run it to see a walk summary and the collision equation.</small></div></div>'}
-  </section>`;
-}
-
-function runKangarooDemoFromUi() {
-  kangarooDemoBusy = true;
-  kangarooDemoError = '';
-  render();
-  let worker;
-  const finish = (result, error) => {
-    worker?.terminate();
-    kangarooDemoResult = result?.verified && result.recovered ? result : null;
-    kangarooDemoError = error || (!kangarooDemoResult ? 'The toy walk did not find a verified result.' : '');
-    kangarooDemoBusy = false;
-    render();
-  };
+async function refreshPuzzleCampaignStatus() {
+  if (puzzleCampaignRequestInFlight) return;
+  puzzleCampaignRequestInFlight = true;
   try {
-    worker = new Worker(new URL('./kangaroo-worker.js', import.meta.url), { type: 'module' });
-    worker.onmessage = ({ data }) => finish(data.result, data.error);
-    worker.onerror = (error) => finish(null, error.message || 'The demo worker failed.');
-    worker.postMessage({});
-  } catch (error) {
-    finish(null, error?.message ?? String(error));
+    const response = await fetch('/api/puzzle-campaigns', { cache: 'no-store' });
+    if (!response.ok) throw new Error(`Campaign status HTTP ${response.status}`);
+    const snapshot = await response.json();
+    if (!snapshot || !Array.isArray(snapshot.campaigns)) throw new Error('Campaign status response is invalid.');
+    puzzleCampaignSnapshot = snapshot;
+    puzzleCampaignError = '';
+  } catch {
+    const hasSnapshot = puzzleCampaignSnapshot.campaigns.some((campaign) => !['LOADING', 'UNAVAILABLE'].includes(campaign.state));
+    puzzleCampaignError = hasSnapshot
+      ? 'Live refresh failed; showing the last available campaign snapshot.'
+      : 'Live campaign data requires the workspace UI server. A static deployment cannot read local campaign files.';
+    if (!hasSnapshot) puzzleCampaignSnapshot = createPuzzleCampaignSnapshot('UNAVAILABLE');
+  } finally {
+    puzzleCampaignRequestInFlight = false;
+    const content = document.querySelector('#campaign-status-content');
+    if (content) content.innerHTML = puzzleCampaignContentMarkup({ snapshot: puzzleCampaignSnapshot, error: puzzleCampaignError });
   }
 }
 
@@ -1072,7 +1054,7 @@ function render() {
     </section>`;
 
   app.innerHTML = `
-    <header class="topbar"><a class="brand" href="#overview" aria-label="Seedlab home"><span class="brand-mark">S</span><span>SEEDLAB<span class="brand-sub">/ EXCHANGE LAB</span></span></a><nav class="exchange-nav" aria-label="Main navigation"><a class="active" href="#overview">Overview</a><a href="#setup-card">Wallet lab</a><a href="#derivation-pipeline">Derivation</a><a href="#kangaroo-demo">Kangaroo demo</a><a href="#public-key-search">Public-key search</a><a href="#search-lab">Address search</a></nav><div class="topbar-meta"><span class="live-dot"></span><span>LOCAL SESSION</span><span class="network-chip">${activeNetwork.shortLabel}</span></div></header>
+    <header class="topbar"><a class="brand" href="#overview" aria-label="Seedlab home"><span class="brand-mark">S</span><span>SEEDLAB<span class="brand-sub">/ EXCHANGE LAB</span></span></a><nav class="exchange-nav" aria-label="Main navigation"><a class="active" href="#overview">Overview</a><a href="#setup-card">Wallet lab</a><a href="#derivation-pipeline">Derivation</a><a href="#campaign-status">Campaign status</a><a href="#public-key-search">Public-key search</a><a href="#search-lab">Address search</a></nav><div class="topbar-meta"><span class="live-dot"></span><span>LOCAL SESSION</span><span class="network-chip">${activeNetwork.shortLabel}</span></div></header>
     <main class="page-shell" id="overview">
       <div class="page-heading"><div><div class="eyebrow">WALLET ENGINE <span class="eyebrow-slash">/</span> DERIVATION & SEARCH</div><h1>Crypto Wallet Lab</h1><p>Explore address derivation, public-key recovery, and bounded-search algorithms in a trading-terminal style workspace.</p></div><div class="session-chip"><span class="session-dot"></span>${wallet.stage ? `DERIVATION ${String(Math.min(wallet.stage, 5)).padStart(2, '0')} / 05` : 'ENGINE READY'}</div></div>
       <div class="security-banner"><span class="alert-mark">!</span><p><strong>Public HTTP learning demo.</strong> The local derivation lab keeps secret values in this browser. The “Scan on server” upload sends your file to the server (S3 + Lambda) for scanning and is <strong>not</strong> stored permanently — only send test data, never real wallet secrets.</p></div>
@@ -1080,7 +1062,7 @@ function render() {
       <div class="layout-grid">
         <div class="lesson-column">
           <section class="setup-card" id="setup-card"><div class="setup-copy"><span class="eyebrow">START HERE</span><h2>Make a fresh demo wallet</h2><p>Uses browser cryptographic randomness. Nothing is saved or sent to EC2.</p></div><div class="setup-controls"><label for="network-select">Derive an address for</label><select id="network-select">${Object.entries(NETWORKS).map(([id, network]) => `<option value="${id}" ${selectedNetworkId === id ? 'selected' : ''}>${network.label}</option>`).join('')}</select><small class="network-note">Includes BTC Legacy, Nested SegWit, Native SegWit and Taproot; TRON; BNB Smart Chain (EVM) and BNB Beacon (BEP2).</small><label for="passphrase">Optional BIP-39 passphrase</label><input id="passphrase" type="password" autocomplete="new-password" placeholder="Leave blank for no passphrase" value="${passphrase.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;')}" ${wallet.stage ? 'disabled' : ''}><small>${wallet.stage ? 'Locked for this derivation; reset to change it.' : 'Case-sensitive. It creates a different wallet.'}</small><button class="action-button generate-button" id="generate">${wallet.stage ? 'Generate another demo wallet' : 'Generate demo wallet'}<span aria-hidden="true">↗</span></button></div></section>
-          ${kangarooDemoMarkup()}
+          ${puzzleCampaignStatusMarkup({ snapshot: puzzleCampaignSnapshot, error: puzzleCampaignError })}
           ${searchGuideMarkup()}
           ${recoveryMarkup()}
           ${puzzleGuideMarkup()}
@@ -1219,7 +1201,6 @@ function render() {
     } catch (error) { alert(error?.message ?? String(error)); }
   }));
   document.querySelector('#generate')?.addEventListener('click', generateWallet);
-  document.querySelector('#run-kangaroo-demo')?.addEventListener('click', runKangarooDemoFromUi);
   document.querySelector('#point-search-start')?.addEventListener('click', startPointSearch);
   document.querySelector('#run-gpu-benchmark')?.addEventListener('click', startGpuBenchmark);
   document.querySelector('#stop-gpu-benchmark')?.addEventListener('click', (event) => { event.target.disabled = true; event.target.textContent = 'Stopping…'; gpuBenchmarkWorker?.postMessage({ type: 'cancel' }); });
@@ -1811,3 +1792,5 @@ function resetWallet() {
 }
 
 render();
+refreshPuzzleCampaignStatus();
+setInterval(refreshPuzzleCampaignStatus, 1000);
