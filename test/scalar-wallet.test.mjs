@@ -8,11 +8,12 @@ const privateKeyFor = (scalar) => `0x${scalar.toString(16).padStart(64, '0')}`;
 const derive = (scalar) => ({ address: `address-${scalar}`, privateKey: privateKeyFor(scalar) });
 
 test('batch range is inclusive and capped to keep browser generation bounded', () => {
-  assert.equal(parseScalarBatchRange('1', '10000').count, 10000n);
+  assert.equal(parseScalarBatchRange('1', '50000').count, 50000n);
+  assert.equal(parseScalarBatchRange('10000000000', '10000010000').count, 10001n);
   assert.equal(parseScalarBatchRange('7', '7').count, 1n);
-  assert.throws(() => parseScalarBatchRange('1', '10001'), /at most 10,000/);
+  assert.throws(() => parseScalarBatchRange('1', '50001'), /at most 50,000/);
   assert.throws(() => parseScalarBatchRange('0', '10'));
-  assert.equal(MAX_SCALAR_BATCH_SIZE, 10000);
+  assert.equal(MAX_SCALAR_BATCH_SIZE, 50000);
 });
 
 test('generates every scalar in order as headerless address/private-key rows', async () => {

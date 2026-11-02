@@ -1,6 +1,6 @@
 import { parseSearchRange } from './search-range.js';
 
-export const MAX_SCALAR_BATCH_SIZE = 10_000;
+export const MAX_SCALAR_BATCH_SIZE = 50_000;
 
 export function parseScalarBatchRange(lower, upper) {
   const range = parseSearchRange(lower, upper);
