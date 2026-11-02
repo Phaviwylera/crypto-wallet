@@ -3,6 +3,7 @@ import { normalizeZ } from '@noble/curves/abstract/curve.js';
 import { keccak_256 } from '@noble/hashes/sha3.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 import { parseSearchRange, MAX_SEARCH_SCALAR } from './search-range.js';
+import { matchesBitcoinAddress } from './bitcoin-public-key.js';
 
 const Point = secp256k1.Point;
 export const MAX_PRIVATE_SCALAR = MAX_SEARCH_SCALAR;
@@ -20,14 +21,14 @@ export function parsePublicKeyFile(text) {
     const cols = line.split('\t').map((value) => value.trim());
     if (index === 0 && cols[0].toLowerCase() === 'address') continue;
     const [address, transactionHash, publicKey, status] = cols;
-    if (cols.length !== 4 || !/^0x[0-9a-f]{40}$/i.test(address) || !/^0x[0-9a-f]{64}$/i.test(transactionHash) || !/^0x04[0-9a-f]{128}$/i.test(publicKey) || status?.toLowerCase() !== 'ok') {
+    if (cols.length !== 4 || !(/^0x[0-9a-f]{40}$/i.test(address) || /^(?:1|3|bc1q)[a-zA-Z0-9]{20,90}$/.test(address)) || !/^0x[0-9a-f]{64}$/i.test(transactionHash) || !/^0x04[0-9a-f]{128}$/i.test(publicKey) || status?.toLowerCase() !== 'ok') {
       throw new Error(`Line ${index + 1}: expected address, transaction_hash, uncompressed public key, and status ok, separated by tabs.`);
     }
     let point;
     try { point = Point.fromBytes(Uint8Array.from(publicKey.slice(2).match(/../g), (part) => parseInt(part, 16))); }
     catch { throw new Error(`Line ${index + 1}: invalid secp256k1 public key.`); }
     const derived = bytesToHex(keccak_256(point.toBytes(false).slice(1)).slice(12));
-    if (derived !== address.slice(2).toLowerCase()) throw new Error(`Line ${index + 1}: public key does not match address.`);
+    if (address.startsWith('0x') ? derived !== address.slice(2).toLowerCase() : !matchesBitcoinAddress(address, point)) throw new Error(`Line ${index + 1}: public key does not match address.`);
     targets.push({ address, transactionHash, publicKey, point });
     if (targets.length > MAX_TARGETS) throw new Error(`Maximum ${MAX_TARGETS.toLocaleString()} rows per file.`);
   }
