@@ -10,7 +10,7 @@
     "server": "node server/index.js",
     "server:build": "node server/index.js",
     "test:scan": "node server/test.mjs",
-    "test:search": "node --test test/search.test.mjs test/public-key-search.test.mjs test/public-key-search-pool.test.mjs test/input-focus.test.mjs test/webgpu-lookup.test.mjs test/range-planner.test.mjs test/bitcoin-public-key.test.mjs test/bitcoin-puzzles.test.mjs test/batch-files.test.mjs test/recovery-batch.test.mjs test/puzzle-status-server.test.mjs test/puzzle-campaigns.test.mjs"
+    "test:search": "node --test test/search.test.mjs test/public-key-search.test.mjs test/public-key-search-pool.test.mjs test/input-focus.test.mjs test/webgpu-lookup.test.mjs test/range-planner.test.mjs test/bitcoin-public-key.test.mjs test/bitcoin-puzzles.test.mjs test/batch-files.test.mjs test/recovery-batch.test.mjs test/puzzle-status-server.test.mjs test/puzzle-campaigns.test.mjs test/scalar-wallet.test.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.645.0",

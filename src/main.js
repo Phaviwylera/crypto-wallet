@@ -19,6 +19,7 @@ import { bitcoinPuzzlePointSearchText, createBitcoinPuzzleMatchExport } from './
 import { MAX_BATCH_FILE_BYTES, parseAddressBatch, parseRecoveryBatch, publicKeyResultsTsv } from './batch-files.js';
 import { runRecoveryBatch } from './recovery-batch.js';
 import { createPuzzleCampaignSnapshot, puzzleCampaignContentMarkup, puzzleCampaignStatusMarkup } from './puzzle-campaigns.js';
+import { randomScalarInRange, scalarWalletExport } from './scalar-wallet.js';
 import './style.css';
 
 const app = document.querySelector('#app');
@@ -36,6 +37,7 @@ let selectedNetworkId = 'ethereum';
 const SEARCH_WORKER_CHUNK = 256;
 let searchLower = '1';
 let searchUpper = '10000';
+let boundedWallet = { result: null, error: '' };
 const selectedNetwork = () => NETWORKS[selectedNetworkId];
 let wallet = freshWallet();
 let passphrase = '';
@@ -802,6 +804,46 @@ async function recoverBatchPublicKeys() {
   }
 }
 
+function boundedWalletGeneratorMarkup() {
+  const result = boundedWallet.result;
+  return `<div class="public-key-extract-panel bounded-wallet-panel" id="bounded-wallet-generator">
+    <strong>Random private key + address within these bounds</strong>
+    <p>Uses the inclusive lower/upper fields above and ${escapeHtml(selectedNetwork().label)}. Web Crypto samples uniformly within the interval; nothing is uploaded or persisted automatically. Small or known intervals can be brute-forced—use bounded keys for testing/recovery only, not real funds.</p>
+    <div class="dlog-actions"><button class="search-file-button" id="generate-bounded-wallet" type="button">Generate key + address</button>${result ? '<button class="search-file-button" id="download-bounded-wallet" type="button">Download private key + address TXT</button>' : ''}</div>
+    ${boundedWallet.error ? `<p class="search-file-error" role="alert">${escapeHtml(boundedWallet.error)}</p>` : ''}
+    ${result ? `<div class="dlog-live-progress bounded-wallet-result" aria-live="polite"><b>Generated locally · ${escapeHtml(result.networkLabel)}</b><p>Inclusive range: <code>${escapeHtml(result.lower)}</code> – <code>${escapeHtml(result.upper)}</code></p><label>Private scalar · decimal</label><code class="dlog-address-value">${escapeHtml(result.scalar)}</code><label>Private key · 32-byte hex</label><code class="dlog-address-value">${escapeHtml(result.privateKey)}</code><label>Derived address</label><code class="dlog-address-value">${escapeHtml(result.address)}</code><p><strong>Sensitive:</strong> the TXT controls this address. Anyone with the private key can spend its funds.</p></div>` : ''}
+  </div>`;
+}
+
+function generateBoundedWallet() {
+  try {
+    const range = parseSearchRange(searchLower.trim(), searchUpper.trim());
+    const scalar = randomScalarInRange(searchLower.trim(), searchUpper.trim());
+    const privateKeyBytes = bigIntToBytes(scalar);
+    try {
+      const privateKey = `0x${hex(privateKeyBytes)}`;
+      const derived = calculateAddressData(privateKeyBytes);
+      boundedWallet = {
+        error: '',
+        result: {
+          networkId: selectedNetworkId,
+          networkLabel: selectedNetwork().label,
+          lower: range.start.toString(),
+          upper: range.end.toString(),
+          scalar: scalar.toString(),
+          privateKey,
+          address: derived.address,
+        },
+      };
+    } finally {
+      privateKeyBytes.fill(0);
+    }
+  } catch (error) {
+    boundedWallet = { result: null, error: error?.message ?? String(error) };
+  }
+  render();
+}
+
 function searchGuideMarkup() {
   return `<section class="backward-panel dlog-panel" id="search-guide"><span class="eyebrow">SEARCH WORKSPACE</span><h3>Choose network → address type → method</h3><div class="point-worker-control"><label for="search-network-select">Network and address type</label><select id="search-network-select" ${discreteLogProgress ? 'disabled' : ''}>${Object.entries(NETWORKS).map(([id, network]) => `<option value="${id}" ${selectedNetworkId === id ? 'selected' : ''}>${network.label}</option>`).join('')}</select><small>Curve: secp256k1 · ${escapeHtml(addressCaption())}. USDT follows its underlying network; not all networks use this curve. This choice also updates the wallet lab and bounded address search.</small></div><div class="dlog-actions"><a class="search-file-button" href="#search-lab">Address search</a><a class="search-file-button" href="#key-recovery">Find public key</a><a class="search-file-button" href="#public-key-search">Public-key BSGS</a><a class="search-file-button" href="#puzzle-guide">Puzzle catalog</a></div><p class="step-explanation">Every real search workflow supports batch text input: address lists on every network, Ethereum/Bitcoin public-key recovery, public-key BSGS, and the existing server scan. Address search checks candidates against all loaded targets. BSGS needs verified points and a bounded interval; GPU assists lookups only. These methods do not make full-range wallet recovery practical.</p></section>`;
 }
@@ -1046,6 +1088,7 @@ function render() {
       ${searchAddressFile?.addresses?.length ? `<ul class="search-target-preview">${searchAddressFile.addresses.slice(0, 25).map((address, index) => `<li><b>${index + 1}.</b> <code>${escapeHtml(address)}</code></li>`).join('')}${searchAddressFile.addresses.length > 25 ? `<li>… and ${(searchAddressFile.addresses.length - 25).toLocaleString()} more validated addresses</li>` : ''}</ul>` : ''}
       ${searchAddressFile?.transactions?.length ? `<div class="public-key-extract-panel"><label for="ethereum-rpc-endpoint">Ethereum JSON-RPC endpoint</label><input id="ethereum-rpc-endpoint" type="url" value="${escapeHtml(ethereumRpcEndpoint)}" spellcheck="false"><small>Extracts signer public keys from outgoing transactions. The transaction hashes are sent to this RPC provider; private keys are never requested.</small><button class="search-file-button" id="extract-public-keys" type="button">Extract public keys and download TXT</button><p id="public-key-extraction-status" role="status" aria-live="polite"></p></div>` : ''}
       <div class="candidate-range"><label>Lower scalar (inclusive)<input id="search-lower" type="text" inputmode="numeric" value="${escapeHtml(searchLower)}"></label><label>Upper scalar (inclusive)<input id="search-upper" type="text" inputmode="numeric" value="${escapeHtml(searchUpper)}"></label></div>
+      ${boundedWalletGeneratorMarkup()}
       <p class="step-explanation subtle">You can edit bounds during a run; changes apply to the next search. Current run bounds remain unchanged.</p>
       <div class="dlog-warning"><strong>Bounded test only—not wallet recovery.</strong> Only a match in the chosen interval can be found; a miss says nothing about other scalars. Even a small-looking range can take a long time. Pollard kangaroo requires a public point and a known interval; it cannot search an address hash. One million candidates per second is not guaranteed; the actual rate depends on the device.</div>
       <div class="dlog-actions"><button class="action-button dlog-button" id="run-dlog-lab" type="button" ${discreteLogProgress ? 'disabled' : ''}>${searchButtonLabel}<span aria-hidden="true">↗</span></button>${discreteLogProgress ? `<button class="dlog-stop-button" id="stop-search" type="button">${discreteLogProgress.stopping ? 'Stopping after current chunks…' : 'Stop search'}</button>` : ''}</div>
@@ -1272,6 +1315,11 @@ function render() {
   });
   document.querySelector('#search-lower')?.addEventListener('input', (event) => { searchLower = event.target.value; });
   document.querySelector('#search-upper')?.addEventListener('input', (event) => { searchUpper = event.target.value; });
+  document.querySelector('#generate-bounded-wallet')?.addEventListener('click', generateBoundedWallet);
+  document.querySelector('#download-bounded-wallet')?.addEventListener('click', () => {
+    const result = boundedWallet.result;
+    if (result) exportTextFile(`bounded-scalar-wallet-${result.networkId}.txt`, scalarWalletExport(result));
+  });
   document.querySelector('#run-dlog-lab')?.addEventListener('click', runDiscreteLogLab);
   document.querySelector('#stop-search')?.addEventListener('click', requestSearchStop);
   document.querySelector('#lab-address')?.addEventListener('input', (event) => {
@@ -1312,6 +1360,7 @@ function selectNetwork(event) {
   searchAddressFile = null;
   selectedNetworkId = event.target.value;
   discreteLogResult = null;
+  boundedWallet = { result: null, error: '' };
   labAddressInput = null;
   copied = new Set();
   if (wallet.stage >= 4) {
@@ -1786,6 +1835,7 @@ function resetWallet() {
   passphrase = '';
   backwardOpen = false;
   discreteLogResult = null;
+  boundedWallet = { result: null, error: '' };
   labAddressInput = null;
   copied = new Set();
   render();
