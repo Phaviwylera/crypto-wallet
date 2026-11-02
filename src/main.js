@@ -14,6 +14,8 @@ import { createPublicKeySearchPool } from './public-key-search-pool.js';
 import { createGpuBridgeHost } from './webgpu-bridge.js';
 import { planRange, rangeForBitLength } from './range-planner.js';
 import { lookupBitcoinPublicKey } from './bitcoin-public-key.js';
+import { BITCOIN_PUZZLES, BITCOIN_PUZZLE_SOURCE, bitcoinPuzzleCatalogTsv, getBitcoinPuzzle, getBitcoinPuzzleByAddress } from './bitcoin-puzzles.js';
+import { bitcoinPuzzlePointSearchText, createBitcoinPuzzleMatchExport } from './bitcoin-puzzle-match.js';
 import './style.css';
 
 const app = document.querySelector('#app');
@@ -44,6 +46,7 @@ let searchRenderTimer = null;
 let labAddressInput = null;
 let searchAddressFile = null;
 let keyRecovery = { network: 'ethereum', address: '', tx: '', busy: false, result: null, error: '' };
+let puzzleCatalog = { selectedId: 71, filter: 'unsolved' };
 let ethereumRpcEndpoint = 'https://ethereum-rpc.publicnode.com';
 let rangePlanner = { bits: '', targets: '1', rate: '', error: '' };
 let pointSearch = { fileName: '', text: '', lower: '1', upper: '1000000', workers: 'auto', backend: 'cpu', busy: false, count: 0, progress: null, result: null, error: '' };
@@ -348,6 +351,12 @@ function stepCard({ number, title, caption, step, body, action }) {
 }
 
 
+function puzzleMatchActions(puzzleId, scalar, publicKey) {
+  if (!puzzleId || !scalar || !publicKey) return '';
+  const data = `data-puzzle-id="${puzzleId}" data-scalar="${escapeHtml(scalar)}" data-public-key="${escapeHtml(publicKey)}"`;
+  return `<div class="dlog-actions"><button class="search-file-button" type="button" data-puzzle-match-action="download" ${data}>Download verified puzzle match</button><button class="search-file-button" type="button" data-puzzle-match-action="copy" ${data}>Copy match instead</button></div>`;
+}
+
 function searchResultMarkup(result, network) {
   if (!result) return '<p class="dlog-placeholder">Enter an address or public key and search a bounded test range.</p>';
   if (result.status === 'invalid') return `<div class="dlog-warning result-error"><strong>Invalid ${network.label} input.</strong> ${escapeHtml(result.reason)}</div>`;
@@ -359,7 +368,7 @@ function searchResultMarkup(result, network) {
     ? `Match found at scalar d=${result.foundScalar}; it matches target ${result.matchTargetIndex + 1} of ${targets.length}.`
     : `No match for any of the ${targets.length} target${targets.length === 1 ? '' : 's'} in the complete interval ${result.startScalar.toLocaleString()}–${result.endScalar.toLocaleString()}.`;
   const targetList = targets.map((target, index) => `<li><b>${index + 1}.</b> <code>${escapeHtml(target.display)}</code>${result.foundScalar && index === result.matchTargetIndex ? ' <strong>← MATCH</strong>' : ''}</li>`).join('');
-  return `<div class="dlog-results"><div><label>INPUT · ${targets.length} ${targets.length === 1 ? 'ADDRESS TARGET' : 'ADDRESS TARGETS'}</label><ul class="search-target-list">${targetList}</ul>${targets.length === 1 ? `<div class="hash-byte-grid address-byte-grid">${byteGrid(targets[0].bytes)}</div>${networkAddressDetails(targets[0], network)}` : '<p>Every candidate was checked against all loaded addresses in the same pass.</p>'}</div><div><label>RESULT · ${result.foundScalar ? 'MATCH' : 'FULL RANGE TESTED'}</label><p>${matchText}</p><p>${result.totalTested.toLocaleString()} candidates checked · ${result.elapsedMs.toFixed(1)} ms · ${result.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second across ${result.workers} workers.</p><p>${result.foundScalar ? `Matching public key: <code class="dlog-address-value">${result.foundPublicKey}</code>` : 'This excludes only the tested scalar interval; it does not recover or rule out keys outside it.'}</p><p>This bounded test is not a practical real-wallet recovery method.</p></div></div>`;
+  return `<div class="dlog-results"><div><label>INPUT · ${targets.length} ${targets.length === 1 ? 'ADDRESS TARGET' : 'ADDRESS TARGETS'}</label><ul class="search-target-list">${targetList}</ul>${targets.length === 1 ? `<div class="hash-byte-grid address-byte-grid">${byteGrid(targets[0].bytes)}</div>${networkAddressDetails(targets[0], network)}` : '<p>Every candidate was checked against all loaded addresses in the same pass.</p>'}</div><div><label>RESULT · ${result.foundScalar ? 'MATCH' : 'FULL RANGE TESTED'}</label><p>${matchText}</p><p>${result.totalTested.toLocaleString()} candidates checked · ${result.elapsedMs.toFixed(1)} ms · ${result.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second across ${result.workers} workers.</p><p>${result.foundScalar ? `Matching public key: <code class="dlog-address-value">${result.foundPublicKey}</code>` : 'This excludes only the tested scalar interval; it does not recover or rule out keys outside it.'}</p>${result.foundScalar && result.puzzleId ? `<p><b>Published Bitcoin puzzle #${result.puzzleId} match.</b> Export re-verifies the scalar, public key and P2PKH address. No balance was checked.</p>${puzzleMatchActions(result.puzzleId, result.foundScalar, result.foundPublicKey)}` : ''}<p>This bounded test is not a practical real-wallet recovery method.</p></div></div>`;
 }
 
 function scanCardMarkup() {
@@ -599,7 +608,11 @@ function pointSearchStatusMarkup() {
   }
   if (!result) return '<p class="dlog-placeholder">Upload an exported public-key TXT to begin.</p>';
   const cancelled = result.status === 'cancelled';
-  const matches = result.matches.map((match) => `<li><strong>${escapeHtml(match.address)}</strong><br>Decimal scalar: <code>${escapeHtml(match.scalar)}</code><br>Collision point: <code>${escapeHtml(match.collisionPoint)}</code><br>Baby step ${match.babyStep}; giant step ${match.giantStep} · Q = dG verified</li>`).join('');
+  const matches = result.matches.map((match) => {
+    const puzzle = getBitcoinPuzzleByAddress(match.address);
+    const puzzleExport = puzzle?.publicKey ? `<p>Published Bitcoin puzzle #${puzzle.id} match · no balance checked.</p>${puzzleMatchActions(puzzle.id, match.scalar, `0x${puzzle.publicKey}`)}` : '';
+    return `<li><strong>${escapeHtml(match.address)}</strong><br>Decimal scalar: <code>${escapeHtml(match.scalar)}</code><br>Collision point: <code>${escapeHtml(match.collisionPoint)}</code><br>Baby step ${match.babyStep}; giant step ${match.giantStep} · Q = dG verified${puzzleExport}</li>`;
+  }).join('');
   return `<div class="dlog-live-progress" role="status"><b>${cancelled ? 'Stopped — partial search' : 'Complete'} · ${result.matches.length} verified match(es)</b><p>${result.completed.toLocaleString()} / ${result.total.toLocaleString()} giant-step slots · ${result.targetCount.toLocaleString()} targets · ${result.workers ?? 0} workers · ${result.cpuWorkers ?? 0} CPU-only + ${result.gpuWorkers ?? 0} WebGPU-assisted · interval ${escapeHtml(result.lower)}–${escapeHtml(result.upper)} · ${(result.elapsedMs / 1000).toFixed(1)} seconds.</p><p>${cancelled ? 'No conclusions can be drawn about unsearched steps.' : 'A miss rules out only this interval for the supplied public keys.'}</p>${matches ? `<p>Matching scalars are sensitive private-key material. Do not share them.</p><ul class="point-matches">${matches}</ul>` : ''}</div>`;
 }
 
@@ -710,18 +723,37 @@ async function recoverSinglePublicKey() {
 }
 
 function searchGuideMarkup() {
-  return `<section class="backward-panel dlog-panel" id="search-guide"><span class="eyebrow">SEARCH WORKSPACE</span><h3>Choose network → address type → method</h3><div class="point-worker-control"><label for="search-network-select">Network and address type</label><select id="search-network-select" ${discreteLogProgress ? 'disabled' : ''}>${Object.entries(NETWORKS).map(([id, network]) => `<option value="${id}" ${selectedNetworkId === id ? 'selected' : ''}>${network.label}</option>`).join('')}</select><small>Curve: secp256k1 · ${escapeHtml(addressCaption())}. USDT follows its underlying network; not all networks use this curve. This choice also updates the wallet lab and bounded address search.</small></div><div class="dlog-actions"><a class="search-file-button" href="#search-lab">Address search</a><a class="search-file-button" href="#key-recovery">Find public key</a><a class="search-file-button" href="#public-key-search">Public-key BSGS</a><a class="search-file-button" href="#puzzle-guide">Puzzle range</a></div><p class="step-explanation">Address search checks candidate addresses. Public-key BSGS needs a verified point and a bounded interval; GPU assists lookups only. Ethereum and supported Bitcoin spending keys can be extracted below. The methods do not make full-range wallet recovery practical.</p></section>`;
+  return `<section class="backward-panel dlog-panel" id="search-guide"><span class="eyebrow">SEARCH WORKSPACE</span><h3>Choose network → address type → method</h3><div class="point-worker-control"><label for="search-network-select">Network and address type</label><select id="search-network-select" ${discreteLogProgress ? 'disabled' : ''}>${Object.entries(NETWORKS).map(([id, network]) => `<option value="${id}" ${selectedNetworkId === id ? 'selected' : ''}>${network.label}</option>`).join('')}</select><small>Curve: secp256k1 · ${escapeHtml(addressCaption())}. USDT follows its underlying network; not all networks use this curve. This choice also updates the wallet lab and bounded address search.</small></div><div class="dlog-actions"><a class="search-file-button" href="#search-lab">Address search</a><a class="search-file-button" href="#key-recovery">Find public key</a><a class="search-file-button" href="#public-key-search">Public-key BSGS</a><a class="search-file-button" href="#puzzle-guide">Puzzle catalog</a></div><p class="step-explanation">Address search checks candidate addresses. Public-key BSGS needs a verified point and a bounded interval; GPU assists lookups only. Ethereum and supported Bitcoin spending keys can be extracted below. The methods do not make full-range wallet recovery practical.</p></section>`;
+}
+
+function filteredBitcoinPuzzles() {
+  if (puzzleCatalog.filter === 'solved') return BITCOIN_PUZZLES.filter((puzzle) => puzzle.status === 'solved');
+  if (puzzleCatalog.filter === 'public-key') return BITCOIN_PUZZLES.filter((puzzle) => puzzle.publicKey);
+  if (puzzleCatalog.filter === 'all') return BITCOIN_PUZZLES;
+  return BITCOIN_PUZZLES.filter((puzzle) => puzzle.status === 'unsolved');
 }
 
 function puzzleGuideMarkup() {
-  return `<section class="backward-panel dlog-panel" id="puzzle-guide"><span class="eyebrow">PUBLISHED PUZZLE · RANGE EXAMPLE</span><h3>Bitcoin puzzle #71</h3><p class="step-explanation">Published target <code>1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU</code>, with inclusive range 2<sup>70</sup> to 2<sup>71</sup> − 1. <a href="https://thepuzzle.cloud/" target="_blank" rel="noopener noreferrer">Puzzle reference ↗</a> Verify its current status separately. The address alone does not reveal its public key; it cannot be used as a BSGS point unless a matching key is published or revealed by a suitable spend. Its range is far too large for a practical full address scan on a phone.</p><button class="search-file-button" id="apply-puzzle-71" type="button" ${discreteLogProgress ? 'disabled' : ''}>Apply #71 to address search</button></section>`;
+  const puzzle = getBitcoinPuzzle(puzzleCatalog.selectedId);
+  const puzzles = filteredBitcoinPuzzles();
+  const solvedCount = BITCOIN_PUZZLES.filter((entry) => entry.status === 'solved').length;
+  const unsolvedKeyCount = BITCOIN_PUZZLES.filter((entry) => entry.status === 'unsolved' && entry.publicKey).length;
+  return `<section class="backward-panel dlog-panel" id="puzzle-guide">
+    <div class="backward-heading"><div><span class="eyebrow">PUBLISHED PUZZLES · SOURCE-SNAPSHOT</span><h3>Bitcoin Puzzle catalog</h3></div><span class="live-example">160 PUBLISHED RANGES</span></div>
+    <p class="step-explanation">All 160 active entries from the published series: <b>${solvedCount} solved</b> and <b>${BITCOIN_PUZZLES.length - solvedCount} unsolved</b> in this source snapshot. <a href="${BITCOIN_PUZZLE_SOURCE.url}" target="_blank" rel="noopener noreferrer">Source data ↗</a> commit dated ${BITCOIN_PUZZLE_SOURCE.commitDate}, retrieved ${BITCOIN_PUZZLE_SOURCE.retrievedDate}. These labels are not live balance checks.</p>
+    <div class="candidate-range"><label>Catalog filter<select id="puzzle-filter"><option value="unsolved" ${puzzleCatalog.filter === 'unsolved' ? 'selected' : ''}>Unsolved in snapshot (${BITCOIN_PUZZLES.length - solvedCount})</option><option value="solved" ${puzzleCatalog.filter === 'solved' ? 'selected' : ''}>Solved in snapshot (${solvedCount})</option><option value="public-key" ${puzzleCatalog.filter === 'public-key' ? 'selected' : ''}>Published public key</option><option value="all" ${puzzleCatalog.filter === 'all' ? 'selected' : ''}>All 160</option></select></label><label>Puzzle<select id="puzzle-select">${puzzles.map((entry) => `<option value="${entry.id}" ${entry.id === puzzle.id ? 'selected' : ''}>#${entry.id} · ${entry.status} · ${entry.publicKey ? 'public key' : 'address only'}</option>`).join('')}</select></label></div>
+    <div class="dlog-live-progress"><b>Puzzle #${puzzle.id} · ${puzzle.status} in source snapshot</b><p>Legacy P2PKH address: <code class="dlog-address-value">${puzzle.address}</code></p><p>Inclusive scalar bounds (2<sup>${puzzle.id - 1}</sup> through 2<sup>${puzzle.id}</sup> − 1):</p><code class="dlog-address-value">${puzzle.lower}<br>to<br>${puzzle.upper}</code><p>${puzzle.publicKey ? `Published compressed public key: <code class="dlog-address-value">${puzzle.publicKey}</code>` : 'No public key is listed in this snapshot. The address alone cannot be used as a BSGS point.'}</p></div>
+    <div class="dlog-actions"><button class="search-file-button" id="apply-puzzle" type="button" ${discreteLogProgress ? 'disabled' : ''}>Apply #${puzzle.id} to address search</button>${puzzle.publicKey ? `<button class="search-file-button" id="use-puzzle-key" type="button" ${pointSearch.busy || gpuBenchmark.busy ? 'disabled' : ''}>Load #${puzzle.id} key into BSGS</button>` : ''}<button class="search-file-button" id="copy-puzzle-record" type="button">Copy public record</button></div>
+    <div class="dlog-actions"><button class="search-file-button" id="download-puzzle-catalog" type="button">Download public catalog TSV</button><button class="search-file-button" id="copy-puzzle-catalog" type="button">Copy catalog instead</button></div>
+    <p class="step-explanation">Applying a puzzle fills its target and published bounds but never starts a search. A bound narrows only that puzzle’s interval; large intervals remain impractical. ${unsolvedKeyCount} unsolved entries include a public key in this snapshot. The catalog contains no private keys. A verified match can be copied or downloaded from search results; no candidate-key list or unrelated-wallet balance scan is produced.</p>
+  </section>`;
 }
 
 function pointSearchMarkup() {
   return `<section class="backward-panel dlog-panel" id="public-key-search">
     <div class="backward-heading"><div><span class="eyebrow">PUBLIC-KEY SEARCH · LOCAL ONLY</span><h3>Search uploaded Ethereum or Bitcoin public keys</h3></div><span class="live-example">PARALLEL BSGS</span></div>
     <p class="backward-intro">Upload the tab-separated TXT exported by “Extract public keys”. This uses parallel baby-step giant-step (BSGS), not kangaroo, to search every validated public point in the same inclusive interval. Workers share the targets; each uses its own table. The file stays in this browser.</p>
-    <div class="search-file-row"><div class="search-file-copy"><strong>Ethereum / Bitcoin public-key TXT</strong><small>Columns: address, transaction_hash, public_key_uncompressed, status; tab separated, status ok. Up to 10,000 rows and 5 MB. All rows must validate. Bitcoin P2PKH, P2WPKH and P2SH-P2WPKH only.</small></div><label class="search-file-button ${pointSearch.busy ? 'is-disabled' : ''}" for="point-search-file">Choose TXT</label><input id="point-search-file" type="file" accept=".txt,text/plain,.tsv,text/tab-separated-values" hidden ${pointSearch.busy ? 'disabled' : ''}><span class="search-file-name">${escapeHtml(pointSearch.fileName || 'No file selected')}</span></div>
+    <div class="search-file-row"><div class="search-file-copy"><strong>Ethereum / Bitcoin public-key TXT</strong><small>Columns: address, transaction_hash, public_key_uncompressed, status; tab separated, status ok. Catalog-loaded keys use published-catalog instead of a transaction hash. Up to 10,000 rows and 5 MB. All rows must validate. Bitcoin P2PKH, P2WPKH and P2SH-P2WPKH only.</small></div><label class="search-file-button ${pointSearch.busy ? 'is-disabled' : ''}" for="point-search-file">Choose TXT</label><input id="point-search-file" type="file" accept=".txt,text/plain,.tsv,text/tab-separated-values" hidden ${pointSearch.busy ? 'disabled' : ''}><span class="search-file-name">${escapeHtml(pointSearch.fileName || 'No file selected')}</span></div>
     <div class="candidate-range"><label>Lower scalar (inclusive)<input id="point-search-lower" type="text" inputmode="numeric" value="${escapeHtml(pointSearch.lower)}"></label><label>Upper scalar (inclusive)<input id="point-search-upper" type="text" inputmode="numeric" value="${escapeHtml(pointSearch.upper)}"></label></div>
     <div class="gpu-benchmark-panel"><span class="eyebrow">EVIDENCE-BASED RANGE PLANNER</span><h3>Understand your search range</h3><p>Use bounds supported by evidence, such as a published puzzle range. A public key does not reveal its private scalar’s bit length. No region is more likely for a uniformly random key.</p><div class="candidate-range"><label>Known exact bit length (optional)<input id="planner-bits" type="number" min="1" max="256" value="${escapeHtml(rangePlanner.bits)}" placeholder="e.g. 20"></label><label>Estimated target count<input id="planner-targets" type="number" min="1" max="10000" value="${escapeHtml(rangePlanner.targets)}"></label><label>Measured search slots/second (optional)<input id="planner-rate" type="number" min="0" value="${escapeHtml(rangePlanner.rate)}" placeholder="From a prior search"></label></div><div class="dlog-actions"><button class="search-file-button" id="planner-apply-bits" type="button">Apply bit-length bounds</button></div><p id="range-planner-error" class="kangaroo-error" role="alert">${escapeHtml(rangePlanner.error)}</p><div id="range-planner-output" aria-live="polite">${rangePlannerOutput()}</div></div>
     <div class="point-worker-control"><label for="point-search-backend">Compute mode</label><select id="point-search-backend" ${pointSearch.busy ? 'disabled' : ''}><option value="cpu" ${pointSearch.backend === 'cpu' ? 'selected' : ''}>CPU only</option><option value="webgpu-high" ${pointSearch.backend === 'webgpu-high' ? 'selected' : ''}>WebGPU · high-performance preference</option><option value="webgpu-low" ${pointSearch.backend === 'webgpu-low' ? 'selected' : ''}>WebGPU · low-power preference</option><option value="hybrid-high" ${pointSearch.backend === 'hybrid-high' ? 'selected' : ''}>Hybrid CPU + WebGPU · high-performance preference</option><option value="hybrid-low" ${pointSearch.backend === 'hybrid-low' ? 'selected' : ''}>Hybrid CPU + WebGPU · low-power preference</option></select><small>Experimental: GPU performs collision table lookups; CPU performs curve math and checks every GPU result. May be slower than CPU-only. Requires WebGPU in a secure context; if unavailable in a worker, the app checks the browser window. Adapter preference does not guarantee a specific GPU. Hybrid divides keys among CPU and WebGPU-assisted workers; it requires at least 2 workers and 2 keys. WebGPU-assisted groups use at most 2 workers. Full GPU elliptic-curve arithmetic is not implemented.</small></div>
@@ -1011,12 +1043,55 @@ function render() {
     pointSearch.fileName = 'Verified extracted key'; pointSearch.result = null; pointSearch.error = '';
     render(); document.querySelector('#public-key-search')?.scrollIntoView({ behavior: 'smooth' });
   });
-  document.querySelector('#apply-puzzle-71')?.addEventListener('click', () => {
+  document.querySelector('#puzzle-filter')?.addEventListener('change', (event) => {
+    puzzleCatalog.filter = event.target.value;
+    const puzzles = filteredBitcoinPuzzles();
+    if (!puzzles.some((puzzle) => puzzle.id === puzzleCatalog.selectedId)) puzzleCatalog.selectedId = puzzles[0].id;
+    render();
+  });
+  document.querySelector('#puzzle-select')?.addEventListener('change', (event) => { puzzleCatalog.selectedId = Number(event.target.value); render(); });
+  document.querySelector('#apply-puzzle')?.addEventListener('click', () => {
     if (discreteLogProgress) return;
+    const puzzle = getBitcoinPuzzle(puzzleCatalog.selectedId);
     selectNetwork({ target: { value: 'bitcoinLegacy' } });
-    labAddressInput = '1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU'; searchLower = (1n << 70n).toString(); searchUpper = ((1n << 71n) - 1n).toString();
+    labAddressInput = puzzle.address; searchLower = puzzle.lower; searchUpper = puzzle.upper;
     render(); document.querySelector('#search-lab')?.scrollIntoView({ behavior: 'smooth' });
   });
+  document.querySelector('#use-puzzle-key')?.addEventListener('click', () => {
+    if (pointSearch.busy || gpuBenchmark.busy) return;
+    const puzzle = getBitcoinPuzzle(puzzleCatalog.selectedId);
+    try {
+      pointSearch.text = bitcoinPuzzlePointSearchText(puzzle.id);
+      pointSearch.fileName = `Bitcoin puzzle #${puzzle.id} · published key`;
+      pointSearch.lower = puzzle.lower; pointSearch.upper = puzzle.upper;
+      pointSearch.result = null; pointSearch.progress = null; pointSearch.error = '';
+      rangePlanner.bits = String(puzzle.id); rangePlanner.targets = '1'; rangePlanner.error = '';
+      render(); document.querySelector('#public-key-search')?.scrollIntoView({ behavior: 'smooth' });
+    } catch (error) { pointSearch.error = error?.message ?? String(error); render(); }
+  });
+  document.querySelector('#copy-puzzle-record')?.addEventListener('click', async (event) => {
+    const puzzle = getBitcoinPuzzle(puzzleCatalog.selectedId);
+    const record = JSON.stringify({ source: BITCOIN_PUZZLE_SOURCE, puzzle, note: 'Dated source snapshot; not live status or balance data. No private key is included.' }, null, 2);
+    try { await copyToClipboard(record); event.target.textContent = 'Copied'; }
+    catch { event.target.textContent = 'Copy unavailable'; }
+  });
+  document.querySelector('#download-puzzle-catalog')?.addEventListener('click', () => exportTextFile('bitcoin-puzzle-catalog-public.tsv', bitcoinPuzzleCatalogTsv()));
+  document.querySelector('#copy-puzzle-catalog')?.addEventListener('click', async (event) => {
+    try { await copyToClipboard(bitcoinPuzzleCatalogTsv()); event.target.textContent = 'Catalog copied'; }
+    catch { event.target.textContent = 'Copy unavailable'; }
+  });
+  document.querySelectorAll('[data-puzzle-match-action]').forEach((button) => button.addEventListener('click', async () => {
+    const puzzle = getBitcoinPuzzle(button.dataset.puzzleId);
+    if (!window.confirm(`This exports private-key material for the verified public puzzle #${puzzle.id} match. No balance was checked. Keep it private. Continue?`)) return;
+    try {
+      const contents = createBitcoinPuzzleMatchExport({ puzzleId: puzzle.id, scalar: button.dataset.scalar, publicKey: button.dataset.publicKey, address: puzzle.address });
+      if (button.dataset.puzzleMatchAction === 'copy') {
+        await copyToClipboard(contents); button.textContent = 'Verified match copied';
+      } else {
+        exportTextFile(`bitcoin-puzzle-${puzzle.id}-verified-match.txt`, contents); button.textContent = 'Download started';
+      }
+    } catch (error) { alert(error?.message ?? String(error)); }
+  }));
   document.querySelector('#generate')?.addEventListener('click', generateWallet);
   document.querySelector('#run-kangaroo-demo')?.addEventListener('click', runKangarooDemoFromUi);
   document.querySelector('#point-search-start')?.addEventListener('click', startPointSearch);
@@ -1499,6 +1574,7 @@ function finishSearch(search, status, match = null, message = '') {
     foundScalar: match?.scalar ?? null, foundPublicKey: match?.publicKey ?? null,
     foundAddress: match ? search.targets[match.targetIndex]?.display ?? '' : '',
     matchTargetIndex: match?.targetIndex ?? -1, targets: search.targets, workers: search.workers.length, message,
+    puzzleId: search.puzzleId ?? null,
   };
   render();
 }
@@ -1536,6 +1612,7 @@ async function runDiscreteLogLab() {
     return;
   }
   const parsed = targets[0];
+  const catalogPuzzle = selectedNetworkId === 'bitcoinLegacy' && targets.length === 1 ? getBitcoinPuzzleByAddress(parsed.display) : null;
 
   let range;
   try {
@@ -1550,6 +1627,7 @@ async function runDiscreteLogLab() {
   const runId = ++searchRunId;
   const search = {
     runId, networkId: selectedNetworkId, addressInput, parsed, targets, range,
+    puzzleId: catalogPuzzle?.id ?? null,
     workers: [], progressByWorker: new Map(), finishedWorkers: new Set(),
     foundMatch: null, cancelRequested: false, manualStop: false, startedAt: performance.now(),
   };

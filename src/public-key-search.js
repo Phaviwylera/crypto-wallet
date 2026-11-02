@@ -21,8 +21,9 @@ export function parsePublicKeyFile(text) {
     const cols = line.split('\t').map((value) => value.trim());
     if (index === 0 && cols[0].toLowerCase() === 'address') continue;
     const [address, transactionHash, publicKey, status] = cols;
-    if (cols.length !== 4 || !(/^0x[0-9a-f]{40}$/i.test(address) || /^(?:1|3|bc1q)[a-zA-Z0-9]{20,90}$/.test(address)) || !/^0x[0-9a-f]{64}$/i.test(transactionHash) || !/^0x04[0-9a-f]{128}$/i.test(publicKey) || status?.toLowerCase() !== 'ok') {
-      throw new Error(`Line ${index + 1}: expected address, transaction_hash, uncompressed public key, and status ok, separated by tabs.`);
+    const validSource = /^0x[0-9a-f]{64}$/i.test(transactionHash) || transactionHash === 'published-catalog';
+    if (cols.length !== 4 || !(/^0x[0-9a-f]{40}$/i.test(address) || /^(?:1|3|bc1q)[a-zA-Z0-9]{20,90}$/.test(address)) || !validSource || !/^0x04[0-9a-f]{128}$/i.test(publicKey) || status?.toLowerCase() !== 'ok') {
+      throw new Error(`Line ${index + 1}: expected address, transaction hash or published-catalog source, uncompressed public key, and status ok, separated by tabs.`);
     }
     let point;
     try { point = Point.fromBytes(Uint8Array.from(publicKey.slice(2).match(/../g), (part) => parseInt(part, 16))); }
