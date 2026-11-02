@@ -12,6 +12,7 @@ import { parseSearchRange, partitionSearchRange } from './search-range.js';
 import { captureScalarFocus, restoreScalarFocus } from './input-focus.js';
 import { createPublicKeySearchPool } from './public-key-search-pool.js';
 import { createGpuBridgeHost } from './webgpu-bridge.js';
+import { planRange, rangeForBitLength } from './range-planner.js';
 import './style.css';
 
 const app = document.querySelector('#app');
@@ -42,6 +43,7 @@ let searchRenderTimer = null;
 let labAddressInput = null;
 let searchAddressFile = null;
 let ethereumRpcEndpoint = 'https://ethereum-rpc.publicnode.com';
+let rangePlanner = { bits: '', targets: '1', rate: '', error: '' };
 let pointSearch = { fileName: '', text: '', lower: '1', upper: '1000000', workers: 'auto', backend: 'cpu', busy: false, count: 0, progress: null, result: null, error: '' };
 let pointSearchPool = null;
 let gpuBenchmark = { preference: 'high-performance', busy: false, progress: null, result: null, error: '' };
@@ -653,12 +655,32 @@ function startGpuBenchmark() {
   }
 }
 
+function plannerNumber(value) {
+  if (value === 0) return '0';
+  return value >= 1e6 || value < 0.001 ? value.toExponential(3) : value.toLocaleString(undefined, { maximumSignificantDigits: 4 });
+}
+
+function rangePlannerOutput() {
+  try {
+    const plan = planRange(pointSearch.lower.trim(), pointSearch.upper.trim(), rangePlanner.targets.trim(), rangePlanner.rate);
+    return `<p><b>Inclusive interval:</b> ${escapeHtml(plan.count.toLocaleString())} scalars · <b>Chunks:</b> ${escapeHtml(plan.chunks.toLocaleString())}</p><p><b>Coverage / chance for one uniformly random key:</b> ${plannerNumber(plan.fraction)} (${plannerNumber(plan.fraction * 100)}%)</p><p><b>Planned giant-step slots:</b> ${escapeHtml(plan.work.toLocaleString())} for ${plan.targets.toLocaleString()} target(s)${plan.seconds === null ? '' : ` · <b>slot-only time:</b> ${plannerNumber(plan.seconds)} seconds (${plannerNumber(plan.seconds / 31557600)} years)`}</p><p>Conditional on a uniformly random private scalar; this is not a prediction for a particular public key. Work assumes all targets are searched through the whole interval. A time estimate excludes setup, table construction and other overhead, and assumes your measured search rate remains constant; it is not a guarantee. GPU benchmark lookups/sec is not a search rate.</p>`;
+  } catch (error) { return `<p class="kangaroo-error">${escapeHtml(error.message)}</p>`; }
+}
+
+function updateRangePlanner() {
+  const output = document.querySelector('#range-planner-output');
+  if (output) output.innerHTML = rangePlannerOutput();
+  const error = document.querySelector('#range-planner-error');
+  if (error) error.textContent = rangePlanner.error;
+}
+
 function pointSearchMarkup() {
   return `<section class="backward-panel dlog-panel" id="public-key-search">
     <div class="backward-heading"><div><span class="eyebrow">PUBLIC-KEY SEARCH · LOCAL ONLY</span><h3>Search uploaded Ethereum public keys</h3></div><span class="live-example">PARALLEL BSGS</span></div>
     <p class="backward-intro">Upload the tab-separated TXT exported by “Extract public keys”. This uses parallel baby-step giant-step (BSGS), not kangaroo, to search every validated public point in the same inclusive interval. Workers share the targets; each uses its own table. The file stays in this browser.</p>
     <div class="search-file-row"><div class="search-file-copy"><strong>Ethereum public-key TXT</strong><small>Columns: address, transaction_hash, public_key_uncompressed, status; tab separated, status ok. Up to 10,000 rows and 5 MB. All rows must validate.</small></div><label class="search-file-button ${pointSearch.busy ? 'is-disabled' : ''}" for="point-search-file">Choose TXT</label><input id="point-search-file" type="file" accept=".txt,text/plain,.tsv,text/tab-separated-values" hidden ${pointSearch.busy ? 'disabled' : ''}><span class="search-file-name">${escapeHtml(pointSearch.fileName || 'No file selected')}</span></div>
     <div class="candidate-range"><label>Lower scalar (inclusive)<input id="point-search-lower" type="text" inputmode="numeric" value="${escapeHtml(pointSearch.lower)}"></label><label>Upper scalar (inclusive)<input id="point-search-upper" type="text" inputmode="numeric" value="${escapeHtml(pointSearch.upper)}"></label></div>
+    <div class="gpu-benchmark-panel"><span class="eyebrow">EVIDENCE-BASED RANGE PLANNER</span><h3>Understand your search range</h3><p>Use bounds supported by evidence, such as a published puzzle range. A public key does not reveal its private scalar’s bit length. No region is more likely for a uniformly random key.</p><div class="candidate-range"><label>Known exact bit length (optional)<input id="planner-bits" type="number" min="1" max="256" value="${escapeHtml(rangePlanner.bits)}" placeholder="e.g. 20"></label><label>Estimated target count<input id="planner-targets" type="number" min="1" max="10000" value="${escapeHtml(rangePlanner.targets)}"></label><label>Measured search slots/second (optional)<input id="planner-rate" type="number" min="0" value="${escapeHtml(rangePlanner.rate)}" placeholder="From a prior search"></label></div><div class="dlog-actions"><button class="search-file-button" id="planner-apply-bits" type="button">Apply bit-length bounds</button></div><p id="range-planner-error" class="kangaroo-error" role="alert">${escapeHtml(rangePlanner.error)}</p><div id="range-planner-output" aria-live="polite">${rangePlannerOutput()}</div></div>
     <div class="point-worker-control"><label for="point-search-backend">Compute mode</label><select id="point-search-backend" ${pointSearch.busy ? 'disabled' : ''}><option value="cpu" ${pointSearch.backend === 'cpu' ? 'selected' : ''}>CPU only</option><option value="webgpu-high" ${pointSearch.backend === 'webgpu-high' ? 'selected' : ''}>WebGPU · high-performance preference</option><option value="webgpu-low" ${pointSearch.backend === 'webgpu-low' ? 'selected' : ''}>WebGPU · low-power preference</option><option value="hybrid-high" ${pointSearch.backend === 'hybrid-high' ? 'selected' : ''}>Hybrid CPU + WebGPU · high-performance preference</option><option value="hybrid-low" ${pointSearch.backend === 'hybrid-low' ? 'selected' : ''}>Hybrid CPU + WebGPU · low-power preference</option></select><small>Experimental: GPU performs collision table lookups; CPU performs curve math and checks every GPU result. May be slower than CPU-only. Requires WebGPU in a secure context; if unavailable in a worker, the app checks the browser window. Adapter preference does not guarantee a specific GPU. Hybrid divides keys among CPU and WebGPU-assisted workers; it requires at least 2 workers and 2 keys. WebGPU-assisted groups use at most 2 workers. Full GPU elliptic-curve arithmetic is not implemented.</small></div>
     <div class="point-worker-control"><label for="point-search-workers">CPU workers</label><select id="point-search-workers" ${pointSearch.busy ? 'disabled' : ''}><option value="auto" ${pointSearch.workers === 'auto' ? 'selected' : ''}>Auto (up to 8)</option>${Array.from({ length: 32 }, (_, i) => `<option value="${i + 1}" ${pointSearch.workers === String(i + 1) ? 'selected' : ''}>${i + 1}</option>`).join('')}</select><small>CPU only · actual workers cannot exceed the number of targets. More workers increase CPU and memory use and may be slower. Your browser reports ${escapeHtml(navigator.hardwareConcurrency || 'unknown')} logical cores.</small></div>
     <p class="step-explanation subtle">You can edit bounds during a run; changes apply to the next search. Current run bounds remain unchanged.</p>
@@ -943,8 +965,21 @@ function render() {
   document.querySelector('#point-search-stop')?.addEventListener('click', (event) => { event.target.disabled = true; event.target.textContent = 'Stopping…'; pointSearchPool?.cancel(); });
   document.querySelector('#point-search-backend')?.addEventListener('change', (event) => { pointSearch.backend = event.target.value; });
   document.querySelector('#point-search-workers')?.addEventListener('change', (event) => { pointSearch.workers = event.target.value; });
-  document.querySelector('#point-search-lower')?.addEventListener('input', (event) => { pointSearch.lower = event.target.value; });
-  document.querySelector('#point-search-upper')?.addEventListener('input', (event) => { pointSearch.upper = event.target.value; });
+  document.querySelector('#point-search-lower')?.addEventListener('input', (event) => { pointSearch.lower = event.target.value; updateRangePlanner(); });
+  document.querySelector('#point-search-upper')?.addEventListener('input', (event) => { pointSearch.upper = event.target.value; updateRangePlanner(); });
+  document.querySelector('#planner-bits')?.addEventListener('input', (event) => { rangePlanner.bits = event.target.value; rangePlanner.error = ''; updateRangePlanner(); });
+  document.querySelector('#planner-targets')?.addEventListener('input', (event) => { rangePlanner.targets = event.target.value; updateRangePlanner(); });
+  document.querySelector('#planner-rate')?.addEventListener('input', (event) => { rangePlanner.rate = event.target.value; updateRangePlanner(); });
+  document.querySelector('#planner-apply-bits')?.addEventListener('click', () => {
+    try {
+      const range = rangeForBitLength(rangePlanner.bits.trim());
+      pointSearch.lower = range.start.toString(); pointSearch.upper = range.end.toString();
+      document.querySelector('#point-search-lower').value = pointSearch.lower;
+      document.querySelector('#point-search-upper').value = pointSearch.upper;
+      rangePlanner.error = '';
+    } catch (error) { rangePlanner.error = error.message; }
+    updateRangePlanner();
+  });
   document.querySelector('#point-search-file')?.addEventListener('change', async (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
