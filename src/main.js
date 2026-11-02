@@ -809,12 +809,12 @@ function boundedWalletGeneratorMarkup() {
   const result = boundedWallet.result;
   const progressPercent = boundedWallet.total ? Math.min(100, 100 * boundedWallet.completed / boundedWallet.total) : 0;
   return `<div class="public-key-extract-panel bounded-wallet-panel" id="bounded-wallet-generator">
-    <strong>All addresses + public keys within these bounds</strong>
-    <p>Enumerates every scalar from lower through upper (up to 10,000 per run) for ${escapeHtml(selectedNetwork().label)}. The TXT contains only <code>address → tab → uncompressed public key</code> on each line, with no header or other information. Small or known intervals can be brute-forced; never use their keys for real funds.</p>
-    <div class="dlog-actions"><button class="search-file-button" id="generate-bounded-wallet" type="button" ${boundedWallet.busy ? 'disabled' : ''}>${boundedWallet.busy ? 'Generating…' : 'Generate all addresses + public keys'}</button>${boundedWallet.busy ? '<button class="dlog-stop-button" id="stop-bounded-wallet" type="button">Cancel generation</button>' : ''}${result ? '<button class="search-file-button" id="download-bounded-wallet" type="button">Download TXT</button>' : ''}</div>
+    <strong>All addresses + private keys within these bounds</strong>
+    <p>Enumerates every scalar from lower through upper (up to 10,000 per run) for ${escapeHtml(selectedNetwork().label)}. The TXT contains only <code>address → tab → 32-byte private key</code> on each line, with no header or other information. <strong>The TXT contains sensitive private keys.</strong> Small or known intervals can be brute-forced; never use their keys for real funds.</p>
+    <div class="dlog-actions"><button class="search-file-button" id="generate-bounded-wallet" type="button" ${boundedWallet.busy ? 'disabled' : ''}>${boundedWallet.busy ? 'Generating…' : 'Generate all addresses + private keys'}</button>${boundedWallet.busy ? '<button class="dlog-stop-button" id="stop-bounded-wallet" type="button">Cancel generation</button>' : ''}${result ? '<button class="search-file-button" id="download-bounded-wallet" type="button">Download TXT</button>' : ''}</div>
     ${boundedWallet.error ? `<p class="search-file-error" role="alert">${escapeHtml(boundedWallet.error)}</p>` : ''}
     ${boundedWallet.busy ? `<div class="dlog-live-progress bounded-wallet-result" role="status" aria-live="polite"><b id="bounded-wallet-progress">Generated ${boundedWallet.completed.toLocaleString()} / ${boundedWallet.total.toLocaleString()} rows</b><div class="search-progress"><span id="bounded-wallet-progress-bar" style="width:${progressPercent}%"></span></div><p>Derivation runs in small chunks to keep the page responsive. Cancel discards the partial output.</p></div>` : ''}
-    ${result ? `<div class="dlog-live-progress bounded-wallet-result" aria-live="polite"><b>${result.count.toLocaleString()} rows ready · ${escapeHtml(result.networkLabel)}</b><p>Inclusive scalar range: <code>${escapeHtml(result.lower)}</code> – <code>${escapeHtml(result.upper)}</code></p><p>Headerless TXT: address first, uncompressed public key second, one pair per line.</p></div>` : ''}
+    ${result ? `<div class="dlog-live-progress bounded-wallet-result" aria-live="polite"><b>${result.count.toLocaleString()} rows ready · ${escapeHtml(result.networkLabel)}</b><p>Inclusive scalar range: <code>${escapeHtml(result.lower)}</code> – <code>${escapeHtml(result.upper)}</code></p><p>Headerless TXT: address first, private key second, one pair per line. <strong>Keep it secret.</strong></p></div>` : ''}
   </div>`;
 }
 
@@ -853,8 +853,9 @@ async function generateBoundedWallet() {
       derive: (scalar) => {
         const privateKeyBytes = bigIntToBytes(scalar);
         try {
+          const privateKey = `0x${hex(privateKeyBytes)}`;
           const derived = calculateAddressData(privateKeyBytes, networkId);
-          return { address: derived.address, publicKey: `0x${hex(derived.publicKey)}` };
+          return { address: derived.address, privateKey };
         } finally {
           privateKeyBytes.fill(0);
         }
@@ -1364,7 +1365,7 @@ function render() {
   document.querySelector('#stop-bounded-wallet')?.addEventListener('click', stopBoundedWalletGeneration);
   document.querySelector('#download-bounded-wallet')?.addEventListener('click', () => {
     const result = boundedWallet.result;
-    if (result) exportTextFile(`address-public-keys-${result.networkId}-${result.lower}-${result.upper}.txt`, result.text);
+    if (result) exportTextFile(`address-private-keys-${result.networkId}-${result.lower}-${result.upper}.txt`, result.text);
   });
   document.querySelector('#run-dlog-lab')?.addEventListener('click', runDiscreteLogLab);
   document.querySelector('#stop-search')?.addEventListener('click', requestSearchStop);

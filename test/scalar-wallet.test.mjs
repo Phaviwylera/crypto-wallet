@@ -1,8 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { secp256k1 } from '@noble/curves/secp256k1.js';
+import { computeAddress } from 'ethers';
 import { generateScalarBatch, MAX_SCALAR_BATCH_SIZE, parseScalarBatchRange, scalarBatchRow } from '../src/scalar-wallet.js';
 
-const derive = (scalar) => ({ address: `address-${scalar}`, publicKey: `public-${scalar}` });
+const privateKeyFor = (scalar) => `0x${scalar.toString(16).padStart(64, '0')}`;
+const derive = (scalar) => ({ address: `address-${scalar}`, privateKey: privateKeyFor(scalar) });
 
 test('batch range is inclusive and capped to keep browser generation bounded', () => {
   assert.equal(parseScalarBatchRange('1', '10000').count, 10000n);
@@ -12,22 +15,23 @@ test('batch range is inclusive and capped to keep browser generation bounded', (
   assert.equal(MAX_SCALAR_BATCH_SIZE, 10000);
 });
 
-test('generates every scalar in order as headerless address/public-key rows', async () => {
+test('generates every scalar in order as headerless address/private-key rows', async () => {
   const progress = [];
   const result = await generateScalarBatch({
     lower: '3', upper: '5', derive, yieldEvery: 1,
     onProgress: (done, total) => progress.push([done, total]),
   });
   assert.equal(result.count, 3);
-  assert.equal(result.text, 'address-3\tpublic-3\naddress-4\tpublic-4\naddress-5\tpublic-5\n');
+  assert.equal(result.text, `address-3\t${privateKeyFor(3n)}\naddress-4\t${privateKeyFor(4n)}\naddress-5\t${privateKeyFor(5n)}\n`);
   assert.deepEqual(progress, [[1, 3], [2, 3], [3, 3]]);
-  assert.doesNotMatch(result.text, /Network:|scalar|private|SECURITY|address\tpublic_key/);
+  assert.doesNotMatch(result.text, /Network:|scalar|SECURITY|public_key/);
 });
 
-test('row formatter puts address first and rejects missing derivation values', () => {
-  assert.equal(scalarBatchRow('0xabc', '0x04key'), '0xabc\t0x04key\n');
-  assert.throws(() => scalarBatchRow('', '0x04key'), /did not return/);
+test('row formatter puts address first and requires a 32-byte private key', () => {
+  assert.equal(scalarBatchRow('0xabc', privateKeyFor(1n)), `0xabc\t${privateKeyFor(1n)}\n`);
+  assert.throws(() => scalarBatchRow('', privateKeyFor(1n)), /did not return/);
   assert.throws(() => scalarBatchRow('0xabc', ''), /did not return/);
+  assert.throws(() => scalarBatchRow('0xabc', '0x04key'), /32-byte/);
 });
 
 test('cancellation stops without returning a partial TXT', async () => {
@@ -42,5 +46,21 @@ test('cancellation stops without returning a partial TXT', async () => {
 test('invalid derivation settings fail before a result is accepted', async () => {
   await assert.rejects(generateScalarBatch({ lower: '1', upper: '2' }), /derivation function/);
   await assert.rejects(generateScalarBatch({ lower: '1', upper: '2', derive, yieldEvery: 0 }), /chunk size/);
-  await assert.rejects(generateScalarBatch({ lower: '1', upper: '2', derive: () => ({ address: '', publicKey: '' }) }), /did not return/);
+  await assert.rejects(generateScalarBatch({ lower: '1', upper: '2', derive: () => ({ address: '', privateKey: '' }) }), /did not return/);
+});
+
+test('real Ethereum rows pair each address with its exact scalar private key', async () => {
+  const result = await generateScalarBatch({
+    lower: '1', upper: '3', yieldEvery: 1,
+    derive: (scalar) => {
+      const privateKey = privateKeyFor(scalar);
+      const privateBytes = Uint8Array.from(Buffer.from(privateKey.slice(2), 'hex'));
+      const publicKey = `0x${Buffer.from(secp256k1.getPublicKey(privateBytes, false)).toString('hex')}`;
+      return { address: computeAddress(publicKey), privateKey };
+    },
+  });
+  const lines = result.text.trim().split('\n');
+  assert.equal(lines.length, 3);
+  assert.equal(lines[0], `0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf\t${privateKeyFor(1n)}`);
+  lines.forEach((line, index) => assert.equal(line.split('\t')[1], privateKeyFor(BigInt(index + 1))));
 });

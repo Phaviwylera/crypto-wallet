@@ -10,12 +10,15 @@ export function parseScalarBatchRange(lower, upper) {
   return range;
 }
 
-export function scalarBatchRow(address, publicKey) {
-  if (typeof address !== 'string' || !address || typeof publicKey !== 'string' || !publicKey) {
-    throw new Error('Derivation did not return an address and public key.');
+export function scalarBatchRow(address, privateKey) {
+  if (typeof address !== 'string' || !address || typeof privateKey !== 'string' || !privateKey) {
+    throw new Error('Derivation did not return an address and private key.');
   }
-  // Headerless TSV: address first, uncompressed public key second.
-  return `${address}\t${publicKey}\n`;
+  if (!/^0x[0-9a-f]{64}$/i.test(privateKey)) {
+    throw new Error('Private key must be 0x-prefixed 32-byte hexadecimal.');
+  }
+  // Headerless TSV: address first, sensitive 32-byte private key second.
+  return `${address}\t${privateKey}\n`;
 }
 
 export async function generateScalarBatch({
@@ -38,7 +41,7 @@ export async function generateScalarBatch({
       throw error;
     }
     const derived = derive(scalar);
-    rows.push(scalarBatchRow(derived.address, derived.publicKey));
+    rows.push(scalarBatchRow(derived.address, derived.privateKey));
 
     if (rows.length % yieldEvery === 0 && scalar < range.end) {
       onProgress(rows.length, Number(range.count));
