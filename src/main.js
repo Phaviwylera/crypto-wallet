@@ -16,6 +16,8 @@ import { planRange, rangeForBitLength } from './range-planner.js';
 import { lookupBitcoinPublicKey } from './bitcoin-public-key.js';
 import { BITCOIN_PUZZLES, BITCOIN_PUZZLE_SOURCE, bitcoinPuzzleCatalogTsv, getBitcoinPuzzle, getBitcoinPuzzleByAddress } from './bitcoin-puzzles.js';
 import { bitcoinPuzzlePointSearchText, createBitcoinPuzzleMatchExport } from './bitcoin-puzzle-match.js';
+import { MAX_BATCH_FILE_BYTES, parseAddressBatch, parseRecoveryBatch, publicKeyResultsTsv } from './batch-files.js';
+import { runRecoveryBatch } from './recovery-batch.js';
 import './style.css';
 
 const app = document.querySelector('#app');
@@ -45,7 +47,7 @@ let activeSearch = null;
 let searchRenderTimer = null;
 let labAddressInput = null;
 let searchAddressFile = null;
-let keyRecovery = { network: 'ethereum', address: '', tx: '', busy: false, result: null, error: '' };
+let keyRecovery = { network: 'ethereum', address: '', tx: '', busy: false, busyMode: null, result: null, error: '', batchName: '', batchEntries: [], batchError: '', batchResults: null, batchCompleted: 0, cancelRequested: false };
 let puzzleCatalog = { selectedId: 71, filter: 'unsolved' };
 let ethereumRpcEndpoint = 'https://ethereum-rpc.publicnode.com';
 let rangePlanner = { bits: '', targets: '1', rate: '', error: '' };
@@ -367,7 +369,10 @@ function searchResultMarkup(result, network) {
   const matchText = result.foundScalar
     ? `Match found at scalar d=${result.foundScalar}; it matches target ${result.matchTargetIndex + 1} of ${targets.length}.`
     : `No match for any of the ${targets.length} target${targets.length === 1 ? '' : 's'} in the complete interval ${result.startScalar.toLocaleString()}–${result.endScalar.toLocaleString()}.`;
-  const targetList = targets.map((target, index) => `<li><b>${index + 1}.</b> <code>${escapeHtml(target.display)}</code>${result.foundScalar && index === result.matchTargetIndex ? ' <strong>← MATCH</strong>' : ''}</li>`).join('');
+  const indexedTargets = targets.map((target, index) => ({ target, index }));
+  const visibleTargets = indexedTargets.slice(0, 25);
+  if (result.matchTargetIndex >= 25) visibleTargets.push(indexedTargets[result.matchTargetIndex]);
+  const targetList = visibleTargets.map(({ target, index }) => `<li><b>${index + 1}.</b> <code>${escapeHtml(target.display)}</code>${result.foundScalar && index === result.matchTargetIndex ? ' <strong>← MATCH</strong>' : ''}</li>`).join('') + (targets.length > visibleTargets.length ? `<li>… and ${(targets.length - visibleTargets.length).toLocaleString()} more searched targets</li>` : '');
   return `<div class="dlog-results"><div><label>INPUT · ${targets.length} ${targets.length === 1 ? 'ADDRESS TARGET' : 'ADDRESS TARGETS'}</label><ul class="search-target-list">${targetList}</ul>${targets.length === 1 ? `<div class="hash-byte-grid address-byte-grid">${byteGrid(targets[0].bytes)}</div>${networkAddressDetails(targets[0], network)}` : '<p>Every candidate was checked against all loaded addresses in the same pass.</p>'}</div><div><label>RESULT · ${result.foundScalar ? 'MATCH' : 'FULL RANGE TESTED'}</label><p>${matchText}</p><p>${result.totalTested.toLocaleString()} candidates checked · ${result.elapsedMs.toFixed(1)} ms · ${result.candidatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 })} candidates/second across ${result.workers} workers.</p><p>${result.foundScalar ? `Matching public key: <code class="dlog-address-value">${result.foundPublicKey}</code>` : 'This excludes only the tested scalar interval; it does not recover or rule out keys outside it.'}</p>${result.foundScalar && result.puzzleId ? `<p><b>Published Bitcoin puzzle #${result.puzzleId} match.</b> Export re-verifies the scalar, public key and P2PKH address. No balance was checked.</p>${puzzleMatchActions(result.puzzleId, result.foundScalar, result.foundPublicKey)}` : ''}<p>This bounded test is not a practical real-wallet recovery method.</p></div></div>`;
 }
 
@@ -689,41 +694,115 @@ function updateRangePlanner() {
   if (error) error.textContent = rangePlanner.error;
 }
 
+function recoveryBatchResultsMarkup() {
+  if (!keyRecovery.batchResults) {
+    if (keyRecovery.busyMode === 'batch') return `<div class="dlog-live-progress" role="status" aria-live="polite"><b>Running recovery batch</b><p id="recovery-batch-progress">Processed ${keyRecovery.batchCompleted} of ${keyRecovery.batchEntries.length} rows</p></div>`;
+    return '<p class="dlog-placeholder">Choose a validated batch file to enable recovery.</p>';
+  }
+  const results = keyRecovery.batchResults;
+  const succeeded = results.filter((row) => row.status === 'ok').length;
+  const cancelled = results.filter((row) => row.status === 'cancelled before processing').length;
+  const rows = results.slice(0, 10).map((row, index) => `<li><b>${index + 1}.</b> <code>${escapeHtml(row.address)}</code> · ${row.status === 'ok' ? `<strong>public key recovered</strong><code class="dlog-address-value">${escapeHtml(row.publicKey)}</code>` : `<span class="search-file-error">${escapeHtml(row.status)}</span>`}</li>`).join('');
+  return `<div class="dlog-live-progress" role="status"><b>Batch complete · ${succeeded} of ${results.length} public keys recovered</b><p>${results.length - succeeded - cancelled} failed · ${cancelled} not processed. Public keys are not private keys. Provider failures remain in the result file.</p><div class="dlog-actions"><button class="search-file-button" id="download-recovery-batch" type="button">Download result TXT</button><button class="search-file-button" id="copy-recovery-batch" type="button">Copy results</button>${succeeded ? `<button class="search-file-button" id="use-recovery-batch" type="button" ${pointSearch.busy || gpuBenchmark.busy ? 'disabled' : ''}>Load ${succeeded} key${succeeded === 1 ? '' : 's'} into BSGS</button>` : ''}</div><ul class="search-target-preview">${rows}${results.length > 10 ? `<li>… and ${results.length - 10} more rows in the downloadable/copyable results</li>` : ''}</ul></div>`;
+}
+
 function recoveryMarkup() {
   const isBtc = keyRecovery.network === 'bitcoin';
   const result = keyRecovery.result;
-  return `<section class="backward-panel dlog-panel" id="key-recovery"><div class="backward-heading"><div><span class="eyebrow">NETWORK → TRANSACTION → PUBLIC KEY</span><h3>Derive a public key</h3></div><span class="live-example">SECP256K1</span></div><div class="point-worker-control"><label for="recovery-network">Network</label><select id="recovery-network" ${keyRecovery.busy ? 'disabled' : ''}><option value="ethereum" ${isBtc ? '' : 'selected'}>Ethereum · outgoing transaction</option><option value="bitcoin" ${isBtc ? 'selected' : ''}>Bitcoin · spending history</option></select></div><div class="candidate-range"><label>${isBtc ? 'Bitcoin address' : 'Ethereum sender address'}<input id="recovery-address" type="text" value="${escapeHtml(keyRecovery.address)}" placeholder="${isBtc ? '1…, 3… or bc1q…' : '0x…'}" spellcheck="false" ${keyRecovery.busy ? 'disabled' : ''}></label>${isBtc ? '' : `<label>Outgoing transaction hash<input id="recovery-tx" type="text" value="${escapeHtml(keyRecovery.tx)}" placeholder="0x…" spellcheck="false" ${keyRecovery.busy ? 'disabled' : ''}></label>`}</div>${isBtc ? `<p class="step-explanation">Uses mempool.space: clicking sends this address to that provider and checks up to 5 history pages. Supported: P2PKH, P2WPKH, P2SH-P2WPKH spending inputs only. Incoming transactions, Taproot and other scripts do not supply a key here. Older history may not be checked; rate limits and CORS can prevent lookup. A matching key is verified against the address and previous-output script, but blockchain inclusion is trusted to the provider.</p>` : `<div class="point-worker-control"><label for="recovery-rpc">Ethereum JSON-RPC endpoint</label><input id="recovery-rpc" type="url" value="${escapeHtml(ethereumRpcEndpoint)}" ${keyRecovery.busy ? 'disabled' : ''}><small>Clicking sends the transaction hash to this provider. The transaction must be sent by the listed address. The signer and address are verified locally; the provider is trusted for the transaction data.</small></div>`}<div class="dlog-actions"><button class="action-button" id="recover-key" type="button" ${keyRecovery.busy ? 'disabled' : ''}>${keyRecovery.busy ? 'Looking up…' : 'Find public key'}</button>${result?.publicKey ? `<button class="search-file-button" id="use-recovered-key" type="button" ${pointSearch.busy || gpuBenchmark.busy ? 'disabled' : ''}>Use in public-key search</button><button class="search-file-button" id="copy-recovered-key" type="button">Copy public key</button>` : ''}</div>${keyRecovery.error ? `<p class="kangaroo-error" role="alert">${escapeHtml(keyRecovery.error)}</p>` : ''}${result?.publicKey ? `<div class="dlog-live-progress"><b>Public key verified against address</b><p>Transaction: <code>${escapeHtml(result.txHash)}</code>${result.type ? ` · ${escapeHtml(result.type)}` : ''}</p><code class="dlog-address-value">${escapeHtml(result.publicKey)}</code><p>This is not a private key. No search was started.</p></div>` : ''}</section>`;
+  return `<section class="backward-panel dlog-panel" id="key-recovery">
+    <div class="backward-heading"><div><span class="eyebrow">NETWORK → TRANSACTION → PUBLIC KEY</span><h3>Derive public keys · single or batch</h3></div><span class="live-example">SECP256K1</span></div>
+    <div class="point-worker-control"><label for="recovery-network">Network</label><select id="recovery-network" ${keyRecovery.busy ? 'disabled' : ''}><option value="ethereum" ${isBtc ? '' : 'selected'}>Ethereum · outgoing transactions</option><option value="bitcoin" ${isBtc ? 'selected' : ''}>Bitcoin · spending history</option></select></div>
+    <div class="candidate-range"><label>${isBtc ? 'Bitcoin address' : 'Ethereum sender address'}<input id="recovery-address" type="text" value="${escapeHtml(keyRecovery.address)}" placeholder="${isBtc ? '1…, 3… or bc1q…' : '0x…'}" spellcheck="false" ${keyRecovery.busy ? 'disabled' : ''}></label>${isBtc ? '' : `<label>Outgoing transaction hash<input id="recovery-tx" type="text" value="${escapeHtml(keyRecovery.tx)}" placeholder="0x…" spellcheck="false" ${keyRecovery.busy ? 'disabled' : ''}></label>`}</div>
+    ${isBtc ? `<p class="step-explanation">Uses mempool.space: running sends each address to that provider and checks up to 5 history pages. Supported: P2PKH, P2WPKH, P2SH-P2WPKH spending inputs only. Incoming transactions, Taproot and other scripts do not supply a key here. Older history may not be checked; rate limits and CORS can prevent lookup. Blockchain inclusion is trusted to the provider.</p>` : `<div class="point-worker-control"><label for="recovery-rpc">Ethereum JSON-RPC endpoint</label><input id="recovery-rpc" type="url" value="${escapeHtml(ethereumRpcEndpoint)}" ${keyRecovery.busy ? 'disabled' : ''}><small>Running sends transaction hashes to this provider. Each transaction must be sent by its listed address. Signers and addresses are verified locally; the provider is trusted for transaction data.</small></div>`}
+    <div class="dlog-actions"><button class="action-button" id="recover-key" type="button" ${keyRecovery.busy ? 'disabled' : ''}>${keyRecovery.busyMode === 'single' ? 'Looking up…' : 'Find one public key'}</button>${result?.publicKey ? `<button class="search-file-button" id="use-recovered-key" type="button" ${keyRecovery.busy || pointSearch.busy || gpuBenchmark.busy ? 'disabled' : ''}>Use in public-key search</button><button class="search-file-button" id="copy-recovered-key" type="button">Copy public key</button>` : ''}</div>
+    ${keyRecovery.error ? `<p class="kangaroo-error" role="alert">${escapeHtml(keyRecovery.error)}</p>` : ''}
+    ${result?.publicKey ? `<div class="dlog-live-progress"><b>Public key verified against address</b><p>Transaction: <code>${escapeHtml(result.txHash)}</code>${result.type ? ` · ${escapeHtml(result.type)}` : ''}</p><code class="dlog-address-value">${escapeHtml(result.publicKey)}</code><p>This is not a private key. No search was started.</p></div>` : ''}
+    <div class="public-key-extract-panel recovery-batch-panel"><strong>Batch TXT public-key recovery</strong><p>${isBtc ? 'One supported Bitcoin address per line.' : 'One address,transaction_hash pair per line; comma, tab, semicolon or whitespace separators are accepted.'} Up to 1,000 unique rows and 5 MB. Rows are processed independently with limited concurrency.</p>
+      <div class="search-file-row"><div class="search-file-copy"><strong>${isBtc ? 'Bitcoin address list' : 'Ethereum address + outgoing transaction list'}</strong><small>${keyRecovery.batchName ? `${escapeHtml(keyRecovery.batchName)} · ${keyRecovery.batchEntries.length} validated rows` : 'No batch file selected'}</small></div><label class="search-file-button ${keyRecovery.busy ? 'is-disabled' : ''}" for="recovery-batch-file">Choose batch TXT</label><input id="recovery-batch-file" type="file" accept=".txt,.csv,.tsv,text/plain,text/csv,text/tab-separated-values" hidden ${keyRecovery.busy ? 'disabled' : ''}>${keyRecovery.batchName ? `<button class="search-file-clear" id="clear-recovery-batch" type="button" ${keyRecovery.busy ? 'disabled' : ''}>Clear</button>` : ''}</div>
+      ${keyRecovery.batchError ? `<p class="search-file-error" role="alert">${escapeHtml(keyRecovery.batchError)}</p>` : ''}
+      <div class="dlog-actions"><button class="action-button" id="recover-batch" type="button" ${keyRecovery.busy || !keyRecovery.batchEntries.length || keyRecovery.batchError ? 'disabled' : ''}>Run batch · ${keyRecovery.batchEntries.length} row${keyRecovery.batchEntries.length === 1 ? '' : 's'}</button>${keyRecovery.busyMode === 'batch' ? '<button class="dlog-stop-button" id="recover-batch-stop" type="button">Stop after in-flight requests</button>' : ''}</div>
+      <div id="recovery-batch-status">${recoveryBatchResultsMarkup()}</div>
+    </div>
+  </section>`;
+}
+
+function validateRecoveryAddress(address, network) {
+  if (network === 'ethereum') {
+    const parsed = parseNetworkAddress(address, 'ethereum');
+    return parsed.valid && parsed.inputKind !== 'publicKey' ? parsed : { valid: false, reason: 'Enter a valid Ethereum sender address.' };
+  }
+  for (const id of ['bitcoinLegacy', 'bitcoin', 'bitcoinNested']) {
+    const parsed = parseNetworkAddress(address, id);
+    if (parsed.valid) return parsed;
+  }
+  return { valid: false, reason: 'Enter a supported Bitcoin P2PKH, P2WPKH or P2SH-P2WPKH address; Taproot and other scripts are not supported.' };
+}
+
+function recoveryRpcUrl() {
+  const url = new URL(ethereumRpcEndpoint.trim());
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname))) throw new Error('Use an HTTPS RPC endpoint (HTTP is allowed only for localhost).');
+  return url.toString();
+}
+
+async function recoverBitcoinKey(address) {
+  const parsed = validateRecoveryAddress(address, 'bitcoin');
+  if (!parsed.valid) throw new Error(parsed.reason);
+  const result = await lookupBitcoinPublicKey(parsed.display);
+  if (!result.publicKey) throw new Error(`No supported spending key found in ${result.pages} history page(s). ${result.historyComplete ? 'The provider returned no more confirmed history.' : 'Older pages were not checked.'} This does not prove no key exists.`);
+  return result;
+}
+
+async function recoverEthereumKey(address, txHash, requestId = 1) {
+  const parsed = validateRecoveryAddress(address, 'ethereum');
+  if (!parsed.valid) throw new Error(parsed.reason);
+  if (!/^0x[0-9a-f]{64}$/i.test(txHash)) throw new Error('Enter a 0x-prefixed 32-byte transaction hash.');
+  const transaction = await fetchEthereumTransaction(recoveryRpcUrl(), txHash, requestId);
+  if (transaction.hash?.toLowerCase() !== txHash.toLowerCase() || transaction.from?.toLowerCase() !== parsed.display.toLowerCase()) throw new Error('Transaction hash or sender does not match. Use an outgoing transaction.');
+  const result = recoverEthereumTransactionPublicKey(transaction);
+  if (result.address.toLowerCase() !== parsed.display.toLowerCase()) throw new Error('Recovered signer does not match the address.');
+  return { ...result, address: parsed.display, txHash };
 }
 
 async function recoverSinglePublicKey() {
   if (keyRecovery.busy) return;
   const network = keyRecovery.network, address = keyRecovery.address.trim(), txHash = keyRecovery.tx.trim();
-  keyRecovery.busy = true; keyRecovery.error = ''; keyRecovery.result = null; render();
+  keyRecovery.busy = true; keyRecovery.busyMode = 'single'; keyRecovery.error = ''; keyRecovery.result = null; render();
   try {
-    if (network === 'bitcoin') {
-      const parsed = ['bitcoinLegacy', 'bitcoin', 'bitcoinNested'].some(id => parseNetworkAddress(address, id).valid);
-      if (!parsed) throw new Error('Enter a valid Bitcoin P2PKH, P2WPKH or P2SH address. Taproot and other scripts are not supported.');
-      const result = await lookupBitcoinPublicKey(address);
-      if (!result.publicKey) throw new Error(`No supported spending key found in ${result.pages} history page(s). ${result.historyComplete ? 'The provider returned no more confirmed history.' : 'Older pages were not checked.'} This does not prove no key exists.`);
-      keyRecovery.result = result;
-    } else {
-      const parsed = parseNetworkAddress(address, 'ethereum');
-      if (!parsed.valid || parsed.inputKind === 'publicKey') throw new Error('Enter a valid Ethereum sender address.');
-      if (!/^0x[0-9a-f]{64}$/i.test(txHash)) throw new Error('Enter a 0x-prefixed 32-byte transaction hash.');
-      const url = new URL(ethereumRpcEndpoint.trim());
-      if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname))) throw new Error('Use an HTTPS RPC endpoint (HTTP is allowed only for localhost).');
-      const transaction = await fetchEthereumTransaction(url.toString(), txHash, 1);
-      if (transaction.hash?.toLowerCase() !== txHash.toLowerCase() || transaction.from?.toLowerCase() !== address.toLowerCase()) throw new Error('Transaction hash or sender does not match. Use an outgoing transaction.');
-      const result = recoverEthereumTransactionPublicKey(transaction);
-      if (result.address.toLowerCase() !== address.toLowerCase()) throw new Error('Recovered signer does not match the address.');
-      keyRecovery.result = { ...result, address, txHash };
-    }
+    keyRecovery.result = network === 'bitcoin' ? await recoverBitcoinKey(address) : await recoverEthereumKey(address, txHash);
   } catch (error) { keyRecovery.error = error?.message ?? String(error); }
-  finally { keyRecovery.busy = false; render(); }
+  finally { keyRecovery.busy = false; keyRecovery.busyMode = null; render(); }
+}
+
+async function recoverBatchPublicKeys() {
+  if (keyRecovery.busy || !keyRecovery.batchEntries.length || keyRecovery.batchError) return;
+  const network = keyRecovery.network;
+  const entries = keyRecovery.batchEntries.map((entry) => ({ ...entry }));
+  keyRecovery.busy = true; keyRecovery.busyMode = 'batch'; keyRecovery.error = '';
+  keyRecovery.batchResults = null; keyRecovery.batchCompleted = 0; keyRecovery.cancelRequested = false;
+  render();
+
+  try {
+    keyRecovery.batchResults = await runRecoveryBatch({
+      entries,
+      concurrency: network === 'bitcoin' ? 2 : 4,
+      recover: (entry, index) => network === 'bitcoin' ? recoverBitcoinKey(entry.address) : recoverEthereumKey(entry.address, entry.txHash, index + 1),
+      shouldStop: () => keyRecovery.cancelRequested,
+      onProgress: ({ completed, succeeded, total, stopping }) => {
+        keyRecovery.batchCompleted = completed;
+        const progress = document.querySelector('#recovery-batch-progress');
+        if (progress) progress.textContent = `Processed ${completed} of ${total} rows · ${succeeded} keys recovered${stopping ? ' · stopping after in-flight requests' : ''}`;
+      },
+    });
+  } catch (error) {
+    keyRecovery.batchError = error?.message ?? String(error);
+  } finally {
+    keyRecovery.busy = false; keyRecovery.busyMode = null;
+    render();
+  }
 }
 
 function searchGuideMarkup() {
-  return `<section class="backward-panel dlog-panel" id="search-guide"><span class="eyebrow">SEARCH WORKSPACE</span><h3>Choose network → address type → method</h3><div class="point-worker-control"><label for="search-network-select">Network and address type</label><select id="search-network-select" ${discreteLogProgress ? 'disabled' : ''}>${Object.entries(NETWORKS).map(([id, network]) => `<option value="${id}" ${selectedNetworkId === id ? 'selected' : ''}>${network.label}</option>`).join('')}</select><small>Curve: secp256k1 · ${escapeHtml(addressCaption())}. USDT follows its underlying network; not all networks use this curve. This choice also updates the wallet lab and bounded address search.</small></div><div class="dlog-actions"><a class="search-file-button" href="#search-lab">Address search</a><a class="search-file-button" href="#key-recovery">Find public key</a><a class="search-file-button" href="#public-key-search">Public-key BSGS</a><a class="search-file-button" href="#puzzle-guide">Puzzle catalog</a></div><p class="step-explanation">Address search checks candidate addresses. Public-key BSGS needs a verified point and a bounded interval; GPU assists lookups only. Ethereum and supported Bitcoin spending keys can be extracted below. The methods do not make full-range wallet recovery practical.</p></section>`;
+  return `<section class="backward-panel dlog-panel" id="search-guide"><span class="eyebrow">SEARCH WORKSPACE</span><h3>Choose network → address type → method</h3><div class="point-worker-control"><label for="search-network-select">Network and address type</label><select id="search-network-select" ${discreteLogProgress ? 'disabled' : ''}>${Object.entries(NETWORKS).map(([id, network]) => `<option value="${id}" ${selectedNetworkId === id ? 'selected' : ''}>${network.label}</option>`).join('')}</select><small>Curve: secp256k1 · ${escapeHtml(addressCaption())}. USDT follows its underlying network; not all networks use this curve. This choice also updates the wallet lab and bounded address search.</small></div><div class="dlog-actions"><a class="search-file-button" href="#search-lab">Address search</a><a class="search-file-button" href="#key-recovery">Find public key</a><a class="search-file-button" href="#public-key-search">Public-key BSGS</a><a class="search-file-button" href="#puzzle-guide">Puzzle catalog</a></div><p class="step-explanation">Every real search workflow supports batch text input: address lists on every network, Ethereum/Bitcoin public-key recovery, public-key BSGS, and the existing server scan. Address search checks candidates against all loaded targets. BSGS needs verified points and a bounded interval; GPU assists lookups only. These methods do not make full-range wallet recovery practical.</p></section>`;
 }
 
 function filteredBitcoinPuzzles() {
@@ -753,14 +832,14 @@ function pointSearchMarkup() {
   return `<section class="backward-panel dlog-panel" id="public-key-search">
     <div class="backward-heading"><div><span class="eyebrow">PUBLIC-KEY SEARCH · LOCAL ONLY</span><h3>Search uploaded Ethereum or Bitcoin public keys</h3></div><span class="live-example">PARALLEL BSGS</span></div>
     <p class="backward-intro">Upload the tab-separated TXT exported by “Extract public keys”. This uses parallel baby-step giant-step (BSGS), not kangaroo, to search every validated public point in the same inclusive interval. Workers share the targets; each uses its own table. The file stays in this browser.</p>
-    <div class="search-file-row"><div class="search-file-copy"><strong>Ethereum / Bitcoin public-key TXT</strong><small>Columns: address, transaction_hash, public_key_uncompressed, status; tab separated, status ok. Catalog-loaded keys use published-catalog instead of a transaction hash. Up to 10,000 rows and 5 MB. All rows must validate. Bitcoin P2PKH, P2WPKH and P2SH-P2WPKH only.</small></div><label class="search-file-button ${pointSearch.busy ? 'is-disabled' : ''}" for="point-search-file">Choose TXT</label><input id="point-search-file" type="file" accept=".txt,text/plain,.tsv,text/tab-separated-values" hidden ${pointSearch.busy ? 'disabled' : ''}><span class="search-file-name">${escapeHtml(pointSearch.fileName || 'No file selected')}</span></div>
+    <div class="search-file-row"><div class="search-file-copy"><strong>Ethereum / Bitcoin public-key TXT</strong><small>Columns: address, transaction_hash, public_key_uncompressed, status; tab separated, status ok. Catalog-loaded keys use published-catalog instead of a transaction hash. Up to 10,000 rows and 5 MB. All rows must validate. Bitcoin P2PKH, P2WPKH and P2SH-P2WPKH only.</small></div><label class="search-file-button ${pointSearch.busy ? 'is-disabled' : ''}" for="point-search-file">Choose batch TXT</label><input id="point-search-file" type="file" accept=".txt,text/plain,.tsv,text/tab-separated-values" hidden ${pointSearch.busy ? 'disabled' : ''}><span class="search-file-name">${escapeHtml(pointSearch.fileName || 'No file selected')}</span></div>
     <div class="candidate-range"><label>Lower scalar (inclusive)<input id="point-search-lower" type="text" inputmode="numeric" value="${escapeHtml(pointSearch.lower)}"></label><label>Upper scalar (inclusive)<input id="point-search-upper" type="text" inputmode="numeric" value="${escapeHtml(pointSearch.upper)}"></label></div>
     <div class="gpu-benchmark-panel"><span class="eyebrow">EVIDENCE-BASED RANGE PLANNER</span><h3>Understand your search range</h3><p>Use bounds supported by evidence, such as a published puzzle range. A public key does not reveal its private scalar’s bit length. No region is more likely for a uniformly random key.</p><div class="candidate-range"><label>Known exact bit length (optional)<input id="planner-bits" type="number" min="1" max="256" value="${escapeHtml(rangePlanner.bits)}" placeholder="e.g. 20"></label><label>Estimated target count<input id="planner-targets" type="number" min="1" max="10000" value="${escapeHtml(rangePlanner.targets)}"></label><label>Measured search slots/second (optional)<input id="planner-rate" type="number" min="0" value="${escapeHtml(rangePlanner.rate)}" placeholder="From a prior search"></label></div><div class="dlog-actions"><button class="search-file-button" id="planner-apply-bits" type="button">Apply bit-length bounds</button></div><p id="range-planner-error" class="kangaroo-error" role="alert">${escapeHtml(rangePlanner.error)}</p><div id="range-planner-output" aria-live="polite">${rangePlannerOutput()}</div></div>
     <div class="point-worker-control"><label for="point-search-backend">Compute mode</label><select id="point-search-backend" ${pointSearch.busy ? 'disabled' : ''}><option value="cpu" ${pointSearch.backend === 'cpu' ? 'selected' : ''}>CPU only</option><option value="webgpu-high" ${pointSearch.backend === 'webgpu-high' ? 'selected' : ''}>WebGPU · high-performance preference</option><option value="webgpu-low" ${pointSearch.backend === 'webgpu-low' ? 'selected' : ''}>WebGPU · low-power preference</option><option value="hybrid-high" ${pointSearch.backend === 'hybrid-high' ? 'selected' : ''}>Hybrid CPU + WebGPU · high-performance preference</option><option value="hybrid-low" ${pointSearch.backend === 'hybrid-low' ? 'selected' : ''}>Hybrid CPU + WebGPU · low-power preference</option></select><small>Experimental: GPU performs collision table lookups; CPU performs curve math and checks every GPU result. May be slower than CPU-only. Requires WebGPU in a secure context; if unavailable in a worker, the app checks the browser window. Adapter preference does not guarantee a specific GPU. Hybrid divides keys among CPU and WebGPU-assisted workers; it requires at least 2 workers and 2 keys. WebGPU-assisted groups use at most 2 workers. Full GPU elliptic-curve arithmetic is not implemented.</small></div>
     <div class="point-worker-control"><label for="point-search-workers">CPU workers</label><select id="point-search-workers" ${pointSearch.busy ? 'disabled' : ''}><option value="auto" ${pointSearch.workers === 'auto' ? 'selected' : ''}>Auto (up to 8)</option>${Array.from({ length: 32 }, (_, i) => `<option value="${i + 1}" ${pointSearch.workers === String(i + 1) ? 'selected' : ''}>${i + 1}</option>`).join('')}</select><small>CPU only · actual workers cannot exceed the number of targets. More workers increase CPU and memory use and may be slower. Your browser reports ${escapeHtml(navigator.hardwareConcurrency || 'unknown')} logical cores.</small></div>
     <p class="step-explanation subtle">You can edit bounds during a run; changes apply to the next search. Current run bounds remain unchanged.</p>
     <div class="dlog-warning"><strong>Bounded test only.</strong> Bounds may span the valid secp256k1 private scalar range: 1 to curve order minus one, which is slightly below 2²⁵⁶. The search processes at most 100,000,000 scalars per internal chunk. Large intervals can take vastly longer than a human lifetime; a full-range search is infeasible. No interval is more likely for a randomly generated key. Use only keys you are authorized to test.</div>
-    <div class="dlog-actions"><button class="action-button" id="point-search-start" type="button" ${pointSearch.busy || gpuBenchmark.busy || !pointSearch.text ? 'disabled' : ''}>Search uploaded public keys <span aria-hidden="true">↗</span></button>${pointSearch.busy ? '<button class="dlog-stop-button" id="point-search-stop" type="button">Stop search</button>' : ''}</div>
+    <div class="dlog-actions"><button class="action-button" id="point-search-start" type="button" ${pointSearch.busy || gpuBenchmark.busy || !pointSearch.text ? 'disabled' : ''}>Run batch public-key search <span aria-hidden="true">↗</span></button>${pointSearch.busy ? '<button class="dlog-stop-button" id="point-search-stop" type="button">Stop search</button>' : ''}</div>
     <div id="point-search-status">${pointSearchStatusMarkup()}</div>
     <div class="gpu-benchmark-panel"><div><span class="eyebrow">LOCAL · SYNTHETIC</span><h3>Benchmark your GPU</h3><p>Tests verified GPU table lookups only. No uploaded keys are used or sent. Copy the result to share it.</p></div><div class="point-worker-control"><label for="gpu-benchmark-preference">Adapter preference</label><select id="gpu-benchmark-preference" ${gpuBenchmark.busy ? 'disabled' : ''}><option value="high-performance" ${gpuBenchmark.preference === 'high-performance' ? 'selected' : ''}>High-performance preference</option><option value="low-power" ${gpuBenchmark.preference === 'low-power' ? 'selected' : ''}>Low-power preference</option></select><small>Browser may ignore this preference and redact adapter details. Results do not measure GPU elliptic-curve arithmetic.</small></div><div class="dlog-actions"><button class="action-button" id="run-gpu-benchmark" type="button" ${gpuBenchmark.busy || pointSearch.busy ? 'disabled' : ''}>Run GPU benchmark</button>${gpuBenchmark.busy ? '<button class="dlog-stop-button" id="stop-gpu-benchmark" type="button">Stop benchmark</button>' : ''}</div><div id="gpu-benchmark-status">${gpuBenchmarkStatusMarkup()}</div></div>
   </section>`;
@@ -971,19 +1050,19 @@ function render() {
       <div class="takeaway"><strong>Why address → phrase search is not practical</strong><span>With no phrase words known, a search must try up to 2<sup>128</sup> valid mnemonics (and know the passphrase and derivation path), derive each address, then compare. This is not a useful workload for the $85 EC2 budget.</span></div>
     </section>` : '';
   const publicKeyInputEntered = activeNetwork.family === 'evm' && looksLikeEvmPublicKey(labAddressInput ?? '');
-  const searchButtonLabel = discreteLogProgress ? 'Searching candidates…' : publicKeyInputEntered && !searchAddressFile?.addresses?.length
-    ? 'Calculate full Keccak-256 from public key' : 'Search candidate range';
+  const batchAddressCount = searchAddressFile?.addresses?.length ?? 0;
+  const searchButtonLabel = discreteLogProgress ? 'Searching candidates…' : batchAddressCount
+    ? `Run batch · ${batchAddressCount.toLocaleString()} address${batchAddressCount === 1 ? '' : 'es'}` : publicKeyInputEntered
+      ? 'Calculate full Keccak-256 from public key' : 'Search candidate range';
   const discreteLogLab = `
     <section class="backward-panel dlog-panel" id="search-lab">
       <div class="backward-heading"><div><span class="eyebrow">BOUNDED ADDRESS SEARCH · LOCAL ONLY</span><h3>Search ${activeNetwork.label}</h3></div><span class="live-example">INCLUSIVE RANGE · LOCAL WORKERS</span></div>
-      <p class="backward-intro">Paste a valid address or load a .txt list of Ethereum addresses. Search checks the inclusive scalar range below; choose a small test range. If a candidate matches, other workers stop after their current small chunk. It runs in browser workers; the address and candidates are not sent to EC2.</p>
+      <p class="backward-intro">Paste one valid address or choose a batch TXT for this network. Every candidate in the inclusive scalar range is checked against all loaded addresses. If a candidate matches, other workers stop after their current small chunk. Files and searches stay in this browser.</p>
       <div class="dlog-address-control"><label for="lab-address">${activeNetwork.label} address or public key</label><input id="lab-address" type="text" spellcheck="false" autocomplete="off" placeholder="${addressPlaceholder()}" value="${escapeHtml(labAddressInput ?? wallet.address ?? '')}" ${discreteLogProgress ? 'disabled' : ''}><small>${addressInputHint()}</small>${labAddressInput?.trim() ? '<button class="reverse-toggle" id="export-public-address" type="button">Export public address</button>' : ''}</div>
-      ${selectedNetworkId === 'ethereum' ? `
-        <div class="search-file-row"><div class="search-file-copy"><strong>Search Ethereum address lists</strong><small>Upload one address per line for the scalar search, or address,transaction-hash pairs to extract public keys. Pair format: address,tx_hash.</small></div><label class="search-file-button ${discreteLogProgress ? 'is-disabled' : ''}" for="search-address-file" aria-disabled="${Boolean(discreteLogProgress)}">Choose file</label><input id="search-address-file" type="file" accept=".txt,text/plain,.csv,text/csv" hidden ${discreteLogProgress ? 'disabled' : ''}>${searchAddressFile ? `<span class="search-file-name">${escapeHtml(searchAddressFile.name)} · ${searchAddressFile.addresses?.length ?? 0} addresses${searchAddressFile.transactions?.length ? ` · ${searchAddressFile.transactions.length} txs` : ''}</span><button class="search-file-clear" id="clear-search-file" type="button" ${discreteLogProgress ? 'disabled' : ''}>Clear</button>` : ''}</div>
-        ${searchAddressFile?.error ? `<p class="search-file-error" role="alert">${escapeHtml(searchAddressFile.error)}</p>` : ''}
-        ${searchAddressFile?.addresses?.length ? `<ul class="search-target-preview">${searchAddressFile.addresses.map((address, index) => `<li><b>${index + 1}.</b> <code>${escapeHtml(address)}</code></li>`).join('')}</ul>` : ''}
-        ${searchAddressFile?.transactions?.length ? `<div class="public-key-extract-panel"><label for="ethereum-rpc-endpoint">Ethereum JSON-RPC endpoint</label><input id="ethereum-rpc-endpoint" type="url" value="${escapeHtml(ethereumRpcEndpoint)}" spellcheck="false"><small>Extracts signer public keys from outgoing transactions. The transaction hashes are sent to this RPC provider; private keys are never requested.</small><button class="search-file-button" id="extract-public-keys" type="button">Extract public keys and download TXT</button><p id="public-key-extraction-status" role="status" aria-live="polite"></p></div>` : ''}
-      ` : ''}
+      <div class="search-file-row"><div class="search-file-copy"><strong>Batch TXT · ${activeNetwork.shortLabel} addresses</strong><small>One address per line, or separate multiple addresses with spaces, commas, semicolons or tabs. Up to 10,000 entries and 5 MB.${selectedNetworkId === 'ethereum' ? ' Ethereum also accepts address,tx_hash rows for public-key extraction.' : ` Only ${activeNetwork.label} addresses are accepted.`}</small></div><label class="search-file-button ${discreteLogProgress ? 'is-disabled' : ''}" for="search-address-file" aria-disabled="${Boolean(discreteLogProgress)}">Choose batch TXT</label><input id="search-address-file" type="file" accept=".txt,.csv,.tsv,text/plain,text/csv,text/tab-separated-values" hidden ${discreteLogProgress ? 'disabled' : ''}>${searchAddressFile ? `<span class="search-file-name">${escapeHtml(searchAddressFile.name)} · ${searchAddressFile.addresses?.length ?? 0} addresses${searchAddressFile.transactions?.length ? ` · ${searchAddressFile.transactions.length} txs` : ''}</span><button class="search-file-clear" id="clear-search-file" type="button" ${discreteLogProgress ? 'disabled' : ''}>Clear</button>` : ''}</div>
+      ${searchAddressFile?.error ? `<p class="search-file-error" role="alert">${escapeHtml(searchAddressFile.error)}</p>` : ''}
+      ${searchAddressFile?.addresses?.length ? `<ul class="search-target-preview">${searchAddressFile.addresses.slice(0, 25).map((address, index) => `<li><b>${index + 1}.</b> <code>${escapeHtml(address)}</code></li>`).join('')}${searchAddressFile.addresses.length > 25 ? `<li>… and ${(searchAddressFile.addresses.length - 25).toLocaleString()} more validated addresses</li>` : ''}</ul>` : ''}
+      ${searchAddressFile?.transactions?.length ? `<div class="public-key-extract-panel"><label for="ethereum-rpc-endpoint">Ethereum JSON-RPC endpoint</label><input id="ethereum-rpc-endpoint" type="url" value="${escapeHtml(ethereumRpcEndpoint)}" spellcheck="false"><small>Extracts signer public keys from outgoing transactions. The transaction hashes are sent to this RPC provider; private keys are never requested.</small><button class="search-file-button" id="extract-public-keys" type="button">Extract public keys and download TXT</button><p id="public-key-extraction-status" role="status" aria-live="polite"></p></div>` : ''}
       <div class="candidate-range"><label>Lower scalar (inclusive)<input id="search-lower" type="text" inputmode="numeric" value="${escapeHtml(searchLower)}"></label><label>Upper scalar (inclusive)<input id="search-upper" type="text" inputmode="numeric" value="${escapeHtml(searchUpper)}"></label></div>
       <p class="step-explanation subtle">You can edit bounds during a run; changes apply to the next search. Current run bounds remain unchanged.</p>
       <div class="dlog-warning"><strong>Bounded test only—not wallet recovery.</strong> Only a match in the chosen interval can be found; a miss says nothing about other scalars. Even a small-looking range can take a long time. Pollard kangaroo requires a public point and a known interval; it cannot search an address hash. One million candidates per second is not guaranteed; the actual rate depends on the device.</div>
@@ -1030,17 +1109,64 @@ function render() {
   passInput?.addEventListener('input', (event) => { passphrase = event.target.value; });
   document.querySelector('#network-select')?.addEventListener('change', selectNetwork);
   document.querySelector('#search-network-select')?.addEventListener('change', selectNetwork);
-  document.querySelector('#recovery-network')?.addEventListener('change', (event) => { keyRecovery = { ...keyRecovery, network: event.target.value, address: '', tx: '', result: null, error: '' }; render(); });
+  document.querySelector('#recovery-network')?.addEventListener('change', (event) => {
+    keyRecovery = { ...keyRecovery, network: event.target.value, address: '', tx: '', result: null, error: '', batchName: '', batchEntries: [], batchError: '', batchResults: null, batchCompleted: 0, cancelRequested: false };
+    render();
+  });
   document.querySelector('#recovery-address')?.addEventListener('input', (event) => { keyRecovery.address = event.target.value; });
   document.querySelector('#recovery-tx')?.addEventListener('input', (event) => { keyRecovery.tx = event.target.value; });
   document.querySelector('#recovery-rpc')?.addEventListener('input', (event) => { ethereumRpcEndpoint = event.target.value; });
   document.querySelector('#recover-key')?.addEventListener('click', recoverSinglePublicKey);
+  document.querySelector('#recovery-batch-file')?.addEventListener('change', async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const network = keyRecovery.network;
+    try {
+      if (file.size > MAX_BATCH_FILE_BYTES) throw new Error('Batch file exceeds the 5 MB limit.');
+      const entries = parseRecoveryBatch(await file.text(), network, (address) => validateRecoveryAddress(address, network));
+      if (network !== keyRecovery.network) return;
+      keyRecovery.batchName = file.name; keyRecovery.batchEntries = entries; keyRecovery.batchError = '';
+      keyRecovery.batchResults = null; keyRecovery.batchCompleted = 0; keyRecovery.cancelRequested = false;
+    } catch (error) {
+      if (network !== keyRecovery.network) return;
+      keyRecovery.batchName = file.name; keyRecovery.batchEntries = []; keyRecovery.batchError = error?.message ?? String(error);
+      keyRecovery.batchResults = null; keyRecovery.batchCompleted = 0;
+    }
+    render();
+  });
+  document.querySelector('#clear-recovery-batch')?.addEventListener('click', () => {
+    keyRecovery.batchName = ''; keyRecovery.batchEntries = []; keyRecovery.batchError = ''; keyRecovery.batchResults = null; keyRecovery.batchCompleted = 0; keyRecovery.cancelRequested = false;
+    render();
+  });
+  document.querySelector('#recover-batch')?.addEventListener('click', recoverBatchPublicKeys);
+  document.querySelector('#recover-batch-stop')?.addEventListener('click', (event) => {
+    keyRecovery.cancelRequested = true; event.target.disabled = true; event.target.textContent = 'Stopping after in-flight requests…';
+  });
+  document.querySelector('#download-recovery-batch')?.addEventListener('click', () => {
+    if (keyRecovery.batchResults) exportTextFile(`${keyRecovery.network}-public-key-batch-results.txt`, publicKeyResultsTsv(keyRecovery.batchResults));
+  });
+  document.querySelector('#copy-recovery-batch')?.addEventListener('click', async (event) => {
+    try { await copyToClipboard(publicKeyResultsTsv(keyRecovery.batchResults ?? [])); event.target.textContent = 'Results copied'; }
+    catch { event.target.textContent = 'Copy unavailable'; }
+  });
+  document.querySelector('#use-recovery-batch')?.addEventListener('click', () => {
+    if (!keyRecovery.batchResults || pointSearch.busy || gpuBenchmark.busy) return;
+    try {
+      pointSearch.text = publicKeyResultsTsv(keyRecovery.batchResults, { successfulOnly: true });
+      const count = keyRecovery.batchResults.filter((row) => row.status === 'ok' && row.publicKey).length;
+      pointSearch.fileName = `${keyRecovery.network} recovery batch · ${count} keys`;
+      pointSearch.result = null; pointSearch.progress = null; pointSearch.error = ''; pointSearch.count = 0;
+      rangePlanner.targets = String(count); rangePlanner.error = '';
+      render(); document.querySelector('#public-key-search')?.scrollIntoView({ behavior: 'smooth' });
+    } catch (error) { keyRecovery.batchError = error?.message ?? String(error); render(); }
+  });
   document.querySelector('#copy-recovered-key')?.addEventListener('click', async (event) => { try { await copyToClipboard(keyRecovery.result.publicKey); event.target.textContent = 'Copied'; } catch { event.target.textContent = 'Copy unavailable'; } });
   document.querySelector('#use-recovered-key')?.addEventListener('click', () => {
     if (!keyRecovery.result || pointSearch.busy || gpuBenchmark.busy) return;
     const { address, txHash, publicKey } = keyRecovery.result;
     pointSearch.text = `address\ttransaction_hash\tpublic_key_uncompressed\tstatus\n${address}\t${txHash}\t${publicKey}\tok\n`;
     pointSearch.fileName = 'Verified extracted key'; pointSearch.result = null; pointSearch.error = '';
+    rangePlanner.targets = '1'; rangePlanner.error = '';
     render(); document.querySelector('#public-key-search')?.scrollIntoView({ behavior: 'smooth' });
   });
   document.querySelector('#puzzle-filter')?.addEventListener('change', (event) => {
@@ -1143,14 +1269,18 @@ function render() {
   document.querySelector('#search-address-file')?.addEventListener('change', async (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
+    const networkId = selectedNetworkId;
     try {
-      const parsedFile = parseAddressFile(await file.text(), selectedNetworkId);
+      if (file.size > MAX_BATCH_FILE_BYTES) throw new Error('Batch file exceeds the 5 MB limit.');
+      const parsedFile = parseAddressBatch(await file.text(), (value) => validateAddressBatchEntry(value, networkId), { ethereumTransactions: networkId === 'ethereum' });
+      if (networkId !== selectedNetworkId) return;
       invalidateSearch();
       searchAddressFile = { name: file.name, ...parsedFile, error: null };
       render();
     } catch (error) {
+      if (networkId !== selectedNetworkId) return;
       invalidateSearch();
-      searchAddressFile = { name: file.name, addresses: [], error: error.message };
+      searchAddressFile = { name: file.name, addresses: [], transactions: [], error: error.message };
       render();
     }
   });
@@ -1357,6 +1487,12 @@ function parseEvmPublicKey(input) {
   }
 }
 
+function validateAddressBatchEntry(input, networkId) {
+  const parsed = parseNetworkAddress(input, networkId);
+  if (parsed.valid && parsed.inputKind === 'publicKey') return { valid: false, reason: 'Batch files must contain addresses, not public keys.' };
+  return parsed;
+}
+
 function parseNetworkAddress(input, networkId = selectedNetworkId) {
   const network = NETWORKS[networkId];
   if (network.family === 'evm') {
@@ -1426,42 +1562,6 @@ function deriveNetworkAddress() {
   wallet.btcChecksum = data.btcChecksum ?? null;
   wallet.taprootData = data.taprootData ?? null;
   wallet.address = data.address;
-}
-
-function parseAddressFile(contents, networkId) {
-  const lines = contents.split(/\r?\n/);
-  const tokens = [];
-  const transactions = [];
-  const isAddress = (value) => /^0x[0-9a-fA-F]{40}$/.test(value);
-  const isTransactionHash = (value) => /^0x[0-9a-fA-F]{64}$/.test(value);
-
-  for (const [index, line] of lines.entries()) {
-    const trimmed = line.trim().replace(/^\uFEFF/, '');
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    if (/^address[\s,;]+(?:tx_?hash|transaction_?hash)$/i.test(trimmed)) continue;
-
-    const columns = trimmed.split(/[,;\t]+/).map((value) => value.trim()).filter(Boolean);
-    if (columns.length === 2 && isAddress(columns[0]) && isTransactionHash(columns[1])) {
-      tokens.push(columns[0]);
-      transactions.push({ address: columns[0], txHash: columns[1] });
-      continue;
-    }
-
-    const addressTokens = trimmed.split(/[\s,;]+/).filter(Boolean);
-    if (!addressTokens.length || addressTokens.some((token) => !isAddress(token))) {
-      throw new Error(`Line ${index + 1} must contain Ethereum addresses, or an address and transaction hash separated by a comma.`);
-    }
-    tokens.push(...addressTokens);
-  }
-
-  if (!tokens.length) throw new Error('The text file contains no Ethereum addresses.');
-  const unique = new Map();
-  for (const token of tokens) {
-    const parsed = parseNetworkAddress(token, networkId);
-    if (!parsed.valid) throw new Error(`Invalid address in file: ${parsed.reason}`);
-    unique.set(parsed.normalized.toLowerCase(), parsed.display);
-  }
-  return { addresses: [...unique.values()], transactions };
 }
 
 async function fetchEthereumTransaction(rpcUrl, txHash, requestId) {
@@ -1583,13 +1683,13 @@ async function runDiscreteLogLab() {
   invalidateSearch();
   const addressInput = document.querySelector('#lab-address')?.value.trim() ?? '';
   labAddressInput = addressInput;
-  if (selectedNetworkId === 'ethereum' && searchAddressFile?.error) {
+  if (searchAddressFile?.error) {
     discreteLogResult = { status: 'invalid', addressInput, reason: 'The selected address file must be corrected or cleared before searching.' };
     render();
     return;
   }
   let targets;
-  if (selectedNetworkId === 'ethereum' && searchAddressFile?.addresses?.length) {
+  if (searchAddressFile?.addresses?.length) {
     targets = searchAddressFile.addresses.map((address) => parseNetworkAddress(address, selectedNetworkId));
   } else {
     const parsed = parseNetworkAddress(addressInput);
