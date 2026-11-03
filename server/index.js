@@ -18,9 +18,10 @@ const MODE = process.env.STORE_MODE || 'memory';
 const PORT = Number(process.env.PORT || 8787);
 const DIST = new URL('../dist/', import.meta.url);
 
-export function createApp() {
+export function createApp({ localRoutes } = {}) {
   const app = new Hono();
   const store = createStore(MODE);
+  if (localRoutes) localRoutes(app);
 
   app.get('/health', (c) => c.json({ ok: true, mode: MODE }));
 
@@ -103,8 +104,16 @@ export function createApp() {
 
 // Node entry point (local dev / EC2 process).
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const app = createApp();
-  serve({ fetch: app.fetch, port: PORT, hostname: '0.0.0.0' }, (info) => {
+  const { registerNativePuzzleRoutes, shutdownNativePuzzle } = await import('./native-puzzle.mjs');
+  const app = createApp({ localRoutes: registerNativePuzzleRoutes });
+  const httpServer = serve({ fetch: app.fetch, port: PORT, hostname: '0.0.0.0' }, (info) => {
     console.log(`Seedlab scan API listening on http://localhost:${info.port} (mode=${MODE})`);
   });
+  httpServer.once('close', shutdownNativePuzzle);
+  const shutdown = () => {
+    shutdownNativePuzzle();
+    httpServer.close(() => process.exit(0));
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
 }
