@@ -19,7 +19,7 @@ import { bitcoinPuzzlePointSearchText, createBitcoinPuzzleMatchExport } from './
 import { MAX_BATCH_FILE_BYTES, parseAddressBatch, parseRecoveryBatch, publicKeyResultsTsv } from './batch-files.js';
 import { runRecoveryBatch } from './recovery-batch.js';
 import { createPuzzleCampaignSnapshot, puzzleCampaignContentMarkup, puzzleCampaignStatusMarkup } from './puzzle-campaigns.js';
-import { createNativePuzzleState, firstNativePuzzleChunk, nativePuzzleMarkup, nativePuzzleRequest, nativePuzzleStatusMarkup, nextNativePuzzleChunk, validateNativePuzzleInput } from './native-puzzle.js';
+import { createNativePuzzleState, nativePuzzleMarkup, nativePuzzleRequest, nativePuzzleStatusMarkup, nextNativePuzzleChunk } from './native-puzzle.js';
 import { generateScalarBatch, parseScalarBatchRange } from './scalar-wallet.js';
 import './style.css';
 
@@ -1005,7 +1005,7 @@ async function refreshNativePuzzleStatus() {
     nativePuzzle.error = '';
   } catch (error) {
     if (!nativePuzzle.runner) {
-      nativePuzzle.runner = { available: false, version: '', reason: 'The native API requires the Seedlab Vite workspace server and a locally installed pzsolve runner. Static hosting cannot start native scans.' };
+      nativePuzzle.runner = { available: false, version: '', reason: 'The native API requires the Seedlab Vite or production Node server and a locally installed pzsolve runner. Static hosting cannot start native scans.' };
     }
     nativePuzzle.error = nativePuzzle.runner.available
       ? 'Native status refresh failed; showing the last available snapshot.'
@@ -1018,17 +1018,10 @@ async function refreshNativePuzzleStatus() {
 }
 
 async function runNativePuzzleAction(action, campaign = '') {
-  if (action === 'next' || action === 'reset') {
-    try {
-      const chunk = action === 'reset'
-        ? firstNativePuzzleChunk(nativePuzzle.puzzleId)
-        : nextNativePuzzleChunk(nativePuzzle.puzzleId, nativePuzzle.lower, nativePuzzle.upper);
-      nativePuzzle.lower = chunk.lower;
-      nativePuzzle.upper = chunk.upper;
-      nativePuzzle.error = '';
-    } catch (error) {
-      nativePuzzle.error = error?.message ?? String(error);
-    }
+  if (action === 'reset') {
+    nativePuzzle.lower = '';
+    nativePuzzle.upper = '';
+    nativePuzzle.error = '';
     render();
     return;
   }
@@ -1037,12 +1030,28 @@ async function runNativePuzzleAction(action, campaign = '') {
   nativePuzzle.error = '';
   render();
   try {
-    if (action === 'start') {
-      validateNativePuzzleInput(nativePuzzle.puzzleId, nativePuzzle.lower, nativePuzzle.upper);
-      await nativePuzzleRequest('start', {
+    if (action === 'next') {
+      let bounds = { lower: '', upper: '' };
+      if (nativePuzzle.lower.trim() || nativePuzzle.upper.trim()) {
+        if (!nativePuzzle.lower.trim() || !nativePuzzle.upper.trim()) throw new Error('Enter both bounds to advance a custom chunk, or clear both for automatic mode.');
+        bounds = nextNativePuzzleChunk(nativePuzzle.puzzleId, nativePuzzle.lower, nativePuzzle.upper);
+      }
+      const plan = await nativePuzzleRequest('plan', {
+        method: 'POST',
+        body: { puzzle: nativePuzzle.puzzleId, ...bounds },
+      });
+      nativePuzzle.lower = plan.lower;
+      nativePuzzle.upper = plan.upper;
+    } else if (action === 'start') {
+      const customBounds = Boolean(nativePuzzle.lower.trim() || nativePuzzle.upper.trim());
+      const result = await nativePuzzleRequest('start', {
         method: 'POST',
         body: { puzzle: nativePuzzle.puzzleId, lower: nativePuzzle.lower, upper: nativePuzzle.upper, threads: Number(nativePuzzle.threads) },
       });
+      if (customBounds && result.job) {
+        nativePuzzle.lower = result.job.lower;
+        nativePuzzle.upper = result.job.upper;
+      }
     } else if (action === 'stop' || action === 'resume') {
       if (!campaign) throw new Error('A native campaign is required.');
       await nativePuzzleRequest(action, { method: 'POST', body: { campaign } });
@@ -1325,9 +1334,8 @@ function render() {
   document.querySelector('#puzzle-select')?.addEventListener('change', (event) => { puzzleCatalog.selectedId = Number(event.target.value); render(); });
   document.querySelector('#native-puzzle-id')?.addEventListener('change', (event) => {
     nativePuzzle.puzzleId = Number(event.target.value);
-    const chunk = firstNativePuzzleChunk(nativePuzzle.puzzleId);
-    nativePuzzle.lower = chunk.lower;
-    nativePuzzle.upper = chunk.upper;
+    nativePuzzle.lower = '';
+    nativePuzzle.upper = '';
     nativePuzzle.error = '';
     render();
   });

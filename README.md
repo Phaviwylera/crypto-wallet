@@ -136,9 +136,9 @@ Every puzzle #N has inclusive bounds `2^(N−1)` through `2^N−1`. The UI can f
 
 The catalog does not enumerate or export candidate private keys and does not scan unrelated wallets for balances. If a bounded search finds a scalar for a recognized catalog address, the results list it and offer download and clipboard export. Export independently requires the scalar to be inside the published bounds, recomputes `scalar × G`, checks it against the supplied public point, and verifies the compressed P2PKH address before including the decimal scalar and 32-byte hexadecimal private key. It explicitly reports that no balance was checked. Large published ranges remain computationally infeasible even though they are narrower than the full secp256k1 range.
 
-### Native C public-puzzle scanner (optional local backend)
+### Native C public-puzzle scanner (persistent backend)
 
-The **Native pzsolve address scanner** panel integrates the optimized native runner instead of using browser JavaScript for large public-puzzle address scans. It is implemented as Vite dev/preview middleware, so no second API port is required. The browser calls relative `/api/native-puzzle/*` endpoints. Static hosting cannot start processes and reports the native scanner as unavailable.
+The **Native pzsolve address scanner** panel integrates the optimized native runner instead of using browser JavaScript for large public-puzzle address scans. The browser calls relative, same-origin `/api/native-puzzle/*` endpoints. Both the Vite dev/preview server and the production Node server implement these routes. Static hosting, including the Vercel static deployment, cannot start or checkpoint native processes and reports the scanner as unavailable.
 
 Install the pinned runner once (Git, Make and a C compiler are required):
 
@@ -149,6 +149,15 @@ npm run dev
 
 The setup clones [`boulayo/bitcoin-puzzle-solver`](https://github.com/boulayo/bitcoin-puzzle-solver), checks out commit `f6b85a19411e61258ad6ecc5af7d20d521fdb7d7`, builds `pzsolve 1.21.0`, installs it under the Git-ignored `.runtime/bin/` directory, and runs its 623-check CPU self-test suite. Restart Vite if it was running during installation. `PZSOLVE_BIN` can point to an existing compatible binary instead.
 
-Choose a built-in public puzzle, exact inclusive decimal bounds and 1–32 CPU threads, then click **Start native scan**. The backend restricts targets to the published puzzle catalog and rejects intervals outside that puzzle's bounds. It spawns argument arrays without a shell and allows one native scan at a time. **Stop and checkpoint** sends SIGTERM; **Resume** continues the stored campaign. **Load next chunk** advances by the current interval size without overlapping the prior interval. Progress comes from actual `status.json` campaign data, not a browser animation.
+For a persistent production UI on a Node host:
 
-Runtime campaigns and registry metadata stay under Git-ignored `.runtime/native-puzzle-*` directories. The API reports whether a key was found but never returns the contents of `FOUND.txt`; retrieve that sensitive file directly on the runner machine. A completed run covers only its displayed custom interval and says nothing about the rest of the puzzle. Native SIMD improves speed substantially but does not make full open-puzzle ranges practical.
+```sh
+npm run build
+npm start
+```
+
+`npm start` serves `dist/` and the native API on port `8787` (`PORT` can override it). Keep the UI and API same-origin, either directly through this server or with a reverse proxy. The host needs a persistent `.runtime/` directory and enough CPU for the scan. Put the service behind access control; do not expose unauthenticated process-control endpoints to the public Internet. Merely redeploying static files to Vercel cannot enable this feature.
+
+Bounds are optional decimal inclusive values. With both blank, the backend selects the first unscanned gap between the selected puzzle's published lower and upper bounds. With one blank, that side defaults to the corresponding published bound. Fully completed campaign intervals are merged and skipped; custom windows are trimmed to their first unscanned gap. **Load next unscanned** uses the same coverage-aware planner. A stopped or incomplete campaign is never counted as a contiguous scanned prefix—resume it instead of skipping unaudited work. Progress comes from actual `status.json` campaign data, not a browser animation.
+
+The backend restricts targets to the published puzzle catalog, spawns argument arrays without a shell, and allows one native scan at a time. **Stop and checkpoint** sends SIGTERM; **Resume** continues the stored campaign. Runtime campaigns and registry metadata stay under Git-ignored `.runtime/native-puzzle-*` directories. Preserve and migrate both directories when moving hosts, or the new host will not know which intervals completed. The API reports whether a key was found but never returns the contents of `FOUND.txt`; retrieve that sensitive file directly on the runner machine. A completed run covers only its displayed interval and says nothing about the rest of the puzzle. Native SIMD improves speed substantially but does not make full open-puzzle ranges practical.

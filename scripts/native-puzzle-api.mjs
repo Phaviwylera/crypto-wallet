@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { getBitcoinPuzzle } from '../src/bitcoin-puzzles.js';
 import { parseSearchRange } from '../src/search-range.js';
+import { planNativePuzzleRange } from '../src/native-puzzle-planner.js';
 
 const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -262,31 +263,52 @@ async function launch(job, resume) {
   }
 }
 
+export async function getNativePuzzleStatus() {
+  const [runner, jobs] = await Promise.all([runnerInfo(), listJobs()]);
+  return {
+    runner,
+    jobs,
+    activeCampaign: jobs.find((job) => job.processAlive)?.campaign ?? null,
+    serverTime: new Date().toISOString(),
+  };
+}
+
 async function statusHandler(request, response) {
   if (request.method !== 'GET' && request.method !== 'HEAD') {
     response.setHeader('allow', 'GET, HEAD');
     throw apiError('Method not allowed.', 405);
   }
-  const [runner, jobs] = await Promise.all([runnerInfo(), listJobs()]);
-  sendJson(response, 200, {
-    runner,
-    jobs,
-    activeCampaign: jobs.find((job) => job.processAlive)?.campaign ?? null,
-    serverTime: new Date().toISOString(),
-  }, request.method);
+  sendJson(response, 200, await getNativePuzzleStatus(), request.method);
 }
 
-async function startHandler(request, response) {
+export async function planNativePuzzle(body) {
+  const plan = planNativePuzzleRange(body.puzzle, body.lower, body.upper, await listJobs(0));
+  return {
+    ok: true,
+    puzzle: plan.puzzle.id,
+    lower: plan.range.start.toString(),
+    upper: plan.range.end.toString(),
+    count: plan.range.count.toString(),
+    automatic: plan.automatic,
+    adjusted: plan.adjusted,
+  };
+}
+
+async function planHandler(request, response) {
   if (request.method !== 'POST') {
     response.setHeader('allow', 'POST');
     throw apiError('Method not allowed.', 405);
   }
-  const body = await readJsonBody(request);
-  const { puzzle, range } = validateNativePuzzleRange(body.puzzle, body.lower, body.upper);
+  sendJson(response, 200, await planNativePuzzle(await readJsonBody(request)));
+}
+
+export async function startNativePuzzle(body) {
+  const plan = planNativePuzzleRange(body.puzzle, body.lower, body.upper, await listJobs(0));
+  const { puzzle, range } = plan;
   const runner = await runnerInfo();
   if (!runner.available) throw apiError(runner.reason, 503);
   const campaign = nativeCampaignName(puzzle.id, range);
-  if (existsSync(registryFile(campaign))) throw apiError('This exact range already has a native campaign. Resume it or load the next chunk.', 409);
+  if (existsSync(registryFile(campaign))) throw apiError('This exact range already has a native campaign. Resume it or load the next unscanned range.', 409);
   const now = new Date().toISOString();
   const job = {
     campaign,
@@ -314,7 +336,26 @@ async function startHandler(request, response) {
     }
     throw error;
   }
-  sendJson(response, 202, { ok: true, job: await publicJob(job) });
+  return { ok: true, job: await publicJob(job) };
+}
+
+async function startHandler(request, response) {
+  if (request.method !== 'POST') {
+    response.setHeader('allow', 'POST');
+    throw apiError('Method not allowed.', 405);
+  }
+  sendJson(response, 202, await startNativePuzzle(await readJsonBody(request)));
+}
+
+export async function resumeNativePuzzle(body) {
+  const job = await readJob(String(body.campaign || ''));
+  const current = await publicJob(job);
+  if (current.found || current.state === 'COMPLETED') throw apiError('A completed range cannot be resumed; load the next unscanned range.', 409);
+  if (current.processAlive) throw apiError('This campaign is already running.', 409);
+  const runner = await runnerInfo();
+  if (!runner.available) throw apiError(runner.reason, 503);
+  await launch(job, true);
+  return { ok: true, job: await publicJob(job) };
 }
 
 async function resumeHandler(request, response) {
@@ -322,23 +363,10 @@ async function resumeHandler(request, response) {
     response.setHeader('allow', 'POST');
     throw apiError('Method not allowed.', 405);
   }
-  const body = await readJsonBody(request);
-  const job = await readJob(String(body.campaign || ''));
-  const current = await publicJob(job);
-  if (current.found || current.state === 'COMPLETED') throw apiError('A completed range cannot be resumed; load the next chunk.', 409);
-  if (current.processAlive) throw apiError('This campaign is already running.', 409);
-  const runner = await runnerInfo();
-  if (!runner.available) throw apiError(runner.reason, 503);
-  await launch(job, true);
-  sendJson(response, 202, { ok: true, job: await publicJob(job) });
+  sendJson(response, 202, await resumeNativePuzzle(await readJsonBody(request)));
 }
 
-async function stopHandler(request, response) {
-  if (request.method !== 'POST') {
-    response.setHeader('allow', 'POST');
-    throw apiError('Method not allowed.', 405);
-  }
-  const body = await readJsonBody(request);
+export async function stopNativePuzzle(body) {
   const campaign = String(body.campaign || '');
   registryFile(campaign);
   const active = children.get(campaign);
@@ -350,7 +378,19 @@ async function stopHandler(request, response) {
   await saveJob(job);
   if (active) active.child.kill('SIGTERM');
   else process.kill(externalPid, 'SIGTERM');
-  sendJson(response, 202, { ok: true, job: await publicJob(job) });
+  return { ok: true, job: await publicJob(job) };
+}
+
+async function stopHandler(request, response) {
+  if (request.method !== 'POST') {
+    response.setHeader('allow', 'POST');
+    throw apiError('Method not allowed.', 405);
+  }
+  sendJson(response, 202, await stopNativePuzzle(await readJsonBody(request)));
+}
+
+export function shutdownNativePuzzle() {
+  for (const { child } of children.values()) child.kill('SIGTERM');
 }
 
 function wrap(handler) {
@@ -366,10 +406,9 @@ function wrap(handler) {
 
 export function nativePuzzleApi() {
   const register = (server) => {
-    server.httpServer?.once('close', () => {
-      for (const { child } of children.values()) child.kill('SIGTERM');
-    });
+    server.httpServer?.once('close', shutdownNativePuzzle);
     server.middlewares.use('/api/native-puzzle/status', wrap(statusHandler));
+    server.middlewares.use('/api/native-puzzle/plan', wrap(planHandler));
     server.middlewares.use('/api/native-puzzle/start', wrap(startHandler));
     server.middlewares.use('/api/native-puzzle/resume', wrap(resumeHandler));
     server.middlewares.use('/api/native-puzzle/stop', wrap(stopHandler));

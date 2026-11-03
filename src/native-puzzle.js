@@ -35,7 +35,8 @@ export function nextNativePuzzleChunk(puzzleId, lower, upper) {
 export function createNativePuzzleState() {
   return {
     puzzleId: 71,
-    ...firstNativePuzzleChunk(71),
+    lower: '',
+    upper: '',
     threads: '2',
     runner: null,
     jobs: [],
@@ -112,19 +113,24 @@ export function nativePuzzleStatusMarkup(state) {
 
 export function nativePuzzleMarkup(state) {
   const active = state.jobs.some((job) => job.processAlive);
-  let count = '—';
-  try {
-    count = parseSearchRange(state.lower, state.upper).count.toLocaleString('en-US');
-  } catch {
-    // The backend will show the validation error when Start is pressed.
+  const puzzle = getBitcoinPuzzle(Number(state.puzzleId));
+  const hasBounds = Boolean(state.lower.trim() || state.upper.trim());
+  let rangeDescription = '<b>Automatic unscanned mode.</b> Blank bounds select the first gap in the published lower–upper range that is not covered by a completed campaign.';
+  if (hasBounds) {
+    try {
+      const count = parseSearchRange(state.lower.trim() || puzzle.lower, state.upper.trim() || puzzle.upper).count.toLocaleString('en-US');
+      rangeDescription = `Requested window: <b>${count} candidates</b>. Completed portions are skipped; the actual campaign bounds appear in its status card.`;
+    } catch {
+      rangeDescription = 'Enter decimal bounds, or clear both fields for automatic unscanned mode.';
+    }
   }
   return `<section class="backward-panel dlog-panel native-puzzle-panel" id="native-puzzle">
-    <div class="backward-heading"><div><span class="eyebrow">OPTIONAL LOCAL BACKEND · NATIVE C</span><h3>Native pzsolve address scanner</h3></div><span class="live-example">AVX / SIMD · CHECKPOINTS</span></div>
-    <p class="step-explanation">Runs the validated native pzsolve executable against built-in public Bitcoin Puzzle targets only. It uses the same custom inclusive ranges as the CLI, with no browser worker or candidate TXT overhead. One scan at a time; large full ranges remain infeasible.</p>
-    <div class="candidate-range native-puzzle-inputs"><label>Public puzzle<select id="native-puzzle-id">${BITCOIN_PUZZLES.map((puzzle) => `<option value="${puzzle.id}" ${puzzle.id === state.puzzleId ? 'selected' : ''}>#${puzzle.id} · ${puzzle.status} snapshot</option>`).join('')}</select></label><label>CPU threads<input id="native-puzzle-threads" type="number" min="1" max="32" value="${escapeHtml(state.threads)}"></label></div>
-    <div class="candidate-range"><label>Lower scalar (inclusive)<input id="native-puzzle-lower" type="text" inputmode="numeric" value="${escapeHtml(state.lower)}"></label><label>Upper scalar (inclusive)<input id="native-puzzle-upper" type="text" inputmode="numeric" value="${escapeHtml(state.upper)}"></label></div>
-    <p class="step-explanation subtle">Current custom interval: <b>${count} candidates</b>. Next chunk advances by the same count without overlap. No subrange is claimed to be more likely.</p>
-    <div class="dlog-actions"><button class="action-button" id="native-puzzle-start" type="button" data-native-action="start" ${state.actionBusy || active || state.runner?.available === false ? 'disabled' : ''}>${state.actionBusy ? 'Working…' : 'Start native scan'}<span aria-hidden="true">↗</span></button><button class="search-file-button" type="button" data-native-action="next" ${state.actionBusy ? 'disabled' : ''}>Load next chunk</button><button class="search-file-button" type="button" data-native-action="reset" ${state.actionBusy ? 'disabled' : ''}>Reset first chunk</button></div>
+    <div class="backward-heading"><div><span class="eyebrow">PERSISTENT NATIVE BACKEND · NATIVE C</span><h3>Native pzsolve address scanner</h3></div><span class="live-example">AVX / SIMD · CHECKPOINTS</span></div>
+    <p class="step-explanation">Runs the validated native pzsolve executable against built-in public Bitcoin Puzzle targets only. Bounds are optional and inclusive. One scan at a time; large full ranges remain infeasible. Only completed campaigns count as coverage—resume stopped campaigns instead of treating their counters as contiguous prefixes.</p>
+    <div class="candidate-range native-puzzle-inputs"><label>Public puzzle<select id="native-puzzle-id">${BITCOIN_PUZZLES.map((entry) => `<option value="${entry.id}" ${entry.id === state.puzzleId ? 'selected' : ''}>#${entry.id} · ${entry.status} snapshot</option>`).join('')}</select></label><label>CPU threads<input id="native-puzzle-threads" type="number" min="1" max="32" value="${escapeHtml(state.threads)}"></label></div>
+    <div class="candidate-range"><label>Lower scalar (optional, inclusive)<input id="native-puzzle-lower" type="text" inputmode="numeric" placeholder="Auto · ${puzzle.lower}" value="${escapeHtml(state.lower)}"></label><label>Upper scalar (optional, inclusive)<input id="native-puzzle-upper" type="text" inputmode="numeric" placeholder="Auto · ${puzzle.upper}" value="${escapeHtml(state.upper)}"></label></div>
+    <p class="step-explanation subtle">${rangeDescription} No subrange is claimed to be more likely.</p>
+    <div class="dlog-actions"><button class="action-button" id="native-puzzle-start" type="button" data-native-action="start" ${state.actionBusy || active || state.runner?.available === false ? 'disabled' : ''}>${state.actionBusy ? 'Working…' : 'Start unscanned scan'}<span aria-hidden="true">↗</span></button><button class="search-file-button" type="button" data-native-action="next" ${state.actionBusy ? 'disabled' : ''}>Load next unscanned</button><button class="search-file-button" type="button" data-native-action="reset" ${state.actionBusy ? 'disabled' : ''}>Clear bounds / auto</button></div>
     <div id="native-puzzle-status" aria-live="polite">${nativePuzzleStatusMarkup(state)}</div>
   </section>`;
 }

@@ -11,6 +11,8 @@ test('native puzzle chunks are inclusive, contiguous and keep their size', () =>
   assert.equal(BigInt(next.upper) - BigInt(next.lower) + 1n, 10000000n);
   assert.equal(firstNativePuzzleChunk(1).upper, '1');
   assert.equal(createNativePuzzleState().puzzleId, 71);
+  assert.equal(createNativePuzzleState().lower, '');
+  assert.equal(createNativePuzzleState().upper, '');
 });
 
 test('native ranges cannot escape the selected public puzzle bounds', () => {
