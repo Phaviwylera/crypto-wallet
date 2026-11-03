@@ -1128,6 +1128,7 @@ async function runNativePuzzleAction(action, campaign = '') {
       const plan = await nativePuzzleRequest('plan', {
         method: 'POST',
         body: { puzzle: nativePuzzle.puzzleId, ...bounds },
+        accessToken: nativePuzzle.accessToken,
       });
       nativePuzzle.lower = plan.lower;
       nativePuzzle.upper = plan.upper;
@@ -1136,6 +1137,7 @@ async function runNativePuzzleAction(action, campaign = '') {
       const result = await nativePuzzleRequest('start', {
         method: 'POST',
         body: { puzzle: nativePuzzle.puzzleId, lower: nativePuzzle.lower, upper: nativePuzzle.upper, threads: Number(nativePuzzle.threads) },
+        accessToken: nativePuzzle.accessToken,
       });
       if (customBounds && result.job) {
         nativePuzzle.lower = result.job.lower;
@@ -1143,7 +1145,7 @@ async function runNativePuzzleAction(action, campaign = '') {
       }
     } else if (action === 'stop' || action === 'resume') {
       if (!campaign) throw new Error('A native campaign is required.');
-      await nativePuzzleRequest(action, { method: 'POST', body: { campaign } });
+      await nativePuzzleRequest(action, { method: 'POST', body: { campaign }, accessToken: nativePuzzle.accessToken });
     } else {
       throw new Error('Unknown native puzzle action.');
     }
@@ -1429,7 +1431,7 @@ function render() {
     nativePuzzle.error = '';
     render();
   });
-  for (const [id, key] of [['#native-puzzle-lower', 'lower'], ['#native-puzzle-upper', 'upper'], ['#native-puzzle-threads', 'threads']]) {
+  for (const [id, key] of [['#native-puzzle-lower', 'lower'], ['#native-puzzle-upper', 'upper'], ['#native-puzzle-threads', 'threads'], ['#native-puzzle-token', 'accessToken']]) {
     document.querySelector(id)?.addEventListener('input', (event) => { nativePuzzle[key] = event.target.value; });
   }
   document.querySelector('#native-puzzle')?.addEventListener('click', (event) => {

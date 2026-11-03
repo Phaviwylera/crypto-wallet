@@ -46,6 +46,30 @@ test('production native routes expose completed coverage without requiring a run
   assert.equal('privateKey' in snapshot.jobs[0], false);
 });
 
+test('native process controls accept only the configured bearer token while status stays read-only', async () => {
+  const token = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+  process.env.NATIVE_PUZZLE_API_TOKEN = token;
+  try {
+    const app = new Hono();
+    registerNativePuzzleRoutes(app);
+    const body = JSON.stringify({ puzzle: 2, lower: '', upper: '' });
+    const missing = await app.request('/api/native-puzzle/plan', { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+    assert.equal(missing.status, 401);
+    const wrong = await app.request('/api/native-puzzle/plan', {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer wrong' }, body,
+    });
+    assert.equal(wrong.status, 401);
+    const authorized = await app.request('/api/native-puzzle/plan', {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body,
+    });
+    assert.equal(authorized.status, 200);
+    const status = await app.request('/api/native-puzzle/status');
+    assert.equal(status.status, 200);
+  } finally {
+    delete process.env.NATIVE_PUZZLE_API_TOKEN;
+  }
+});
+
 test('production entry point registers native GET routes before the SPA fallback', async () => {
   const app = createApp({ localRoutes: registerNativePuzzleRoutes });
   const response = await app.request('/api/native-puzzle/status');

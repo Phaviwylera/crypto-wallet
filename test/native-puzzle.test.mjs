@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildNativeHuntArgs, nativeCampaignName, validateNativePuzzleRange } from '../scripts/native-puzzle-api.mjs';
-import { createNativePuzzleState, firstNativePuzzleChunk, nativePuzzleStatusMarkup, nextNativePuzzleChunk } from '../src/native-puzzle.js';
+import { createNativePuzzleState, firstNativePuzzleChunk, nativePuzzleRequest, nativePuzzleStatusMarkup, nextNativePuzzleChunk } from '../src/native-puzzle.js';
 
 test('native puzzle chunks are inclusive, contiguous and keep their size', () => {
   const first = firstNativePuzzleChunk(71);
@@ -36,6 +36,24 @@ test('native hunt arguments preserve exact hex ranges and resume identity', () =
   assert.ok(!args.includes('--resume'));
   assert.ok(buildNativeHuntArgs(job, true).includes('--resume'));
   assert.equal(nativeCampaignName(71, { start: range.start + 1n, end: range.end }) === campaign, false);
+});
+
+test('native API requests attach a bearer token only for an authenticated control', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    await nativePuzzleRequest('status');
+    await nativePuzzleRequest('start', { method: 'POST', body: { puzzle: 2 }, accessToken: 'test-token' });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(calls[0].options.headers.authorization, undefined);
+  assert.equal(calls[1].options.headers.authorization, 'Bearer test-token');
+  assert.equal(calls[1].options.headers['content-type'], 'application/json');
 });
 
 test('native status markup reports results without exposing FOUND.txt contents', () => {

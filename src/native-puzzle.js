@@ -44,14 +44,17 @@ export function createNativePuzzleState() {
     actionBusy: false,
     error: '',
     serverTime: null,
+    accessToken: '',
   };
 }
 
-export async function nativePuzzleRequest(action, { method = 'GET', body } = {}) {
+export async function nativePuzzleRequest(action, { method = 'GET', body, accessToken = '' } = {}) {
+  const headers = body ? { 'content-type': 'application/json' } : {};
+  if (accessToken) headers.authorization = `Bearer ${accessToken}`;
   const response = await fetch(`/api/native-puzzle/${action}`, {
     method,
     cache: 'no-store',
-    headers: body ? { 'content-type': 'application/json' } : undefined,
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await response.json().catch(() => null);
@@ -127,6 +130,7 @@ export function nativePuzzleMarkup(state) {
   return `<section class="backward-panel dlog-panel native-puzzle-panel" id="native-puzzle">
     <div class="backward-heading"><div><span class="eyebrow">PERSISTENT NATIVE BACKEND · NATIVE C</span><h3>Native pzsolve address scanner</h3></div><span class="live-example">AVX / SIMD · CHECKPOINTS</span></div>
     <p class="step-explanation">Runs the validated native pzsolve executable against built-in public Bitcoin Puzzle targets only. Bounds are optional and inclusive. One scan at a time; large full ranges remain infeasible. Only completed campaigns count as coverage—resume stopped campaigns instead of treating their counters as contiguous prefixes.</p>
+    <div class="point-worker-control"><label for="native-puzzle-token">Native API access token <span class="subtle">(required on protected deployments)</span></label><input id="native-puzzle-token" type="password" value="${escapeHtml(state.accessToken)}" autocomplete="off" spellcheck="false" placeholder="Leave blank for an unprotected local server"><small>Used only as a same-origin bearer token for plan/start/stop/resume controls. It is kept in page state, not persistent browser storage. Public status remains read-only.</small></div>
     <div class="candidate-range native-puzzle-inputs"><label>Public puzzle<select id="native-puzzle-id">${BITCOIN_PUZZLES.map((entry) => `<option value="${entry.id}" ${entry.id === state.puzzleId ? 'selected' : ''}>#${entry.id} · ${entry.status} snapshot</option>`).join('')}</select></label><label>CPU threads<input id="native-puzzle-threads" type="number" min="1" max="32" value="${escapeHtml(state.threads)}"></label></div>
     <div class="candidate-range"><label>Lower scalar (optional, inclusive)<input id="native-puzzle-lower" type="text" inputmode="numeric" placeholder="Auto · ${puzzle.lower}" value="${escapeHtml(state.lower)}"></label><label>Upper scalar (optional, inclusive)<input id="native-puzzle-upper" type="text" inputmode="numeric" placeholder="Auto · ${puzzle.upper}" value="${escapeHtml(state.upper)}"></label></div>
     <p class="step-explanation subtle">${rangeDescription} No subrange is claimed to be more likely.</p>
