@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PIN="f6b85a19411e61258ad6ecc5af7d20d521fdb7d7"
 SOURCE="${PZSOLVE_SOURCE_DIR:-$ROOT/.runtime/bitcoin-puzzle-solver}"
-BIN_DIR="$ROOT/.runtime/bin"
+BIN_DIR="${PZSOLVE_BIN_DIR:-$ROOT/.runtime/bin}"
 JOBS="${PZSOLVE_BUILD_JOBS:-2}"
 
 if [[ ! -d "$SOURCE/.git" ]]; then
