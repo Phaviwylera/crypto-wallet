@@ -19,6 +19,7 @@ import { bitcoinPuzzlePointSearchText, createBitcoinPuzzleMatchExport } from './
 import { MAX_BATCH_FILE_BYTES, parseAddressBatch, parseRecoveryBatch, publicKeyResultsTsv } from './batch-files.js';
 import { runRecoveryBatch } from './recovery-batch.js';
 import { createPuzzleCampaignSnapshot, puzzleCampaignContentMarkup, puzzleCampaignStatusMarkup } from './puzzle-campaigns.js';
+import { createNativePuzzleState, firstNativePuzzleChunk, nativePuzzleMarkup, nativePuzzleRequest, nativePuzzleStatusMarkup, nextNativePuzzleChunk, validateNativePuzzleInput } from './native-puzzle.js';
 import { generateScalarBatch, parseScalarBatchRange } from './scalar-wallet.js';
 import './style.css';
 
@@ -62,6 +63,8 @@ let gpuBenchmarkWorker = null;
 let puzzleCampaignSnapshot = createPuzzleCampaignSnapshot();
 let puzzleCampaignError = '';
 let puzzleCampaignRequestInFlight = false;
+let nativePuzzle = createNativePuzzleState();
+let nativePuzzleRequestInFlight = false;
 let pendingFile = null;
 let scanState = { jobId: null, status: 'idle', total: 0, processed: 0, results: [], error: null, hideEmpty: true };
 const API_BASE = (import.meta.env && import.meta.env.VITE_SCAN_API_BASE) || '';
@@ -891,7 +894,7 @@ async function generateBoundedWallet() {
 }
 
 function searchGuideMarkup() {
-  return `<section class="backward-panel dlog-panel" id="search-guide"><span class="eyebrow">SEARCH WORKSPACE</span><h3>Choose network → address type → method</h3><div class="point-worker-control"><label for="search-network-select">Network and address type</label><select id="search-network-select" ${discreteLogProgress ? 'disabled' : ''}>${Object.entries(NETWORKS).map(([id, network]) => `<option value="${id}" ${selectedNetworkId === id ? 'selected' : ''}>${network.label}</option>`).join('')}</select><small>Curve: secp256k1 · ${escapeHtml(addressCaption())}. USDT follows its underlying network; not all networks use this curve. This choice also updates the wallet lab and bounded address search.</small></div><div class="dlog-actions"><a class="search-file-button" href="#search-lab">Address search</a><a class="search-file-button" href="#key-recovery">Find public key</a><a class="search-file-button" href="#public-key-search">Public-key BSGS</a><a class="search-file-button" href="#puzzle-guide">Puzzle catalog</a></div><p class="step-explanation">Every real search workflow supports batch text input: address lists on every network, Ethereum/Bitcoin public-key recovery, public-key BSGS, and the existing server scan. Address search checks candidates against all loaded targets. BSGS needs verified points and a bounded interval; GPU assists lookups only. These methods do not make full-range wallet recovery practical.</p></section>`;
+  return `<section class="backward-panel dlog-panel" id="search-guide"><span class="eyebrow">SEARCH WORKSPACE</span><h3>Choose network → address type → method</h3><div class="point-worker-control"><label for="search-network-select">Network and address type</label><select id="search-network-select" ${discreteLogProgress ? 'disabled' : ''}>${Object.entries(NETWORKS).map(([id, network]) => `<option value="${id}" ${selectedNetworkId === id ? 'selected' : ''}>${network.label}</option>`).join('')}</select><small>Curve: secp256k1 · ${escapeHtml(addressCaption())}. USDT follows its underlying network; not all networks use this curve. This choice also updates the wallet lab and bounded address search.</small></div><div class="dlog-actions"><a class="search-file-button" href="#search-lab">Address search</a><a class="search-file-button" href="#key-recovery">Find public key</a><a class="search-file-button" href="#public-key-search">Public-key BSGS</a><a class="search-file-button" href="#puzzle-guide">Puzzle catalog</a><a class="search-file-button" href="#native-puzzle">Native C scan</a></div><p class="step-explanation">Every real search workflow supports batch text input: address lists on every network, Ethereum/Bitcoin public-key recovery, public-key BSGS, and the existing server scan. Address search checks candidates against all loaded targets. BSGS needs verified points and a bounded interval; GPU assists lookups only. These methods do not make full-range wallet recovery practical.</p></section>`;
 }
 
 function filteredBitcoinPuzzles() {
@@ -980,6 +983,78 @@ async function refreshPuzzleCampaignStatus() {
     puzzleCampaignRequestInFlight = false;
     const content = document.querySelector('#campaign-status-content');
     if (content) content.innerHTML = puzzleCampaignContentMarkup({ snapshot: puzzleCampaignSnapshot, error: puzzleCampaignError });
+  }
+}
+
+function updateNativePuzzleStatusDom() {
+  const content = document.querySelector('#native-puzzle-status');
+  if (content) content.innerHTML = nativePuzzleStatusMarkup(nativePuzzle);
+  const start = document.querySelector('#native-puzzle-start');
+  if (start) start.disabled = nativePuzzle.actionBusy || nativePuzzle.jobs.some((job) => job.processAlive) || nativePuzzle.runner?.available === false;
+}
+
+async function refreshNativePuzzleStatus() {
+  if (nativePuzzleRequestInFlight) return;
+  nativePuzzleRequestInFlight = true;
+  try {
+    const snapshot = await nativePuzzleRequest('status');
+    if (!snapshot.runner || !Array.isArray(snapshot.jobs)) throw new Error('Native puzzle status response is invalid.');
+    nativePuzzle.runner = snapshot.runner;
+    nativePuzzle.jobs = snapshot.jobs;
+    nativePuzzle.serverTime = snapshot.serverTime || null;
+    nativePuzzle.error = '';
+  } catch (error) {
+    if (!nativePuzzle.runner) {
+      nativePuzzle.runner = { available: false, version: '', reason: 'The native API requires the Seedlab Vite workspace server and a locally installed pzsolve runner. Static hosting cannot start native scans.' };
+    }
+    nativePuzzle.error = nativePuzzle.runner.available
+      ? 'Native status refresh failed; showing the last available snapshot.'
+      : 'Native scanner is unavailable in this deployment.';
+  } finally {
+    nativePuzzle.loading = false;
+    nativePuzzleRequestInFlight = false;
+    updateNativePuzzleStatusDom();
+  }
+}
+
+async function runNativePuzzleAction(action, campaign = '') {
+  if (action === 'next' || action === 'reset') {
+    try {
+      const chunk = action === 'reset'
+        ? firstNativePuzzleChunk(nativePuzzle.puzzleId)
+        : nextNativePuzzleChunk(nativePuzzle.puzzleId, nativePuzzle.lower, nativePuzzle.upper);
+      nativePuzzle.lower = chunk.lower;
+      nativePuzzle.upper = chunk.upper;
+      nativePuzzle.error = '';
+    } catch (error) {
+      nativePuzzle.error = error?.message ?? String(error);
+    }
+    render();
+    return;
+  }
+  if (nativePuzzle.actionBusy) return;
+  nativePuzzle.actionBusy = true;
+  nativePuzzle.error = '';
+  render();
+  try {
+    if (action === 'start') {
+      validateNativePuzzleInput(nativePuzzle.puzzleId, nativePuzzle.lower, nativePuzzle.upper);
+      await nativePuzzleRequest('start', {
+        method: 'POST',
+        body: { puzzle: nativePuzzle.puzzleId, lower: nativePuzzle.lower, upper: nativePuzzle.upper, threads: Number(nativePuzzle.threads) },
+      });
+    } else if (action === 'stop' || action === 'resume') {
+      if (!campaign) throw new Error('A native campaign is required.');
+      await nativePuzzleRequest(action, { method: 'POST', body: { campaign } });
+    } else {
+      throw new Error('Unknown native puzzle action.');
+    }
+    await refreshNativePuzzleStatus();
+  } catch (error) {
+    nativePuzzle.error = error?.message ?? String(error);
+  } finally {
+    nativePuzzle.actionBusy = false;
+    render();
   }
 }
 
@@ -1155,6 +1230,7 @@ function render() {
           ${searchGuideMarkup()}
           ${recoveryMarkup()}
           ${puzzleGuideMarkup()}
+          ${nativePuzzleMarkup(nativePuzzle)}
           ${discreteLogLab}
           ${pointSearchMarkup()}
           <div class="steps-heading" id="derivation-pipeline"><div><span class="eyebrow">THE PIPELINE</span><h2>Five steps, one address</h2></div><div class="steps-actions">${wallet.stage >= 5 ? `<button class="reverse-toggle" id="backward-toggle">${backwardOpen ? 'Hide backward trace' : 'Trace backward'}</button>` : ''}${wallet.stage ? '<button class="reset-button" id="reset">Reset session</button>' : ''}</div></div>
@@ -1247,6 +1323,21 @@ function render() {
     render();
   });
   document.querySelector('#puzzle-select')?.addEventListener('change', (event) => { puzzleCatalog.selectedId = Number(event.target.value); render(); });
+  document.querySelector('#native-puzzle-id')?.addEventListener('change', (event) => {
+    nativePuzzle.puzzleId = Number(event.target.value);
+    const chunk = firstNativePuzzleChunk(nativePuzzle.puzzleId);
+    nativePuzzle.lower = chunk.lower;
+    nativePuzzle.upper = chunk.upper;
+    nativePuzzle.error = '';
+    render();
+  });
+  for (const [id, key] of [['#native-puzzle-lower', 'lower'], ['#native-puzzle-upper', 'upper'], ['#native-puzzle-threads', 'threads']]) {
+    document.querySelector(id)?.addEventListener('input', (event) => { nativePuzzle[key] = event.target.value; });
+  }
+  document.querySelector('#native-puzzle')?.addEventListener('click', (event) => {
+    const button = event.target.closest?.('[data-native-action]');
+    if (button) runNativePuzzleAction(button.dataset.nativeAction, button.dataset.campaign || '');
+  });
   document.querySelector('#apply-puzzle')?.addEventListener('click', () => {
     if (discreteLogProgress) return;
     const puzzle = getBitcoinPuzzle(puzzleCatalog.selectedId);
@@ -1890,4 +1981,6 @@ function resetWallet() {
 
 render();
 refreshPuzzleCampaignStatus();
+refreshNativePuzzleStatus();
 setInterval(refreshPuzzleCampaignStatus, 1000);
+setInterval(refreshNativePuzzleStatus, 2000);

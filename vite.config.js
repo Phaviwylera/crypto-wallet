@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite';
 import { getStatusSnapshot } from './scripts/puzzle-status-server.mjs';
+import { nativePuzzleApi } from './scripts/native-puzzle-api.mjs';
 
 function puzzleCampaignApi() {
   const middleware = async (request, response) => {
@@ -35,7 +36,7 @@ function puzzleCampaignApi() {
 }
 
 export default defineConfig({
-  plugins: [puzzleCampaignApi()],
+  plugins: [puzzleCampaignApi(), nativePuzzleApi()],
   server: {
     host: '0.0.0.0',
     allowedHosts: true,
