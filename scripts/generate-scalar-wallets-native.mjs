@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { parseSearchRange } from '../src/search-range.js';
+import { parseScalarSampleCount } from '../src/scalar-wallet.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -20,6 +21,7 @@ export async function runNativeScalarWalletExport({
   network = 'ethereum',
   threads = 2,
   chunkSize = 4096,
+  sampleCount = null,
   binary = nativeScalarExporterPath(),
 }) {
   // Validate the mathematical bounds before creating a partial file. The C
@@ -29,6 +31,8 @@ export async function runNativeScalarWalletExport({
   if (!Number.isInteger(threads) || threads < 1 || threads > 32) throw new Error('Threads must be an integer from 1 through 32.');
   if (!Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > 65536) throw new Error('Chunk size must be an integer from 1 through 65,536.');
   if (!output) throw new Error('An output TXT path is required.');
+  const sample = sampleCount === null || sampleCount === undefined || sampleCount === '' ? null : parseScalarSampleCount(String(sampleCount), range.count);
+  if (sample !== null && sample > 0xffffffffffffffffn) throw new Error('Sample count is too large for the native exporter.');
   const outputPath = path.resolve(output);
   const partialPath = `${outputPath}.partial`;
   if (existsSync(outputPath)) throw new Error(`Output already exists: ${outputPath}`);
@@ -39,6 +43,7 @@ export async function runNativeScalarWalletExport({
     '--start', range.start.toString(), '--end', range.end.toString(),
     '--output', outputPath, '--threads', String(threads), '--chunk-size', String(chunkSize),
   ];
+  if (sample !== null) args.push('--sample', sample.toString());
   await new Promise((resolve, reject) => {
     const child = spawn(binary, args, { stdio: 'inherit' });
     let settled = false;
@@ -82,6 +87,7 @@ Options:
   --output      New local TXT path (required; never overwritten)
   --threads     Parallel workers, 1–32 (default: 2)
   --chunk-size  Rows per batch, 1–65536 (default: 4096)
+  --sample      Export this many unique random entries from the inclusive range
   --help        Show this help
 
 Ethereum only. Each row is exactly 110 bytes: EIP-55 address<TAB>0x-private-key<LF>.
@@ -99,6 +105,7 @@ async function runCli() {
       output: { type: 'string' },
       threads: { type: 'string', default: '2' },
       'chunk-size': { type: 'string', default: '4096' },
+      sample: { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
     },
     allowPositionals: false,
@@ -115,6 +122,7 @@ async function runCli() {
     network: values.network,
     threads: Number(values.threads),
     chunkSize: Number(values['chunk-size']),
+    sampleCount: values.sample ?? null,
   });
 }
 

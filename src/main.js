@@ -21,7 +21,7 @@ import { runRecoveryBatch } from './recovery-batch.js';
 import { createPuzzleCampaignSnapshot, puzzleCampaignContentMarkup, puzzleCampaignStatusMarkup } from './puzzle-campaigns.js';
 import { createNativePuzzleState, nativePuzzleMarkup, nativePuzzleRequest, nativePuzzleStatusMarkup, nextNativePuzzleChunk } from './native-puzzle.js';
 import { nativeScalarExportRequest, streamNativeScalarExportDownload } from './native-scalar-export.js';
-import { generateScalarBatch, parseScalarBatchRange } from './scalar-wallet.js';
+import { generateRandomScalarBatch, generateScalarBatch, parseScalarBatchRange, parseScalarSampleCount } from './scalar-wallet.js';
 import { collectWalletSpacePoints } from './wallet-space-data.js';
 import './style.css';
 
@@ -40,8 +40,9 @@ let selectedNetworkId = 'ethereum';
 const SEARCH_WORKER_CHUNK = 256;
 let searchLower = '1';
 let searchUpper = '10000';
-let boundedWallet = { result: null, error: '', busy: false, completed: 0, total: 0, mode: '', jobId: '', downloadBusy: false };
+let boundedWallet = { result: null, error: '', busy: false, completed: 0, total: 0, mode: '', jobId: '', downloadBusy: false, downloadProgress: null };
 let boundedWalletRunId = 0;
+let boundedWalletSelection = { mode: 'all', sampleCount: '500000' };
 const selectedNetwork = () => NETWORKS[selectedNetworkId];
 let wallet = freshWallet();
 let passphrase = '';
@@ -898,19 +899,57 @@ async function recoverBatchPublicKeys() {
   }
 }
 
+function boundedWalletDownloadProgressLabel(progress) {
+  const action = progress.phase === 'finalizing' ? 'Finalizing TXT on disk' : 'Saving TXT';
+  return `${action} · ${progress.completed.toLocaleString()} / ${progress.total.toLocaleString()} bytes`;
+}
+
+function boundedWalletDownloadMarkup() {
+  const progress = boundedWallet.downloadProgress;
+  if (!boundedWallet.downloadBusy || !progress) return '';
+  const percent = progress.total ? Math.min(100, 100 * progress.completed / progress.total) : 0;
+  return `<div class="dlog-live-progress bounded-wallet-result" role="status" aria-live="polite">
+    <b id="bounded-wallet-download-progress">${boundedWalletDownloadProgressLabel(progress)}</b>
+    <div class="search-progress"><span id="bounded-wallet-download-progress-bar" style="width:${percent}%"></span></div>
+    <p id="bounded-wallet-download-note">${progress.phase === 'finalizing' ? 'All bytes received. Waiting for the browser to finish saving the TXT…' : 'Keep this tab open until “Saved and verified” appears. Chrome may show a temporary .crswap file while saving; use only the completed .txt file.'}</p>
+  </div>`;
+}
+
+function updateBoundedWalletDownloadProgress(progress) {
+  if (!boundedWallet.downloadBusy) return;
+  boundedWallet.downloadProgress = progress;
+  const label = document.querySelector('#bounded-wallet-download-progress');
+  if (label) label.textContent = boundedWalletDownloadProgressLabel(progress);
+  const bar = document.querySelector('#bounded-wallet-download-progress-bar');
+  if (bar) bar.style.width = `${progress.total ? Math.min(100, 100 * progress.completed / progress.total) : 0}%`;
+  const note = document.querySelector('#bounded-wallet-download-note');
+  if (note) note.textContent = progress.phase === 'finalizing'
+    ? 'All bytes received. Waiting for the browser to finish saving the TXT…'
+    : 'Keep this tab open until “Saved and verified” appears. Chrome may show a temporary .crswap file while saving; use only the completed .txt file.';
+}
+
 function boundedWalletGeneratorMarkup() {
   const result = boundedWallet.result;
   const native = selectedNetworkId === 'ethereum';
   const progressPercent = boundedWallet.total ? Math.min(100, 100 * boundedWallet.completed / boundedWallet.total) : 0;
-  const generateLabel = boundedWallet.busy ? (boundedWallet.mode === 'native' ? 'Generating natively…' : 'Generating…') : 'Generate all addresses + private keys';
+  const randomSelected = boundedWalletSelection.mode === 'random';
+  const generateLabel = boundedWallet.busy
+    ? (boundedWallet.mode === 'native' ? 'Generating natively…' : 'Generating…')
+    : (randomSelected ? 'Generate random sample' : 'Generate all addresses + private keys');
   return `<div class="public-key-extract-panel bounded-wallet-panel" id="bounded-wallet-generator">
-    <strong>All addresses + private keys within these bounds</strong>
-    <p>Enumerates every scalar from lower through upper for ${escapeHtml(selectedNetwork().label)}, with no artificial row cap. The TXT contains only <code>address → tab → 32-byte private key</code> on each line, with no header or other information. ${native ? 'Ethereum uses the parallel native C service and streams the completed TXT directly to your chosen file—no whole-file browser Blob. The independent export service does not control the puzzle scanner.' : 'This network currently uses the slower browser generator, which holds the complete result in memory.'} <strong>The TXT contains sensitive private keys.</strong> Small or known intervals can be brute-forced; never use their keys for real funds.</p>
+    <strong>Addresses + private keys within these bounds</strong>
+    <p>Choose <b>All entries</b> to enumerate every scalar from lower through upper, or <b>Random sample</b> to export an exact number of unique random entries from that inclusive range. The TXT contains only <code>address → tab → 32-byte private key</code> on each line, with no header or other information. ${native ? 'Ethereum uses the parallel native C service and streams the completed TXT directly to your chosen file—no whole-file browser Blob. The independent export service does not control the puzzle scanner.' : 'This network currently uses the slower browser generator, which holds the complete result in memory.'} <strong>The TXT contains sensitive private keys.</strong> Small or known intervals can be brute-forced; never use their keys for real funds.</p>
+    <div class="candidate-range">
+      <label>Export mode<select id="bounded-wallet-mode" ${boundedWallet.busy || boundedWallet.downloadBusy ? 'disabled' : ''}><option value="all" ${randomSelected ? '' : 'selected'}>All entries in range</option><option value="random" ${randomSelected ? 'selected' : ''}>Random sample</option></select></label>
+      <label>Random entries<input id="bounded-wallet-sample-count" type="text" inputmode="numeric" value="${escapeHtml(boundedWalletSelection.sampleCount)}" ${randomSelected && !boundedWallet.busy && !boundedWallet.downloadBusy ? '' : 'disabled'} placeholder="500000"></label>
+    </div>
+    <p class="step-explanation subtle">Random sample count is exact entries, not lakhs: <code>500000</code> means 500,000 rows (5 lakh). It must be ≤ the inclusive range size. Sampling is without replacement, so private keys do not repeat.</p>
     ${native ? `<div class="point-worker-control"><label for="bounded-wallet-token">Native API access token <span class="subtle">(same token as native scanner controls)</span></label><input id="bounded-wallet-token" type="password" value="${escapeHtml(nativePuzzle.accessToken)}" ${boundedWallet.busy ? 'disabled' : ''} autocomplete="off" spellcheck="false" placeholder="Leave blank only for an unprotected local service"><small>Sent only as a same-origin bearer token. It is kept in page state, not persistent browser storage, and is never placed in the download URL.</small></div>` : ''}
-    <div class="dlog-actions"><button class="search-file-button" id="generate-bounded-wallet" type="button" ${boundedWallet.busy || boundedWallet.downloadBusy ? 'disabled' : ''}>${generateLabel}</button>${boundedWallet.busy ? '<button class="dlog-stop-button" id="stop-bounded-wallet" type="button">Cancel generation</button>' : ''}${result ? `<button class="search-file-button" id="download-bounded-wallet" type="button" ${boundedWallet.downloadBusy ? 'disabled' : ''}>${boundedWallet.downloadBusy ? 'Streaming download…' : 'Download TXT'}</button>` : ''}${result?.native ? '<button class="dlog-stop-button" id="delete-native-bounded-wallet" type="button">Delete server copy</button>' : ''}</div>
+    <div class="dlog-actions"><button class="search-file-button" id="generate-bounded-wallet" type="button" ${boundedWallet.busy || boundedWallet.downloadBusy ? 'disabled' : ''}>${generateLabel}</button>${boundedWallet.busy ? '<button class="dlog-stop-button" id="stop-bounded-wallet" type="button">Cancel generation</button>' : ''}${result ? `<button class="search-file-button" id="download-bounded-wallet" type="button" ${boundedWallet.downloadBusy ? 'disabled' : ''}>${boundedWallet.downloadBusy ? 'Streaming download…' : 'Download TXT'}</button>` : ''}${result?.native ? `<button class="dlog-stop-button" id="delete-native-bounded-wallet" type="button" ${boundedWallet.downloadBusy ? 'disabled' : ''}>Delete server copy</button>` : ''}</div>
     ${boundedWallet.error ? `<p class="search-file-error" role="alert">${escapeHtml(boundedWallet.error)}</p>` : ''}
     ${boundedWallet.busy ? `<div class="dlog-live-progress bounded-wallet-result" role="status" aria-live="polite"><b id="bounded-wallet-progress">Generated ${boundedWallet.completed.toLocaleString()} / ${boundedWallet.total.toLocaleString()} rows</b><div class="search-progress"><span id="bounded-wallet-progress-bar" style="width:${progressPercent}%"></span></div><p>${boundedWallet.mode === 'native' ? 'Native C writes bounded chunks on the server. Cancel signals only this export job.' : 'Derivation runs in small JavaScript chunks and holds the result in browser memory.'}</p></div>` : ''}
-    ${result ? `<div class="dlog-live-progress bounded-wallet-result" aria-live="polite"><b>${result.count.toLocaleString()} rows ready · ${escapeHtml(result.networkLabel)}${result.ratePerSecond ? ` · ${result.ratePerSecond.toLocaleString()} rows/s` : ''}</b><p>Inclusive scalar range: <code>${escapeHtml(result.lower)}</code> – <code>${escapeHtml(result.upper)}</code></p><p>${result.native ? 'Native C export complete. Download streams to disk without loading the TXT into browser memory. The server copy expires after 30 minutes.' : 'Headerless browser-generated TXT is held in memory.'} <strong>Keep it secret.</strong>${result.downloaded ? ' Streamed download complete.' : ''}</p></div>` : ''}
+    ${boundedWalletDownloadMarkup()}
+    ${result ? `<div class="dlog-live-progress bounded-wallet-result" aria-live="polite"><b>${result.count.toLocaleString()} rows ready · ${escapeHtml(result.networkLabel)} · ${result.selectionMode === 'random' ? 'random sample' : 'all entries'}${result.ratePerSecond ? ` · ${result.ratePerSecond.toLocaleString()} rows/s` : ''}</b><p>Inclusive scalar range: <code>${escapeHtml(result.lower)}</code> – <code>${escapeHtml(result.upper)}</code></p><p>${result.native ? 'Native C export complete. Download streams to disk without loading the TXT into browser memory. The server copy expires after 30 minutes.' : 'Headerless browser-generated TXT is held in memory.'} <strong>Keep it secret.</strong>${result.downloaded ? ` Saved and verified: <code>${escapeHtml(result.savedFileName || result.fileName)}</code> · ${result.bytes.toLocaleString()} bytes.` : ''}</p></div>` : ''}
   </div>`;
 }
 
@@ -922,7 +961,7 @@ function resetBoundedWallet(error = '', stopNative = true) {
     }).catch(() => {});
   }
   boundedWalletRunId += 1;
-  boundedWallet = { result: null, error, busy: false, completed: 0, total: 0, mode: '', jobId: '', downloadBusy: false };
+  boundedWallet = { result: null, error, busy: false, completed: 0, total: 0, mode: '', jobId: '', downloadBusy: false, downloadProgress: null };
 }
 
 async function stopBoundedWalletGeneration() {
@@ -954,11 +993,13 @@ function updateBoundedWalletProgress(completed, total) {
   if (bar) bar.style.width = `${total ? Math.min(100, 100 * completed / total) : 0}%`;
 }
 
-async function runNativeBoundedWallet({ range, runId, networkId, networkLabel }) {
+async function runNativeBoundedWallet({ range, runId, networkId, networkLabel, selectionMode, sampleCount }) {
   try {
+    const body = { lower: range.start.toString(), upper: range.end.toString(), threads: 2, mode: selectionMode };
+    if (selectionMode === 'random') body.sampleCount = sampleCount.toString();
     const started = await nativeScalarExportRequest('start', {
       method: 'POST',
-      body: { lower: range.start.toString(), upper: range.end.toString(), threads: 2 },
+      body,
       accessToken: nativePuzzle.accessToken,
     });
     if (runId !== boundedWalletRunId) {
@@ -988,10 +1029,12 @@ async function runNativeBoundedWallet({ range, runId, networkId, networkLabel })
             upper: job.upper,
             networkId,
             networkLabel,
+            selectionMode,
+            sampleCount: selectionMode === 'random' ? sampleCount.toString() : null,
             downloaded: false,
           },
           error: '', busy: false, completed: Number(job.count), total: Number(job.count),
-          mode: 'native', jobId: job.id, downloadBusy: false,
+          mode: 'native', jobId: job.id, downloadBusy: false, downloadProgress: null,
         };
         render();
         return;
@@ -1018,21 +1061,36 @@ async function generateBoundedWallet() {
     return;
   }
 
+  const selectionMode = boundedWalletSelection.mode;
+  let sampleCount = null;
+  if (selectionMode === 'random') {
+    try {
+      sampleCount = parseScalarSampleCount(boundedWalletSelection.sampleCount.trim(), range.count);
+      if (!Number.isSafeInteger(Number(sampleCount))) throw new Error('Random sample count is too large for this generator.');
+    } catch (error) {
+      resetBoundedWallet(error?.message ?? String(error));
+      render();
+      return;
+    }
+  }
+  const total = selectionMode === 'random' ? Number(sampleCount) : Number(range.count);
   const runId = ++boundedWalletRunId;
   const networkId = selectedNetworkId;
   const networkLabel = selectedNetwork().label;
   const mode = networkId === 'ethereum' ? 'native' : 'browser';
-  boundedWallet = { result: null, error: '', busy: true, completed: 0, total: Number(range.count), mode, jobId: '', downloadBusy: false };
+  boundedWallet = { result: null, error: '', busy: true, completed: 0, total, mode, jobId: '', downloadBusy: false, downloadProgress: null };
   render();
   if (mode === 'native') {
-    await runNativeBoundedWallet({ range, runId, networkId, networkLabel });
+    await runNativeBoundedWallet({ range, runId, networkId, networkLabel, selectionMode, sampleCount });
     return;
   }
 
   try {
-    const output = await generateScalarBatch({
+    const generator = selectionMode === 'random' ? generateRandomScalarBatch : generateScalarBatch;
+    const output = await generator({
       lower: range.start.toString(),
       upper: range.end.toString(),
+      ...(selectionMode === 'random' ? { sampleCount: sampleCount.toString() } : {}),
       derive: (scalar) => {
         const privateKeyBytes = bigIntToBytes(scalar);
         try {
@@ -1058,13 +1116,18 @@ async function generateBoundedWallet() {
         upper: output.range.end.toString(),
         networkId,
         networkLabel,
+        selectionMode,
+        sampleCount: selectionMode === 'random' ? sampleCount.toString() : null,
+        fileName: selectionMode === 'random'
+          ? `address-private-keys-${networkId}-${output.range.start}-${output.range.end}-random-${output.count}.txt`
+          : `address-private-keys-${networkId}-${output.range.start}-${output.range.end}.txt`,
       },
       error: '', busy: false, completed: output.count, total: output.count,
-      mode: 'browser', jobId: '', downloadBusy: false,
+      mode: 'browser', jobId: '', downloadBusy: false, downloadProgress: null,
     };
   } catch (error) {
     if (runId !== boundedWalletRunId) return;
-    boundedWallet = { result: null, error: error?.message ?? String(error), busy: false, completed: 0, total: 0, mode: 'browser', jobId: '', downloadBusy: false };
+    boundedWallet = { result: null, error: error?.message ?? String(error), busy: false, completed: 0, total: 0, mode: 'browser', jobId: '', downloadBusy: false, downloadProgress: null };
   }
   if (runId === boundedWalletRunId) render();
 }
@@ -1073,19 +1136,28 @@ async function downloadBoundedWallet() {
   const result = boundedWallet.result;
   if (!result || boundedWallet.downloadBusy) return;
   if (!result.native) {
-    exportTextFile(`address-private-keys-${result.networkId}-${result.lower}-${result.upper}.txt`, result.text);
+    exportTextFile(result.fileName || `address-private-keys-${result.networkId}-${result.lower}-${result.upper}.txt`, result.text);
     return;
   }
   boundedWallet.downloadBusy = true;
+  boundedWallet.downloadProgress = { phase: 'writing', completed: 0, total: Number(result.bytes) };
+  boundedWallet.error = '';
+  result.downloaded = false;
   render();
   try {
-    await streamNativeScalarExportDownload({
+    const saved = await streamNativeScalarExportDownload({
       jobId: result.jobId,
       accessToken: nativePuzzle.accessToken,
       suggestedName: result.fileName,
+      expectedBytes: result.bytes,
+      onProgress: updateBoundedWalletDownloadProgress,
       showSaveFilePicker: globalThis.showSaveFilePicker?.bind(globalThis),
     });
-    if (boundedWallet.result?.jobId === result.jobId) boundedWallet.result.downloaded = true;
+    // The helper has closed the staging file and verified the final TXT size.
+    if (boundedWallet.result?.jobId === result.jobId) {
+      boundedWallet.result.downloaded = true;
+      boundedWallet.result.savedFileName = saved.fileName;
+    }
     boundedWallet.error = '';
   } catch (error) {
     boundedWallet.error = error?.name === 'AbortError'
@@ -1093,6 +1165,7 @@ async function downloadBoundedWallet() {
       : (error?.message ?? String(error));
   } finally {
     boundedWallet.downloadBusy = false;
+    boundedWallet.downloadProgress = null;
     render();
   }
 }
@@ -1681,6 +1754,13 @@ function render() {
   });
   document.querySelector('#search-lower')?.addEventListener('input', (event) => { searchLower = event.target.value; });
   document.querySelector('#search-upper')?.addEventListener('input', (event) => { searchUpper = event.target.value; });
+  document.querySelector('#bounded-wallet-mode')?.addEventListener('change', (event) => {
+    boundedWalletSelection.mode = event.target.value === 'random' ? 'random' : 'all';
+    render();
+  });
+  document.querySelector('#bounded-wallet-sample-count')?.addEventListener('input', (event) => {
+    boundedWalletSelection.sampleCount = event.target.value;
+  });
   document.querySelector('#generate-bounded-wallet')?.addEventListener('click', generateBoundedWallet);
   document.querySelector('#stop-bounded-wallet')?.addEventListener('click', stopBoundedWalletGeneration);
   document.querySelector('#download-bounded-wallet')?.addEventListener('click', downloadBoundedWallet);

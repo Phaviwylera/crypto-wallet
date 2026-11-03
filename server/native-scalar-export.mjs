@@ -7,6 +7,7 @@ import { Readable } from 'node:stream';
 import { constants as fsConstants } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { parseSearchRange } from '../src/search-range.js';
+import { parseScalarSampleCount } from '../src/scalar-wallet.js';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DEFAULT_BINARY = path.join(PROJECT_ROOT, '.runtime', 'bin', 'seedlab-eth-export');
@@ -34,6 +35,8 @@ function publicJob(job) {
     lower: job.lower,
     upper: job.upper,
     count: job.count,
+    mode: job.mode,
+    sampleCount: job.sampleCount,
     completed: job.completed,
     bytes: job.bytes,
     totalBytes: job.totalBytes,
@@ -119,6 +122,17 @@ export function createNativeScalarExportService({
       throw apiError(error.message);
     }
     const threads = normalizeThreads(body.threads);
+    const mode = body.mode === 'random' || body.sampleCount !== undefined ? 'random' : 'all';
+    let sampleCount = null;
+    if (mode === 'random') {
+      try {
+        sampleCount = parseScalarSampleCount(String(body.sampleCount ?? '').trim(), range.count);
+      } catch (error) {
+        throw apiError(error.message);
+      }
+      if (sampleCount > 0xffffffffffffffffn) throw apiError('Sample count is too large for the native exporter.');
+    }
+    const exportCount = sampleCount ?? range.count;
     const runner = await runnerInfo();
     if (!runner.available) throw apiError(runner.reason, 503);
     await mkdir(resolvedOutputRoot, { recursive: true, mode: 0o700 });
@@ -132,12 +146,16 @@ export function createNativeScalarExportService({
       id,
       lower,
       upper,
-      count: range.count.toString(),
+      count: exportCount.toString(),
+      mode,
+      sampleCount: sampleCount ? sampleCount.toString() : null,
       completed: '0',
       bytes: '0',
-      totalBytes: (range.count * ROW_BYTES).toString(),
+      totalBytes: (exportCount * ROW_BYTES).toString(),
       ratePerSecond: 0,
-      fileName: `address-private-keys-ethereum-${lower}-${upper}.txt`,
+      fileName: mode === 'random'
+        ? `address-private-keys-ethereum-${lower}-${upper}-random-${exportCount}.txt`
+        : `address-private-keys-ethereum-${lower}-${upper}.txt`,
       state: 'STARTING',
       error: '',
       output,
@@ -151,9 +169,9 @@ export function createNativeScalarExportService({
 
     let child;
     try {
-      child = spawn(resolvedBinary, [
-        '--start', lower, '--end', upper, '--threads', String(threads), '--output', output,
-      ], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const args = ['--start', lower, '--end', upper, '--threads', String(threads), '--output', output];
+      if (sampleCount) args.push('--sample', sampleCount.toString());
+      child = spawn(resolvedBinary, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     } catch (error) {
       job.state = 'ERROR';
       job.error = error.message;
@@ -193,7 +211,7 @@ export function createNativeScalarExportService({
       if (code === 0) {
         try {
           const details = await stat(output);
-          if (BigInt(details.size) !== range.count * ROW_BYTES) throw new Error('Native exporter returned an incorrect output size.');
+          if (BigInt(details.size) !== exportCount * ROW_BYTES) throw new Error('Native exporter returned an incorrect output size.');
           job.state = 'COMPLETED';
           job.completed = job.count;
           job.bytes = String(details.size);
