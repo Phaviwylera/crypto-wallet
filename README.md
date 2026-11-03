@@ -38,6 +38,14 @@ For the public BIP-39 test mnemonic `abandon` repeated 11 times followed by `abo
 
 This is a publicly known test mnemonic only. Never use it or any sample phrase to hold funds.
 
+## 3D public-address space
+
+Click **3D Space** in the top bar to open the WebGL map. It collects only public addresses already represented in the workspace: the current demo wallet, loaded/search addresses, recovered addresses, server-scan addresses, and the published Bitcoin Puzzle catalog. Session and loaded points use brighter colors than catalog points, and duplicate public addresses are combined.
+
+Drag to rotate, use the mouse wheel or **+ / −** controls to zoom, and click a point to inspect its public address, network, 3D Morton cell, mapped 256-bit scalar, and exact cell scalar range. **Reset view** restores the camera.
+
+The 64 × 64 × 64 projection is calculated with exact integer arithmetic from public address payloads. It is a visualization only: neighboring points do not imply related keys, and the view never reads seed phrases or private keys. The Three.js module loads only when the dialog is opened; a browser with WebGL enabled is required.
+
 ## Bounded address search
 
 For EVM profiles, the input also accepts a validated 33-byte compressed or 64/65-byte uncompressed secp256k1 public key and calculates its address directly, without searching. For addresses, choose inclusive decimal scalar bounds from 1 to the secp256k1 curve order minus one (slightly below 2²⁵⁶); the default is 1–10,000. The local worker pool partitions the interval without gaps, uses at most eight workers (and no more workers than candidates), stops at the first match, and reports progress and a measured rate. The Stop control cancels at chunk boundaries. Every network profile has a **Choose batch TXT** option: upload up to 10,000 address entries in a file of at most 5 MB, one per line or separated by spaces, commas, semicolons, or tabs. Each entry is validated for the selected network, duplicates are removed, and each candidate is compared with all targets in one pass. Ethereum files may additionally contain `address,tx_hash` rows for public-key extraction; other networks accept addresses only. Public keys pasted into an address batch are rejected rather than silently searched as addresses. Files and candidate searches stay in the browser. Both searches allow editing the bounds during a run; edits apply to the next run, not the active one.
