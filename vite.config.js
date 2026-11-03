@@ -41,6 +41,11 @@ export default defineConfig({
     host: '0.0.0.0',
     allowedHosts: true,
     proxy: {
+      // Dev: the independent scalar-export service never shares the puzzle lifecycle.
+      '/api/native-scalar-export': {
+        target: process.env.SCALAR_EXPORT_SERVER_URL || 'http://localhost:8788',
+        changeOrigin: true,
+      },
       // Dev: forward other API calls to the local scan server (npm run server).
       '/api': {
         target: process.env.SCAN_SERVER_URL || 'http://localhost:8787',

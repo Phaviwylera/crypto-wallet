@@ -8,7 +8,7 @@ EIP-55_address<TAB>0x-prefixed_32-byte_private_key<LF>
 
 Every row is 110 bytes. There is no header and no application row cap. The mathematical bounds remain `1 <= start <= end < secp256k1_order`; host file-offset and available-storage limits still apply.
 
-The native exporter is separate from address search, public-key BSGS, transaction recovery, puzzle scanning, and server file scans. It currently supports **Ethereum only**. The existing browser button and portable Node.js exporter remain available; the browser path still holds its result in memory and is not claimed to run at native speed.
+The native exporter is separate from address search, public-key BSGS, transaction recovery, puzzle scanning, and server file scans. It currently supports **Ethereum only**. The portable Node.js exporter remains available for every supported network. The bounded-generation button uses the native service for Ethereum once installed; other networks retain the slower in-memory browser path.
 
 ## Build
 
@@ -32,7 +32,37 @@ Setup clones `boulayo/bitcoin-puzzle-solver` at the exact pinned commit `f6b85a1
 
 It does **not** start, stop, restart, or reconfigure any Seedlab service or puzzle campaign. It does not print or use the native-puzzle API token.
 
-## Generate
+For a local UI development server, run `npm run server:scalar-export` in a separate terminal after building the binary. Vite proxies `/api/native-scalar-export/*` to that independent loopback service on port 8788.
+
+## Use the bounded-generation button on EC2
+
+Install the independent UI/API service from an updated clean checkout. With the EC2 layout used for this deployment:
+
+```bash
+cd /home/ssm-user/seedlab-export-src
+git pull --ff-only origin main
+sudo SEEDLAB_DOMAIN=api.seedlad.com \
+  SEEDLAB_REPO=/home/ssm-user/seedlab-export-src \
+  bash scripts/seedlab-ec2-scalar-export-setup.sh
+sudo systemctl start seedlab-deploy.service
+```
+
+The deploy service builds the latest `origin/main` from its own source archive, so the older unrelated deployment checkout does not need to be reset or merged. The scalar installer:
+
+- builds the pinned exporter under `/var/lib/seedlab-native/bin`;
+- creates owner-only `/var/lib/seedlab-native/scalar-exports` storage;
+- installs `seedlab-scalar-export-api.service` on **127.0.0.1:8788**;
+- reuses `/etc/seedlab/native-api.env` without printing the bearer token;
+- adds the authenticated `/api/native-scalar-export/*` Nginx proxy to the same HTTPS server blocks as the existing native controls;
+- restarts **only** `seedlab-scalar-export-api.service` and reloads Nginx.
+
+It does **not** restart `seedlab-native-api.service`, signal pzsolve, or restart a puzzle campaign. Port 8788 must remain loopback-only; do not add it to the EC2 security group.
+
+Hard-refresh the deployed site. In **All addresses + private keys within these bounds**, enter the existing native API token, choose Ethereum and inclusive bounds, then click **Generate all addresses + private keys**. The button now starts native C generation instead of the old JavaScript loop. When complete, click **Download TXT** in a current Chromium browser on HTTPS: the authenticated response is piped directly to a file chosen with the browser's save-file picker. No bearer token appears in the URL and no whole-file Blob is created. Browsers without the File System Access API should use the CLI instead.
+
+Only one UI export runs at a time. Completed files expire after 30 minutes; **Delete server copy** removes one sooner. API job metadata is memory-only, so restarting the scalar service invalidates old job IDs and its cleanup removes orphaned UUID-named files from the dedicated export directory. All status, start, stop, delete, and download endpoints require the bearer token. Nginx forwards the Authorization header and disables response buffering for downloads.
+
+## Generate with the CLI
 
 Example: exactly 1,000,000 inclusive rows using two workers:
 

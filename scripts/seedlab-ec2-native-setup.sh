@@ -11,6 +11,7 @@ ENV_DIR=/etc/seedlab
 ENV_FILE=$ENV_DIR/native-api.env
 NGINX_CONFIG=/etc/nginx/sites-available/seedlab
 SNIPPET=/etc/nginx/snippets/seedlab-native-proxy.conf
+SCALAR_SNIPPET=/etc/nginx/snippets/seedlab-scalar-export-proxy.conf
 INCLUDE_LINE="include $SNIPPET;"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -18,7 +19,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 if [ -z "$DOMAIN" ]; then
-  echo "Set SEEDLAB_DOMAIN to the HTTPS hostname, for example api.example.com." >&2
+  echo "Set SEEDLAB_DOMAIN to the HTTPS hostname, for example api.seedlad.com." >&2
   exit 1
 fi
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
@@ -133,6 +134,12 @@ location ^~ /api/native-puzzle/ {
     proxy_read_timeout 35s;
 }
 NGINX
+
+# Preserve the independently installed scalar-export route when rerunning the
+# puzzle installer. This does not start or restart the scalar-export service.
+if [ -f "$SCALAR_SNIPPET" ] && ! grep -Fq "include $SCALAR_SNIPPET;" "$SNIPPET"; then
+  printf '\ninclude %s;\n' "$SCALAR_SNIPPET" >> "$SNIPPET"
+fi
 
 if ! grep -Fq "$INCLUDE_LINE" "$NGINX_CONFIG"; then
   if ! grep -Fq "server_name $DOMAIN;" "$NGINX_CONFIG"; then
