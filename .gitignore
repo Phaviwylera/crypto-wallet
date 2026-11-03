@@ -1,6 +1,7 @@
 node_modules/
 dist/
 exports/
+.runtime/
 .env*
 .DS_Store
 infra/seedlab-scan.zip

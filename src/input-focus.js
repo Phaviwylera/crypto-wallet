@@ -1,5 +1,5 @@
 // Preserve editable scalar input and cursor across whole-app progress renders.
-const SCALAR_INPUT_IDS = new Set(['search-lower', 'search-upper', 'point-search-lower', 'point-search-upper']);
+const SCALAR_INPUT_IDS = new Set(['search-lower', 'search-upper', 'point-search-lower', 'point-search-upper', 'native-puzzle-lower', 'native-puzzle-upper']);
 
 export function captureScalarFocus(document) {
   const input = document.activeElement;
