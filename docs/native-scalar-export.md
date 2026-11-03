@@ -58,7 +58,9 @@ The deploy service builds the latest `origin/main` from its own source archive, 
 
 It does **not** restart `seedlab-native-api.service`, signal pzsolve, or restart a puzzle campaign. Port 8788 must remain loopback-only; do not add it to the EC2 security group.
 
-Hard-refresh the deployed site. In **All addresses + private keys within these bounds**, enter the existing native API token, choose Ethereum and inclusive bounds, then click **Generate all addresses + private keys**. The button now starts native C generation instead of the old JavaScript loop. When complete, click **Download TXT** in a current Chromium browser on HTTPS: the authenticated response is piped directly to a file chosen with the browser's save-file picker. No bearer token appears in the URL and no whole-file Blob is created. Browsers without the File System Access API should use the CLI instead.
+Hard-refresh the deployed site. In **Addresses + private keys within these bounds**, enter the existing native API token, choose Ethereum and inclusive bounds, then choose **All entries in range** or **Random sample**. For a random sample, enter the exact number of unique entries (for example `500000` means 500,000 rows / 5 lakh, not 500,000 lakhs); it must not exceed the inclusive range size. Click **Generate all addresses + private keys** or **Generate random sample**. The button now starts native C generation instead of the old JavaScript loop. When complete, click **Download TXT** in a current Chromium browser on HTTPS: the authenticated response is written directly to a file chosen with the browser's save-file picker. No bearer token appears in the URL and no whole-file Blob is created. Browsers without the File System Access API should use the CLI instead.
+
+Keep the tab open while the button says **Streaming download…**. Chromium may temporarily show a `.crswap` file beside the chosen `.txt`; that is the browser's staging file, not the completed export. The UI reports byte progress, waits for the browser to close/commit the file, and verifies that the saved TXT size equals the completed job size before showing **Saved and verified**. Empty, truncated, oversized, or non-TXT responses are rejected and are not reported as successful downloads. If a download fails, retry **Download TXT** while the server copy is still available; do not rename or use a leftover `.crswap` file as a verified export.
 
 Only one UI export runs at a time. Completed files expire after 30 minutes; **Delete server copy** removes one sooner. API job metadata is memory-only, so restarting the scalar service invalidates old job IDs and its cleanup removes orphaned UUID-named files from the dedicated export directory. All status, start, stop, delete, and download endpoints require the bearer token. Nginx forwards the Authorization header and disables response buffering for downloads.
 
@@ -74,10 +76,22 @@ npm run export:scalars:native -- \
   --output exports/ethereum-1-1000000.txt
 ```
 
+For an exact random sample without replacement:
+
+```bash
+npm run export:scalars:native -- \
+  --start 1 \
+  --end 1000000000 \
+  --sample 500000 \
+  --threads 2 \
+  --output exports/ethereum-random-500000.txt
+```
+
 The output is owner-only (`0600`) where supported. Workers stream bounded batches with ordered `pwrite` offsets; memory does not grow with the total interval. One generator-point multiplication is needed per batch, followed by repeated Jacobian additions and one batch affine inversion. Keccak-256 and EIP-55 checksums are computed locally for every row.
 
 - `--threads` accepts 1–32 and defaults to 2. More threads than available cores can be slower.
 - `--chunk-size` accepts 1–65,536 rows and defaults to 4,096.
+- `--sample N` exports exactly N unique random scalars from the inclusive range, without replacement. N must be between 1 and the range size.
 - `--network ethereum` is accepted for command-line consistency; other networks are rejected rather than silently using the wrong derivation.
 - Existing final and `.partial` paths are never overwritten.
 - On success, the binary flushes and closes the file, then publishes the final name with a no-replace hard-link operation.

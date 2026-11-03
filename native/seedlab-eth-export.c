@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/random.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -127,6 +128,7 @@ typedef struct {
     atomic_uint_fast64_t completed;
     atomic_bool failed;
     atomic_int error_number;
+    const pz_u256 *scalars;
 } export_job;
 
 static void fail_job(export_job *job, int error_number)
@@ -156,16 +158,146 @@ static bool write_all_at(export_job *job, const char *bytes, size_t length, uint
     return true;
 }
 
+static bool random_bytes(uint8_t *buffer, size_t length)
+{
+    while (length > 0) {
+        const ssize_t result = getrandom(buffer, length, 0);
+        if (result < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (result == 0) return false;
+        buffer += (size_t)result;
+        length -= (size_t)result;
+    }
+    return true;
+}
+
+static bool random_below(pz_u256 *result, const pz_u256 *bound)
+{
+    if (pz_u256_is_zero(bound)) return false;
+    const unsigned bits = pz_u256_bits(bound);
+    const size_t length = (bits + 7) / 8;
+    uint8_t buffer[32] = {0};
+    const size_t start = sizeof buffer - length;
+    do {
+        if (!random_bytes(buffer + start, length)) return false;
+        const unsigned rem = bits & 7;
+        if (rem) buffer[start] &= (uint8_t)((1u << rem) - 1u);
+        pz_u256_from_be(result, buffer);
+    } while (pz_u256_cmp(result, bound) >= 0);
+    wipe(buffer, sizeof buffer);
+    return true;
+}
+
+typedef struct {
+    pz_u256 *values;
+    uint8_t *used;
+    size_t capacity;
+    size_t size;
+} scalar_set;
+
+static uint64_t scalar_hash(const pz_u256 *value)
+{
+    uint64_t hash = 1469598103934665603ULL;
+    for (unsigned i = 0; i < 4; i++) {
+        uint64_t x = value->w[i] + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+        hash ^= x ^ (x >> 31);
+    }
+    return hash;
+}
+
+static bool scalar_set_init(scalar_set *set, uint64_t expected)
+{
+    if (expected > SIZE_MAX / 2) return false;
+    size_t capacity = 1;
+    while (capacity < (size_t)expected * 2) {
+        if (capacity > SIZE_MAX / 2) return false;
+        capacity <<= 1;
+    }
+    set->values = calloc(capacity, sizeof(*set->values));
+    set->used = calloc(capacity, sizeof(*set->used));
+    set->capacity = capacity;
+    set->size = 0;
+    return set->values && set->used;
+}
+
+static void scalar_set_free(scalar_set *set)
+{
+    if (set->values) wipe(set->values, set->capacity * sizeof(*set->values));
+    free(set->values);
+    free(set->used);
+    set->values = NULL;
+    set->used = NULL;
+}
+
+static bool scalar_set_contains(const scalar_set *set, const pz_u256 *value)
+{
+    size_t index = (size_t)scalar_hash(value) & (set->capacity - 1);
+    while (set->used[index]) {
+        if (pz_u256_cmp(&set->values[index], value) == 0) return true;
+        index = (index + 1) & (set->capacity - 1);
+    }
+    return false;
+}
+
+static bool scalar_set_insert(scalar_set *set, const pz_u256 *value)
+{
+    size_t index = (size_t)scalar_hash(value) & (set->capacity - 1);
+    while (set->used[index]) {
+        if (pz_u256_cmp(&set->values[index], value) == 0) return false;
+        index = (index + 1) & (set->capacity - 1);
+    }
+    set->used[index] = 1;
+    set->values[index] = *value;
+    set->size++;
+    return true;
+}
+
+/* Floyd's sampling algorithm: exactly `sample` unique offsets in [0, width),
+ * without replacement, even when sample is close to width. */
+static bool sample_scalars(pz_u256 *output, const pz_u256 *width, uint64_t sample)
+{
+    scalar_set set;
+    if (!scalar_set_init(&set, sample)) return false;
+    pz_u256 j;
+    const pz_u256 sample_u256 = pz_u256_from_u64(sample);
+    pz_u256_sub(&j, width, &sample_u256);
+    bool ok = true;
+    for (uint64_t i = 0; i < sample && !g_interrupted; i++) {
+        pz_u256 bound, random, chosen;
+        pz_u256_add_u64(&bound, &j, 1);
+        if (!random_below(&random, &bound)) { ok = false; break; }
+        chosen = scalar_set_contains(&set, &random) ? j : random;
+        if (!scalar_set_insert(&set, &chosen)) { ok = false; break; }
+        output[i] = chosen;
+        pz_u256_add_u64(&j, &j, 1);
+    }
+    if (g_interrupted) ok = false;
+    scalar_set_free(&set);
+    return ok;
+}
+
 static void *export_worker(void *argument)
 {
     export_job *job = (export_job *)argument;
     const size_t point_count = (size_t)job->chunk_size;
-    pz_gej *jacobian = malloc(sizeof(*jacobian) * point_count);
-    pz_ge *affine = malloc(sizeof(*affine) * point_count);
+    pz_gej *jacobian = NULL;
+    pz_ge *affine = NULL;
     char *rows = malloc(ROW_BYTES * point_count);
-    if (!jacobian || !affine || !rows) {
+    if (!rows) {
         fail_job(job, ENOMEM);
         goto cleanup;
+    }
+    if (!job->scalars) {
+        jacobian = malloc(sizeof(*jacobian) * point_count);
+        affine = malloc(sizeof(*affine) * point_count);
+        if (!jacobian || !affine) {
+            fail_job(job, ENOMEM);
+            goto cleanup;
+        }
     }
 
     while (!g_interrupted && !atomic_load(&job->failed)) {
@@ -176,22 +308,35 @@ static void *export_worker(void *argument)
         const uint64_t count = remaining < job->chunk_size ? remaining : job->chunk_size;
 
         pz_u256 scalar;
-        const pz_u256 offset_scalar = pz_u256_from_u64(offset);
-        pz_u256_add(&scalar, &job->lower, &offset_scalar);
-        pz_ge initial;
-        if (!pz_ec_mul_g(&initial, &scalar)) {
-            fail_job(job, EINVAL);
-            break;
-        }
-        pz_gej_set_ge(&jacobian[0], &initial);
-        for (uint64_t i = 1; i < count; i++) pz_gej_add_ge(&jacobian[i], &jacobian[i - 1], &pz_ec_g);
-        if (!pz_gej_to_ge_batch(affine, jacobian, (size_t)count)) {
-            fail_job(job, EINVAL);
-            break;
-        }
-        for (uint64_t i = 0; i < count; i++) {
-            format_row(rows + i * ROW_BYTES, &scalar, &affine[i]);
-            pz_u256_add_u64(&scalar, &scalar, 1);
+        if (job->scalars) {
+            for (uint64_t i = 0; i < count; i++) {
+                pz_u256_add(&scalar, &job->lower, &job->scalars[offset + i]);
+                pz_ge point;
+                if (!pz_ec_mul_g(&point, &scalar)) {
+                    fail_job(job, EINVAL);
+                    break;
+                }
+                format_row(rows + i * ROW_BYTES, &scalar, &point);
+            }
+            if (atomic_load(&job->failed)) break;
+        } else {
+            const pz_u256 offset_scalar = pz_u256_from_u64(offset);
+            pz_u256_add(&scalar, &job->lower, &offset_scalar);
+            pz_ge initial;
+            if (!pz_ec_mul_g(&initial, &scalar)) {
+                fail_job(job, EINVAL);
+                break;
+            }
+            pz_gej_set_ge(&jacobian[0], &initial);
+            for (uint64_t i = 1; i < count; i++) pz_gej_add_ge(&jacobian[i], &jacobian[i - 1], &pz_ec_g);
+            if (!pz_gej_to_ge_batch(affine, jacobian, (size_t)count)) {
+                fail_job(job, EINVAL);
+                break;
+            }
+            for (uint64_t i = 0; i < count; i++) {
+                format_row(rows + i * ROW_BYTES, &scalar, &affine[i]);
+                pz_u256_add_u64(&scalar, &scalar, 1);
+            }
         }
         if (!write_all_at(job, rows, (size_t)(count * ROW_BYTES), offset * ROW_BYTES)) break;
         atomic_fetch_add(&job->completed, count);
@@ -256,6 +401,7 @@ static void usage(FILE *stream)
           "  --output FILE   New TXT path; never overwritten (required)\n"
           "  --threads N     Parallel workers, 1-32 (default: 2)\n"
           "  --chunk-size N  Rows per batch, 1-65536 (default: 4096)\n"
+          "  --sample N      Export N unique random scalars from the inclusive range\n"
           "  --selftest      Verify Keccak, key 1, EIP-55 and fixed-width row format\n"
           "  --version       Print license and modified-work notices\n"
           "  --help          Show this help\n\n"
@@ -266,7 +412,7 @@ static void usage(FILE *stream)
 int main(int argc, char **argv)
 {
     const char *start_text = NULL, *end_text = NULL, *output = NULL;
-    uint64_t threads = DEFAULT_THREADS, chunk_size = DEFAULT_CHUNK;
+    uint64_t threads = DEFAULT_THREADS, chunk_size = DEFAULT_CHUNK, sample = 0;
     for (int i = 1; i < argc; i++) {
         const char *argument = argv[i];
         if (!strcmp(argument, "--help")) { usage(stdout); return 0; }
@@ -279,6 +425,8 @@ int main(int argc, char **argv)
             if (!parse_u64_option(&threads, argv[++i], 1, 32)) { fputs("Invalid --threads.\n", stderr); return 1; }
         } else if (!strcmp(argument, "--chunk-size") && i + 1 < argc) {
             if (!parse_u64_option(&chunk_size, argv[++i], 1, MAX_CHUNK)) { fputs("Invalid --chunk-size.\n", stderr); return 1; }
+        } else if (!strcmp(argument, "--sample") && i + 1 < argc) {
+            if (!parse_u64_option(&sample, argv[++i], 1, UINT64_MAX)) { fputs("Invalid --sample.\n", stderr); return 1; }
         } else {
             fprintf(stderr, "Unknown or incomplete argument: %s\n", argument);
             usage(stderr);
@@ -306,7 +454,16 @@ int main(int argc, char **argv)
         fputs("The requested row count or output file is too large for this host.\n", stderr);
         return 1;
     }
-    job.total = count.w[0];
+    if (sample) {
+        const bool width_fits_u64 = !(count.w[1] || count.w[2] || count.w[3]);
+        if ((width_fits_u64 && sample > count.w[0]) || sample > (uint64_t)LLONG_MAX / ROW_BYTES) {
+            fputs("Sample count must be between 1 and the inclusive range size, and fit the host output limit.\n", stderr);
+            return 1;
+        }
+        job.total = sample;
+    } else {
+        job.total = count.w[0];
+    }
     job.chunk_size = chunk_size;
     atomic_init(&job.next_chunk, 0);
     atomic_init(&job.completed, 0);
@@ -347,6 +504,24 @@ int main(int argc, char **argv)
     sigaction(SIGTERM, &action, NULL);
 
     pz_ec_init();
+    pz_u256 *scalars = NULL;
+    if (sample) {
+        if (sample > SIZE_MAX / sizeof(*scalars)) {
+            close(job.fd);
+            free(partial);
+            fputs("Sample count is too large for this host.\n", stderr);
+            return 1;
+        }
+        scalars = malloc((size_t)sample * sizeof(*scalars));
+        if (!scalars || !sample_scalars(scalars, &count, sample)) {
+            free(scalars);
+            close(job.fd);
+            free(partial);
+            fputs("Could not sample unique random scalars.\n", stderr);
+            return 1;
+        }
+        job.scalars = scalars;
+    }
     pthread_t *workers = calloc((size_t)threads, sizeof(*workers));
     if (!workers) {
         close(job.fd);
@@ -382,6 +557,8 @@ int main(int argc, char **argv)
     }
     for (size_t i = 0; i < created; i++) pthread_join(workers[i], NULL);
     free(workers);
+    if (scalars) wipe(scalars, (size_t)sample * sizeof(*scalars));
+    free(scalars);
 
     const uint64_t completed = atomic_load(&job.completed);
     const double elapsed = monotonic_seconds() - started;

@@ -152,3 +152,32 @@ test('status cleanup removes inaccessible UUID orphans but not unrelated files',
   assert.equal(existsSync(orphan), false);
   assert.equal(await readFile(unrelated, 'utf8'), 'not an export');
 });
+
+test('authenticated native API can generate and download an exact random sample', { skip }, async (t) => {
+  const previousToken = process.env.NATIVE_PUZZLE_API_TOKEN;
+  process.env.NATIVE_PUZZLE_API_TOKEN = TOKEN;
+  t.after(() => {
+    if (previousToken === undefined) delete process.env.NATIVE_PUZZLE_API_TOKEN;
+    else process.env.NATIVE_PUZZLE_API_TOKEN = previousToken;
+  });
+  const { app } = await fixture(t);
+  const startedResponse = await app.request('/api/native-scalar-export/start', {
+    method: 'POST', headers: { ...authorization, 'content-type': 'application/json' },
+    body: JSON.stringify({ lower: '1', upper: '1000', mode: 'random', sampleCount: '64', threads: 2 }),
+  });
+  assert.equal(startedResponse.status, 202);
+  const { job: started } = await startedResponse.json();
+  assert.equal(started.mode, 'random');
+  assert.equal(started.sampleCount, '64');
+  const completed = await waitForState(app, started.id, ['COMPLETED']);
+  assert.equal(completed.count, '64');
+  assert.equal(completed.bytes, String(64 * 110));
+  assert.equal(completed.fileName, 'address-private-keys-ethereum-1-1000-random-64.txt');
+  const download = await app.request(`/api/native-scalar-export/download?id=${started.id}`, { headers: authorization });
+  assert.equal(download.status, 200);
+  const lines = (await download.text()).trimEnd().split('\n');
+  assert.equal(lines.length, 64);
+  const keys = lines.map((line) => line.split('\t')[1]);
+  assert.equal(new Set(keys).size, 64);
+  for (const key of keys) assert.ok(BigInt(key) >= 1n && BigInt(key) <= 1000n);
+});

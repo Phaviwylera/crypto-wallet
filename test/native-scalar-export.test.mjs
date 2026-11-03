@@ -145,3 +145,39 @@ test('SIGTERM leaves only an incomplete partial and never a completed TXT', { sk
   assert.equal(existsSync(`${output}.partial`), true);
   assert.equal((await stat(`${output}.partial`)).mode & 0o777, 0o600);
 });
+
+test('native random sample exports exact unique in-range rows that match JavaScript derivation', { skip }, async (t) => {
+  const directory = await temporaryDirectory(t, 'native-scalar-random-');
+  const output = path.join(directory, 'random.txt');
+  const result = await runNative([
+    '--start', '1', '--end', '1000', '--sample', '100', '--output', output, '--threads', '2', '--chunk-size', '17',
+  ]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /Complete: 100 rows, 11000 bytes/);
+  assert.equal(existsSync(`${output}.partial`), false);
+  const text = await readFile(output, 'utf8');
+  const lines = text.trimEnd().split('\n');
+  assert.equal(lines.length, 100);
+  const keys = lines.map((line) => line.split('\t')[1]);
+  assert.equal(new Set(keys).size, 100);
+  for (const line of lines) {
+    const [address, key] = line.split('\t');
+    const scalar = BigInt(key);
+    assert.ok(scalar >= 1n && scalar <= 1000n);
+    const expected = deriveScalarWallet(scalar);
+    assert.equal(address, expected.address);
+    assert.equal(key, expected.privateKey);
+  }
+  assert.equal((await stat(output)).mode & 0o777, 0o600);
+});
+
+test('native random sample rejects counts outside the inclusive range before creating files', { skip }, async (t) => {
+  const directory = await temporaryDirectory(t, 'native-scalar-random-invalid-');
+  for (const [index, sample] of ['0', '1001'].entries()) {
+    const output = path.join(directory, `invalid-${index}.txt`);
+    const result = await runNative(['--start', '1', '--end', '1000', '--sample', sample, '--output', output]);
+    assert.notEqual(result.code, 0);
+    assert.equal(existsSync(output), false);
+    assert.equal(existsSync(`${output}.partial`), false);
+  }
+});
