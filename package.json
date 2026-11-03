@@ -9,11 +9,14 @@
     "preview": "vite preview --host 0.0.0.0",
     "start": "node server/index.js",
     "export:scalars": "node scripts/generate-scalar-wallets.mjs",
+    "export:scalars:native": "node scripts/generate-scalar-wallets-native.mjs",
+    "export:scalars:native:setup": "bash scripts/setup-native-scalar-export.sh",
+    "test:export:native": "node --test test/native-scalar-export.test.mjs",
     "puzzle:native:setup": "bash scripts/setup-pzsolve.sh",
     "server": "node server/index.js",
     "server:build": "node server/index.js",
     "test:scan": "node server/test.mjs",
-    "test:search": "node --test test/search.test.mjs test/public-key-search.test.mjs test/public-key-search-pool.test.mjs test/input-focus.test.mjs test/webgpu-lookup.test.mjs test/range-planner.test.mjs test/bitcoin-public-key.test.mjs test/bitcoin-puzzles.test.mjs test/batch-files.test.mjs test/recovery-batch.test.mjs test/puzzle-status-server.test.mjs test/puzzle-campaigns.test.mjs test/scalar-wallet.test.mjs test/scalar-export.test.mjs test/native-puzzle.test.mjs test/native-puzzle-planner.test.mjs test/native-puzzle-server.test.mjs test/wallet-space-math.test.mjs"
+    "test:search": "node --test test/search.test.mjs test/public-key-search.test.mjs test/public-key-search-pool.test.mjs test/input-focus.test.mjs test/webgpu-lookup.test.mjs test/range-planner.test.mjs test/bitcoin-public-key.test.mjs test/bitcoin-puzzles.test.mjs test/batch-files.test.mjs test/recovery-batch.test.mjs test/puzzle-status-server.test.mjs test/puzzle-campaigns.test.mjs test/scalar-wallet.test.mjs test/scalar-export.test.mjs test/native-scalar-export.test.mjs test/native-puzzle.test.mjs test/native-puzzle-planner.test.mjs test/native-puzzle-server.test.mjs test/wallet-space-math.test.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.645.0",
