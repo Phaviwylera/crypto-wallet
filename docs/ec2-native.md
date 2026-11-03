@@ -1,6 +1,6 @@
 # Native pzsolve API on the EC2 website
 
-This adds the same persistent native-C backend used by the local workspace to an existing EC2/Nginx deployment. Nginx continues to serve the built static site and Certbot certificate. Only `/health`, `/api/puzzle-campaigns`, and `/api/native-puzzle/*` are proxied to the Node service on loopback port 8787.
+This adds the same persistent native-C backend used by the local workspace to an existing EC2/Nginx deployment. Nginx continues to serve the built static site and Certbot certificate. Only `/health`, `/api/puzzle-campaigns`, and `/api/native-puzzle/*` are proxied to the Node service on loopback port 8787. The optional independent scalar-export installer adds `/api/native-scalar-export/*` through a separate loopback service on port 8788; it does not restart this puzzle service.
 
 The installer:
 
