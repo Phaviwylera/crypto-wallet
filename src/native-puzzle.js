@@ -80,22 +80,30 @@ function formatRate(value) {
   return `${rate.toFixed(0)} keys/s`;
 }
 
-function progressPercent(job) {
+export function nativePuzzleProgressPercent(job) {
   try {
     const done = BigInt(job.done || 0);
     const total = BigInt(job.total || 0);
-    if (total <= 0n) return 0;
-    return Number((done * 10000n) / total) / 100;
+    if (total <= 0n || done <= 0n) return 0;
+    // Number safely represents these finite magnitudes; only the displayed
+    // significant digits are needed, not an integer-scaled truncation.
+    return (Number(done) / Number(total)) * 100;
   } catch {
     return 0;
   }
 }
 
+export function formatNativePuzzleProgress(percent) {
+  if (!Number.isFinite(percent) || percent <= 0) return '0.0000%';
+  if (percent < 0.0001) return `${percent.toExponential(2)}%`;
+  return `${percent.toFixed(4)}%`;
+}
+
 function nativeJobMarkup(job) {
-  const percent = progressPercent(job);
+  const percent = nativePuzzleProgressPercent(job);
   const state = escapeHtml(job.state || 'UNKNOWN');
   return `<article class="native-puzzle-job" data-state="${state}">
-    <div class="native-puzzle-job-heading"><div><b>Puzzle #${Number(job.puzzle)} · ${state}</b><code>${escapeHtml(job.campaign)}</code></div><strong>${percent.toFixed(4)}%</strong></div>
+    <div class="native-puzzle-job-heading"><div><b>Puzzle #${Number(job.puzzle)} · ${state}</b><code>${escapeHtml(job.campaign)}</code></div><strong>${formatNativePuzzleProgress(percent)}</strong></div>
     <div class="native-puzzle-progress" role="progressbar" aria-label="Puzzle #${Number(job.puzzle)} native scan progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span style="width:${Math.min(100, percent)}%"></span></div>
     <dl><div><dt>Checked</dt><dd>${formatInteger(job.done)} / ${formatInteger(job.total)}</dd></div><div><dt>Rate</dt><dd>${formatRate(job.ratePerSecond)}</dd></div><div><dt>Elapsed</dt><dd>${Number(job.elapsedSeconds || 0).toFixed(1)}s</dd></div><div><dt>Rejected</dt><dd>${Number(job.rejectedCandidates || 0)}</dd></div></dl>
     <p>Range <code>${escapeHtml(job.lower)}</code> to <code>${escapeHtml(job.upper)}</code></p>

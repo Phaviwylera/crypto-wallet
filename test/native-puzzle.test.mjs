@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildNativeHuntArgs, nativeCampaignName, validateNativePuzzleRange } from '../scripts/native-puzzle-api.mjs';
-import { createNativePuzzleState, firstNativePuzzleChunk, nativePuzzleRequest, nativePuzzleStatusMarkup, nextNativePuzzleChunk } from '../src/native-puzzle.js';
+import { createNativePuzzleState, firstNativePuzzleChunk, formatNativePuzzleProgress, nativePuzzleProgressPercent, nativePuzzleRequest, nativePuzzleStatusMarkup, nextNativePuzzleChunk } from '../src/native-puzzle.js';
 
 test('native puzzle chunks are inclusive, contiguous and keep their size', () => {
   const first = firstNativePuzzleChunk(71);
@@ -54,6 +54,15 @@ test('native API requests attach a bearer token only for an authenticated contro
   assert.equal(calls[0].options.headers.authorization, undefined);
   assert.equal(calls[1].options.headers.authorization, 'Bearer test-token');
   assert.equal(calls[1].options.headers['content-type'], 'application/json');
+});
+
+test('native progress preserves tiny nonzero fractions instead of truncating them to zero', () => {
+  const percent = nativePuzzleProgressPercent({ done: '175675768832', total: (2n ** 70n).toString() });
+  assert.ok(percent > 0);
+  assert.ok(Math.abs(percent - 1.488031642349e-8) < 1e-20);
+  assert.equal(formatNativePuzzleProgress(percent), '1.49e-8%');
+  assert.equal(formatNativePuzzleProgress(0.012345), '0.0123%');
+  assert.equal(formatNativePuzzleProgress(0), '0.0000%');
 });
 
 test('native status markup reports results without exposing FOUND.txt contents', () => {
