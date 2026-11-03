@@ -7,3 +7,5 @@ exports/
 infra/seedlab-scan.zip
 server/dist-lambda/
 *.zip
+__pycache__/
+*.py[cod]

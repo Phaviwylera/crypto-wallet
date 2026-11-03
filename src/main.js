@@ -21,6 +21,7 @@ import { runRecoveryBatch } from './recovery-batch.js';
 import { createPuzzleCampaignSnapshot, puzzleCampaignContentMarkup, puzzleCampaignStatusMarkup } from './puzzle-campaigns.js';
 import { createNativePuzzleState, nativePuzzleMarkup, nativePuzzleRequest, nativePuzzleStatusMarkup, nextNativePuzzleChunk } from './native-puzzle.js';
 import { generateScalarBatch, parseScalarBatchRange } from './scalar-wallet.js';
+import { collectWalletSpacePoints } from './wallet-space-data.js';
 import './style.css';
 
 const app = document.querySelector('#app');
@@ -497,6 +498,94 @@ function renderScanResults() {
   });
   el.querySelectorAll('[data-export-index]').forEach((node) => node.addEventListener('click', () => exportWallet(Number(node.dataset.exportIndex))));
   el.querySelectorAll('[data-detail-index]').forEach((node) => node.addEventListener('click', () => showWalletDetails(Number(node.dataset.detailIndex))));
+}
+
+function walletSpaceInspectorMarkup(point, styles) {
+  if (!point) {
+    return '<span class="eyebrow">POINT INSPECTOR</span><h3>Select a highlighted point</h3><p>Click any point in the 3D map to inspect its public address, network, exact Morton cell and mapped scalar range.</p><p class="wallet-space-muted">Drag to rotate · scroll or use + / − to zoom · press 0 to reset the camera.</p>';
+  }
+  const { space } = point;
+  const style = styles[point.source] ?? styles.search;
+  return `<span class="eyebrow">${escapeHtml(style.label)}</span><h3>${escapeHtml(point.networkLabel)}</h3>
+    <div class="wallet-space-address"><label>PUBLIC ADDRESS</label><code>${escapeHtml(point.address)}</code></div>
+    <dl class="wallet-space-facts"><div><dt>3D coordinate</dt><dd>(${space.x}, ${space.y}, ${space.z})</dd></div><div><dt>Morton cell</dt><dd>${space.cell.toLocaleString()}</dd></div><div><dt>Address payload</dt><dd>${space.bitLength} bits</dd></div></dl>
+    <label class="wallet-space-scalar-label">MAPPED 256-BIT SCALAR</label><code class="wallet-space-scalar">${space.mappedScalarHex}</code>
+    <details class="wallet-space-range"><summary>Exact inclusive cell scalar range</summary><label>LOWER</label><code>${space.scalarLowerHex}</code><label>UPPER</label><code>${space.scalarUpperHex}</code></details>
+    <button class="search-file-button" id="wallet-space-copy" type="button">Copy public address</button>
+    <p class="wallet-space-muted">This deterministic projection uses only the public address payload. It does not reveal a private key, balance, ownership, or relationship to nearby points.</p>`;
+}
+
+async function openWalletSpace() {
+  if (document.querySelector('#wallet-space-dialog')) return;
+  const dialog = document.createElement('dialog');
+  dialog.id = 'wallet-space-dialog';
+  dialog.className = 'wallet-space-dialog';
+  dialog.innerHTML = `<div class="wallet-space-shell">
+    <div class="wallet-space-header"><div><span class="eyebrow">PUBLIC ADDRESS PROJECTION · 64 × 64 × 64</span><h2>3D Wallet Space</h2><p id="wallet-space-summary">Preparing public wallet points…</p></div><button class="reverse-toggle" id="wallet-space-close" type="button">Close</button></div>
+    <div class="wallet-space-toolbar"><div class="wallet-space-zoom" aria-label="3D camera controls"><button id="wallet-space-zoom-in" type="button" aria-label="Zoom in">+</button><button id="wallet-space-zoom-out" type="button" aria-label="Zoom out">−</button><button id="wallet-space-reset" type="button">Reset view</button></div><div class="wallet-space-legend" id="wallet-space-legend"></div></div>
+    <div class="wallet-space-body"><div class="wallet-space-canvas" id="wallet-space-canvas"><div class="wallet-space-loading">Loading the 3D engine…</div></div><aside class="wallet-space-inspector" id="wallet-space-inspector">${walletSpaceInspectorMarkup()}</aside></div>
+    <div class="wallet-space-footer">Points are a deterministic 3D Morton projection of public address payloads. Only public addresses are collected; private keys and recovery phrases are never read by this view.</div>
+  </div>`;
+  document.body.append(dialog);
+  let space = null;
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    space?.destroy();
+    dialog.remove();
+  };
+  dialog.querySelector('#wallet-space-close').addEventListener('click', () => dialog.close());
+  dialog.addEventListener('click', (event) => { if (event.target === dialog) dialog.close(); });
+  dialog.addEventListener('close', cleanup, { once: true });
+  dialog.querySelector('#wallet-space-zoom-in').addEventListener('click', () => space?.zoomIn());
+  dialog.querySelector('#wallet-space-zoom-out').addEventListener('click', () => space?.zoomOut());
+  dialog.querySelector('#wallet-space-reset').addEventListener('click', () => space?.reset());
+  dialog.showModal();
+
+  try {
+    const { createWalletSpace, WALLET_SPACE_STYLES } = await import('./wallet-space.js');
+    if (!dialog.open) return;
+    const points = collectWalletSpacePoints({
+      wallet,
+      selectedNetworkId,
+      networks: NETWORKS,
+      scanState,
+      searchAddressFile,
+      labAddressInput,
+      keyRecovery,
+      puzzles: BITCOIN_PUZZLES,
+      parseAddress: parseNetworkAddress,
+    });
+    const inspector = dialog.querySelector('#wallet-space-inspector');
+    const selectPoint = (point) => {
+      inspector.innerHTML = walletSpaceInspectorMarkup(point, WALLET_SPACE_STYLES);
+      inspector.querySelector('#wallet-space-copy')?.addEventListener('click', async (event) => {
+        try {
+          await copyToClipboard(point.address);
+          event.target.textContent = 'Copied';
+        } catch {
+          event.target.textContent = 'Copy unavailable';
+        }
+      });
+    };
+    space = createWalletSpace({
+      container: dialog.querySelector('#wallet-space-canvas'),
+      points,
+      onSelect: selectPoint,
+    });
+    const localCount = space.points.filter((point) => point.source !== 'puzzle').length;
+    dialog.querySelector('#wallet-space-summary').textContent = `${space.points.length.toLocaleString()} unique public addresses · ${localCount.toLocaleString()} session / loaded · drag to rotate, scroll to zoom, click a point`;
+    const counts = new Map();
+    for (const point of space.points) counts.set(point.source, (counts.get(point.source) ?? 0) + 1);
+    dialog.querySelector('#wallet-space-legend').innerHTML = Object.entries(WALLET_SPACE_STYLES).filter(([source]) => counts.has(source)).map(([source, style]) => `<span><i style="--point-color:${style.cssColor}"></i>${escapeHtml(style.label)} <b>${counts.get(source).toLocaleString()}</b></span>`).join('');
+    space.resize();
+  } catch (error) {
+    const container = dialog.querySelector('#wallet-space-canvas');
+    if (container) container.innerHTML = `<div class="wallet-space-loading wallet-space-error" role="alert">${escapeHtml(error?.message ?? String(error))}</div>`;
+    const summary = dialog.querySelector('#wallet-space-summary');
+    if (summary) summary.textContent = 'The 3D view could not start.';
+  }
 }
 
 function showWalletDetails(index) {
@@ -1227,7 +1316,7 @@ function render() {
     </section>`;
 
   app.innerHTML = `
-    <header class="topbar"><a class="brand" href="#overview" aria-label="Seedlab home"><span class="brand-mark">S</span><span>SEEDLAB<span class="brand-sub">/ EXCHANGE LAB</span></span></a><nav class="exchange-nav" aria-label="Main navigation"><a class="active" href="#overview">Overview</a><a href="#setup-card">Wallet lab</a><a href="#derivation-pipeline">Derivation</a><a href="#campaign-status">Campaign status</a><a href="#public-key-search">Public-key search</a><a href="#search-lab">Address search</a></nav><div class="topbar-meta"><span class="live-dot"></span><span>LOCAL SESSION</span><span class="network-chip">${activeNetwork.shortLabel}</span></div></header>
+    <header class="topbar"><a class="brand" href="#overview" aria-label="Seedlab home"><span class="brand-mark">S</span><span>SEEDLAB<span class="brand-sub">/ EXCHANGE LAB</span></span></a><nav class="exchange-nav" aria-label="Main navigation"><a class="active" href="#overview">Overview</a><a href="#setup-card">Wallet lab</a><a href="#derivation-pipeline">Derivation</a><a href="#campaign-status">Campaign status</a><a href="#public-key-search">Public-key search</a><a href="#search-lab">Address search</a></nav><div class="topbar-meta"><button class="space-launch-button" id="open-wallet-space" type="button" title="Open the interactive 3D public-address map">3D Space <span aria-hidden="true">↗</span></button><span class="live-dot"></span><span>LOCAL SESSION</span><span class="network-chip">${activeNetwork.shortLabel}</span></div></header>
     <main class="page-shell" id="overview">
       <div class="page-heading"><div><div class="eyebrow">WALLET ENGINE <span class="eyebrow-slash">/</span> DERIVATION & SEARCH</div><h1>Crypto Wallet Lab</h1><p>Explore address derivation, public-key recovery, and bounded-search algorithms in a trading-terminal style workspace.</p></div><div class="session-chip"><span class="session-dot"></span>${wallet.stage ? `DERIVATION ${String(Math.min(wallet.stage, 5)).padStart(2, '0')} / 05` : 'ENGINE READY'}</div></div>
       <div class="security-banner"><span class="alert-mark">!</span><p><strong>Public HTTP learning demo.</strong> The local derivation lab keeps secret values in this browser. The “Scan on server” upload sends your file to the server (S3 + Lambda) for scanning and is <strong>not</strong> stored permanently — only send test data, never real wallet secrets.</p></div>
@@ -1265,6 +1354,7 @@ function render() {
   passInput?.addEventListener('input', (event) => { passphrase = event.target.value; });
   document.querySelector('#network-select')?.addEventListener('change', selectNetwork);
   document.querySelector('#search-network-select')?.addEventListener('change', selectNetwork);
+  document.querySelector('#open-wallet-space')?.addEventListener('click', openWalletSpace);
   document.querySelector('#recovery-network')?.addEventListener('change', (event) => {
     keyRecovery = { ...keyRecovery, network: event.target.value, address: '', tx: '', result: null, error: '', batchName: '', batchEntries: [], batchError: '', batchResults: null, batchCompleted: 0, cancelRequested: false };
     render();
