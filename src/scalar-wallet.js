@@ -1,13 +1,9 @@
 import { parseSearchRange } from './search-range.js';
 
-export const MAX_SCALAR_BATCH_SIZE = 50_000;
-
 export function parseScalarBatchRange(lower, upper) {
-  const range = parseSearchRange(lower, upper);
-  if (range.count > BigInt(MAX_SCALAR_BATCH_SIZE)) {
-    throw new Error(`Generate at most ${MAX_SCALAR_BATCH_SIZE.toLocaleString('en-US')} scalars at once; choose a smaller inclusive interval.`);
-  }
-  return range;
+  // No artificial row cap: callers are responsible for choosing suitable storage.
+  // The mathematical secp256k1 scalar bounds are still enforced.
+  return parseSearchRange(lower, upper);
 }
 
 export function scalarBatchRow(address, privateKey) {
