@@ -1,6 +1,6 @@
-export const TEXT_FILE_TYPES = [
-  { description: 'Text file', accept: { 'text/plain': ['.txt'] } },
-];
+import { scalarExportFileTypes } from './scalar-export-format.js';
+
+export const TEXT_FILE_TYPES = scalarExportFileTypes('txt');
 
 export function utf8ByteLength(text) {
   let bytes = 0;
@@ -15,12 +15,12 @@ export function utf8ByteLength(text) {
 }
 
 export function validateExportFileName(name) {
-  if (typeof name !== 'string' || !name.endsWith('.txt') || name.length > 255 ||
-      /[<>:"/\\|?*\u0000-\u001f]/.test(name) || name === '.txt' ||
+  if (typeof name !== 'string' || !/\.(txt|csv)$/i.test(name) || name.length > 255 ||
+      /[<>:"/\\|?*\u0000-\u001f]/.test(name) || /^\.(txt|csv)$/i.test(name) ||
       name.endsWith('.') || name.endsWith(' ') || name.startsWith(' ') ||
       name.slice(0, -4).endsWith('.') || name.slice(0, -4).endsWith(' ') ||
-      /^(con|prn|aux|nul|com[1-9]|lpt[1-9])\.txt$/i.test(name)) {
-    throw new Error('The export file name must be a safe .txt file name, not a path.');
+      /^(con|prn|aux|nul|com[1-9]|lpt[1-9])\.(txt|csv)$/i.test(name)) {
+    throw new Error('The export file name must be a safe .txt or .csv file name, not a path.');
   }
   return name;
 }
@@ -47,7 +47,7 @@ export async function ensureExportFolderPermission(directoryHandle) {
 }
 
 // The File System Access API has no portable exclusive-create flag. Probe first
-// so a repeated export never silently replaces an earlier private-key TXT.
+// so a repeated export never silently replaces an earlier private-key export.
 export async function createExportFileHandle(directoryHandle, suggestedName, { ensurePermission = true } = {}) {
   validateExportFileName(suggestedName);
   if (ensurePermission) {
@@ -55,9 +55,10 @@ export async function createExportFileHandle(directoryHandle, suggestedName, { e
   } else if (!directoryHandle || typeof directoryHandle.getFileHandle !== 'function') {
     throw new Error('Choose a download folder first.');
   }
+  const extension = suggestedName.slice(-4);
   const base = suggestedName.slice(0, -4);
   for (let attempt = 0; attempt < 1000; attempt += 1) {
-    const name = attempt === 0 ? suggestedName : `${base}-${attempt + 1}.txt`;
+    const name = attempt === 0 ? suggestedName : `${base}-${attempt + 1}${extension}`;
     try {
       await directoryHandle.getFileHandle(name, { create: false });
       continue;
@@ -76,7 +77,7 @@ export async function saveTextToExportFolder({
   onProgress = () => {},
 }) {
   if (typeof contents !== 'string' || contents.length === 0) {
-    throw new Error('The browser-generated export is empty; no TXT was saved.');
+    throw new Error('The browser-generated export is empty; no file was saved.');
   }
   const total = utf8ByteLength(contents);
   const handle = await createExportFileHandle(directoryHandle, suggestedName);
@@ -95,7 +96,7 @@ export async function saveTextToExportFolder({
     closed = true;
     const savedFile = await handle.getFile();
     if (savedFile.size !== total) {
-      throw new Error(`The saved file has ${savedFile.size} bytes; expected ${total}. Do not use this incomplete TXT; retry the download.`);
+      throw new Error(`The saved file has ${savedFile.size} bytes; expected ${total}. Do not use this incomplete export; retry the download.`);
     }
     verified = true;
     onProgress({ phase: 'verified', completed: total, total });
@@ -106,7 +107,7 @@ export async function saveTextToExportFolder({
     }
     if (!verified) {
       // This path created a fresh no-clobber file name. Do not leave an empty
-      // or incomplete private-key TXT that could be mistaken for a good export.
+      // or incomplete private-key export that could be mistaken for a good file.
       try { await directoryHandle.removeEntry(handle.name); } catch { /* Best effort. */ }
     }
     throw error;

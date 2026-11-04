@@ -8,6 +8,8 @@ EIP-55_address<TAB>0x-prefixed_32-byte_private_key<LF>
 
 Every row is 110 bytes. There is no header and no application row cap. The mathematical bounds remain `1 <= start <= end < secp256k1_order`; host file-offset and available-storage limits still apply.
 
+The completed job can be downloaded as **TXT** (the canonical headerless TSV above) or **CSV**. CSV is a download-time view of the same server file: one `address,private_key` header row, comma separators, and CRLF line endings. Each CSV data row is 111 bytes, so a CSV download is `21 + rows × 111` bytes. The server does not regenerate the keys or keep a second CSV copy.
+
 The native exporter is separate from address search, public-key BSGS, transaction recovery, puzzle scanning, and server file scans. It currently supports **Ethereum only**. The portable Node.js exporter remains available for every supported network. The bounded-generation button uses the native service for Ethereum once installed; other networks retain the slower in-memory browser path.
 
 ## Build
@@ -58,19 +60,27 @@ The deploy service builds the latest `origin/main` from its own source archive, 
 
 It does **not** restart `seedlab-native-api.service`, signal pzsolve, or restart a puzzle campaign. Port 8788 must remain loopback-only; do not add it to the EC2 security group.
 
-Hard-refresh the deployed site. In **Addresses + private keys within these bounds**, enter the existing native API token, choose Ethereum and inclusive bounds, then choose **All entries in range** or **Random sample**. For a random sample, enter the exact number of unique entries (for example `500000` means 500,000 rows / 5 lakh, not 500,000 lakhs); it must not exceed the inclusive range size. Click **Generate all addresses + private keys** or **Generate random sample**. The button now starts native C generation instead of the old JavaScript loop. When complete, click **Download TXT** in a current Chromium browser on HTTPS: the authenticated response is written directly to a file chosen with the browser's save-file picker, or into the folder selected with **Choose folder** (see below). No bearer token appears in the URL and no whole-file Blob is created. Browsers without the File System Access API should use the CLI instead.
+Hard-refresh the deployed site. In **Addresses + private keys within these bounds**, enter the existing native API token, choose Ethereum and inclusive bounds, then choose **All entries in range** or **Random sample**. For a random sample, enter the exact number of unique entries (for example `500000` means 500,000 rows / 5 lakh, not 500,000 lakhs); it must not exceed the inclusive range size. Click **Generate all addresses + private keys** or **Generate random sample**. The button now starts native C generation instead of the old JavaScript loop. When complete, choose **Download format → TXT or CSV**, then click **Download TXT** / **Download CSV** in a current Chromium browser on HTTPS: the authenticated response is written directly to a file chosen with the browser's save-file picker, or into the folder selected with **Choose folder** (see below). No bearer token appears in the URL and no whole-file Blob is created. Browsers without the File System Access API should use the CLI instead.
+
+### TXT or CSV, and large-file limits
+
+- **TXT** keeps the existing headerless `address<TAB>private_key` layout.
+- **CSV** adds the header `address,private_key` and writes `address,private_key` rows with CRLF endings for spreadsheet/database import.
+- The format is selected at download time. You can download the same completed job once as TXT and once as CSV without generating the keys again.
+- CSV does **not** remove file-size or row limits. Notepad and many editors still struggle with very large files, and Excel worksheets stop at about 1,048,576 rows (including the header). For larger exports, use a streaming/large-file viewer, import directly into a database, or split the range/sample into smaller exports.
+- The native CLI and C binary still write the canonical TXT/TSV file; CSV conversion is provided by the UI download route.
 
 ### Choosing a download folder (for example on `D:`)
 
-The panel has a **Download folder** row with **Choose folder**. It opens the browser's directory picker (`showDirectoryPicker`, read-write); pick any folder — for example `D:\SeedlabExports` — and allow access. After that, **Download TXT** writes the export directly into that folder for both the native Ethereum stream and the in-memory browser generator, verifies the final file size, and reports the file and folder name. Notes:
+The panel has a **Download folder** row with **Choose folder**. It opens the browser's directory picker (`showDirectoryPicker`, read-write); pick any folder — for example `D:\SeedlabExports` — and allow access. After that, **Download TXT** or **Download CSV** writes the export directly into that folder for both the native Ethereum stream and the in-memory browser generator, verifies the final file size, and reports the file and folder name. Notes:
 
 - A web page cannot set or read your browser's global download drive, and it cannot see full drive paths — only the folder's name. Confirm inside the picker that the folder is on `D:`. To move **all** browser downloads to `D:`, use Chrome/Edge **Settings → Downloads → Location** instead.
 - The selection is kept in page memory only. After a reload, choose the folder again; the browser may re-ask for write permission on the first download of each session.
-- Exports never overwrite an existing file: a repeat export is saved as `name-2.txt`, `name-3.txt`, and so on. A failed download removes its incomplete destination file.
+- Exports never overwrite an existing file: a repeat export is saved as `name-2.txt`, `name-3.txt`, or `name-2.csv`, `name-3.csv`, and so on. A failed download removes its incomplete destination file.
 - **Use browser default** clears the selection and returns to the normal Save As dialog (native) or browser download (other networks).
 - Folder selection requires a desktop Chromium browser on HTTPS and may be blocked inside embedded/preview iframes; open the app in its own tab if the picker does not appear.
 
-Keep the tab open while the button says **Streaming download…**. Chromium may temporarily show a `.crswap` file beside the chosen `.txt`; that is the browser's staging file, not the completed export. The UI reports byte progress, waits for the browser to close/commit the file, and verifies that the saved TXT size equals the completed job size before showing **Saved and verified**. Empty, truncated, oversized, or non-TXT responses are rejected and are not reported as successful downloads. If a download fails, retry **Download TXT** while the server copy is still available; do not rename or use a leftover `.crswap` file as a verified export.
+Keep the tab open while the button says **Streaming download…**. Chromium may temporarily show a `.crswap` file beside the chosen `.txt` or `.csv`; that is the browser's staging file, not the completed export. The UI reports byte progress, waits for the browser to close/commit the file, and verifies that the saved file size equals the expected TXT or CSV size before showing **Saved and verified**. Empty, truncated, oversized, or wrong-format responses are rejected and are not reported as successful downloads. If a download fails, retry **Download TXT** / **Download CSV** while the server copy is still available; do not rename or use a leftover `.crswap` file as a verified export.
 
 Only one UI export runs at a time. Completed files expire after 30 minutes; **Delete server copy** removes one sooner. API job metadata is memory-only, so restarting the scalar service invalidates old job IDs and its cleanup removes orphaned UUID-named files from the dedicated export directory. All status, start, stop, delete, and download endpoints require the bearer token. Nginx forwards the Authorization header and disables response buffering for downloads.
 
@@ -108,9 +118,9 @@ The output is owner-only (`0600`) where supported. Workers stream bounded batche
 - Ctrl+C/SIGINT or SIGTERM leaves an incomplete `.partial` file and no completed TXT. Move or delete that partial before retrying. There is no resume support.
 - The pre-sized partial can be sparse and may have its final apparent size even while incomplete. Only the final non-`.partial` name denotes success.
 
-**Storage:** budget 110 bytes per row before filesystem overhead. One million rows are 110,000,000 bytes; ten million are 1,100,000,000 bytes (approximately 1.1 GB). At 500,000 rows/sec, row data alone is 55,000,000 bytes/sec. Check free space on the actual output filesystem.
+**Storage:** budget 110 bytes per row for the canonical TXT before filesystem overhead. One million rows are 110,000,000 bytes; ten million are 1,100,000,000 bytes (approximately 1.1 GB). A CSV download of the same job is `21 + rows × 111` bytes (one million rows: 111,000,021 bytes). At 500,000 rows/sec, TXT row data alone is 55,000,000 bytes/sec. Check free space on the actual output filesystem.
 
-**Security:** the TXT contains every private key in the interval. Do not place it under Nginx/static hosting, commit it, or expose it through an unauthenticated download. `exports/` is Git-ignored. Small or published intervals are trivially searchable; never use their keys for real funds.
+**Security:** the TXT or CSV contains every private key in the interval. Do not place it under Nginx/static hosting, commit it, or expose it through an unauthenticated download. `exports/` is Git-ignored. Small or published intervals are trivially searchable; never use their keys for real funds.
 
 ## Measure on the target host
 

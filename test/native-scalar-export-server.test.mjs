@@ -153,6 +153,54 @@ test('status cleanup removes inaccessible UUID orphans but not unrelated files',
   assert.equal(await readFile(unrelated, 'utf8'), 'not an export');
 });
 
+test('authenticated native API streams the same completed job as TXT or CSV without regenerating', { skip }, async (t) => {
+  const previousToken = process.env.NATIVE_PUZZLE_API_TOKEN;
+  process.env.NATIVE_PUZZLE_API_TOKEN = TOKEN;
+  t.after(() => {
+    if (previousToken === undefined) delete process.env.NATIVE_PUZZLE_API_TOKEN;
+    else process.env.NATIVE_PUZZLE_API_TOKEN = previousToken;
+  });
+  const { app, outputRoot } = await fixture(t);
+  const startedResponse = await app.request('/api/native-scalar-export/start', {
+    method: 'POST', headers: { ...authorization, 'content-type': 'application/json' },
+    body: JSON.stringify({ lower: '1', upper: '256', threads: 2 }),
+  });
+  assert.equal(startedResponse.status, 202);
+  const { job: started } = await startedResponse.json();
+  const completed = await waitForState(app, started.id, ['COMPLETED']);
+  assert.equal(completed.bytes, String(256 * 110));
+  assert.equal(completed.fileName, 'address-private-keys-ethereum-1-256.txt');
+
+  const tsv = await readFile(path.join(outputRoot, `${started.id}.txt`), 'utf8');
+  const expectedCsv = 'address,private_key\r\n' + tsv.split('\n').filter(Boolean).map((line) => line.replace('\t', ',')).join('\r\n') + '\r\n';
+
+  const txt = await app.request(`/api/native-scalar-export/download?id=${started.id}`, { headers: authorization });
+  assert.equal(txt.status, 200);
+  assert.equal(txt.headers.get('content-type'), 'text/plain; charset=utf-8');
+  assert.equal(txt.headers.get('content-length'), String(256 * 110));
+  assert.match(txt.headers.get('content-disposition'), /address-private-keys-ethereum-1-256\.txt/);
+  assert.equal(await txt.text(), tsv);
+
+  const csv = await app.request(`/api/native-scalar-export/download?id=${started.id}&format=csv`, { headers: authorization });
+  assert.equal(csv.status, 200);
+  assert.equal(csv.headers.get('content-type'), 'text/csv; charset=utf-8');
+  assert.equal(csv.headers.get('content-length'), String(21 + 256 * 111));
+  assert.match(csv.headers.get('content-disposition'), /address-private-keys-ethereum-1-256\.csv/);
+  assert.equal(csv.headers.get('cache-control'), 'private, no-store');
+  const csvText = await csv.text();
+  assert.equal(csvText, expectedCsv);
+  assert.equal(Buffer.byteLength(csvText), 21 + 256 * 111);
+  assert.equal(csvText.split('\r\n').filter(Boolean).length, 257);
+
+  // The canonical server copy remains headerless TSV after a CSV download.
+  assert.equal(await readFile(path.join(outputRoot, `${started.id}.txt`), 'utf8'), tsv);
+  assert.equal(existsSync(path.join(outputRoot, `${started.id}.csv`)), false);
+
+  const invalid = await app.request(`/api/native-scalar-export/download?id=${started.id}&format=xlsx`, { headers: authorization });
+  assert.equal(invalid.status, 400);
+  assert.match((await invalid.json()).error, /TXT or CSV/);
+});
+
 test('authenticated native API can generate and download an exact random sample', { skip }, async (t) => {
   const previousToken = process.env.NATIVE_PUZZLE_API_TOKEN;
   process.env.NATIVE_PUZZLE_API_TOKEN = TOKEN;

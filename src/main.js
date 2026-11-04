@@ -22,6 +22,7 @@ import { createPuzzleCampaignSnapshot, puzzleCampaignContentMarkup, puzzleCampai
 import { createNativePuzzleState, nativePuzzleMarkup, nativePuzzleRequest, nativePuzzleStatusMarkup, nextNativePuzzleChunk } from './native-puzzle.js';
 import { nativeScalarExportRequest, streamNativeScalarExportDownload } from './native-scalar-export.js';
 import { saveTextToExportFolder, utf8ByteLength } from './download-folder.js';
+import { nativeScalarExportByteCount, normalizeScalarExportFormat, scalarExportFileName, scalarTsvToCsv, SCALAR_EXPORT_FORMATS } from './scalar-export-format.js';
 import { generateRandomScalarBatch, generateScalarBatch, parseScalarBatchRange, parseScalarSampleCount } from './scalar-wallet.js';
 import { collectWalletSpacePoints } from './wallet-space-data.js';
 import './style.css';
@@ -43,7 +44,7 @@ let searchLower = '1';
 let searchUpper = '10000';
 let boundedWallet = { result: null, error: '', busy: false, completed: 0, total: 0, mode: '', jobId: '', downloadBusy: false, downloadProgress: null };
 let boundedWalletRunId = 0;
-let boundedWalletSelection = { mode: 'all', sampleCount: '500000' };
+let boundedWalletSelection = { mode: 'all', sampleCount: '500000', format: 'txt' };
 let downloadFolder = { handle: null, name: '', busy: false, error: '' };
 const selectedNetwork = () => NETWORKS[selectedNetworkId];
 let wallet = freshWallet();
@@ -274,8 +275,8 @@ function taprootDetails(privateKey) {
   };
 }
 
-function exportTextFile(filename, contents) {
-  const blob = new Blob([contents], { type: 'text/plain;charset=utf-8' });
+function exportTextFile(filename, contents, mimeType = 'text/plain;charset=utf-8') {
+  const blob = new Blob([contents], { type: mimeType });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
@@ -902,32 +903,35 @@ async function recoverBatchPublicKeys() {
 }
 
 function boundedWalletDownloadProgressLabel(progress) {
-  const action = progress.phase === 'finalizing' ? 'Finalizing TXT on disk' : 'Saving TXT';
+  const label = SCALAR_EXPORT_FORMATS[normalizeScalarExportFormat(boundedWalletSelection.format)].label;
+  const action = progress.phase === 'finalizing' ? `Finalizing ${label} on disk` : `Saving ${label}`;
   return `${action} · ${progress.completed.toLocaleString()} / ${progress.total.toLocaleString()} bytes`;
 }
 
 function boundedWalletDownloadMarkup() {
   const progress = boundedWallet.downloadProgress;
   if (!boundedWallet.downloadBusy || !progress) return '';
+  const { label, extension } = SCALAR_EXPORT_FORMATS[normalizeScalarExportFormat(boundedWalletSelection.format)];
   const percent = progress.total ? Math.min(100, 100 * progress.completed / progress.total) : 0;
   return `<div class="dlog-live-progress bounded-wallet-result" role="status" aria-live="polite">
     <b id="bounded-wallet-download-progress">${boundedWalletDownloadProgressLabel(progress)}</b>
     <div class="search-progress"><span id="bounded-wallet-download-progress-bar" style="width:${percent}%"></span></div>
-    <p id="bounded-wallet-download-note">${progress.phase === 'finalizing' ? 'All bytes received. Waiting for the browser to finish saving the TXT…' : 'Keep this tab open until “Saved and verified” appears. Chrome may show a temporary .crswap file while saving; use only the completed .txt file.'}</p>
+    <p id="bounded-wallet-download-note">${progress.phase === 'finalizing' ? `All bytes received. Waiting for the browser to finish saving the ${label}…` : `Keep this tab open until “Saved and verified” appears. Chrome may show a temporary .crswap file while saving; use only the completed .${extension} file.`}</p>
   </div>`;
 }
 
 function updateBoundedWalletDownloadProgress(progress) {
   if (!boundedWallet.downloadBusy) return;
   boundedWallet.downloadProgress = progress;
-  const label = document.querySelector('#bounded-wallet-download-progress');
-  if (label) label.textContent = boundedWalletDownloadProgressLabel(progress);
+  const labelElement = document.querySelector('#bounded-wallet-download-progress');
+  if (labelElement) labelElement.textContent = boundedWalletDownloadProgressLabel(progress);
   const bar = document.querySelector('#bounded-wallet-download-progress-bar');
   if (bar) bar.style.width = `${progress.total ? Math.min(100, 100 * progress.completed / progress.total) : 0}%`;
   const note = document.querySelector('#bounded-wallet-download-note');
+  const { label, extension } = SCALAR_EXPORT_FORMATS[normalizeScalarExportFormat(boundedWalletSelection.format)];
   if (note) note.textContent = progress.phase === 'finalizing'
-    ? 'All bytes received. Waiting for the browser to finish saving the TXT…'
-    : 'Keep this tab open until “Saved and verified” appears. Chrome may show a temporary .crswap file while saving; use only the completed .txt file.';
+    ? `All bytes received. Waiting for the browser to finish saving the ${label}…`
+    : `Keep this tab open until “Saved and verified” appears. Chrome may show a temporary .crswap file while saving; use only the completed .${extension} file.`;
 }
 
 function downloadFolderMarkup() {
@@ -935,7 +939,7 @@ function downloadFolderMarkup() {
   const disabled = downloadFolder.busy || boundedWallet.downloadBusy || !supported;
   return `<div class="search-file-row">
     <div class="search-file-copy"><strong>Download folder</strong><small>${downloadFolder.handle
-      ? `Selected folder: <b>${escapeHtml(downloadFolder.name)}</b>. The browser hides the full drive path; confirm in the picker that it is on D: if that is where you want the TXT.`
+      ? `Selected folder: <b>${escapeHtml(downloadFolder.name)}</b>. The browser hides the full drive path; confirm in the picker that it is on D: if that is where you want the export.`
       : 'To save on D:, choose a folder on that drive (for example D:\\SeedlabExports). This app cannot change the browser’s global download drive by itself.'}</small></div>
     <button class="search-file-button" id="choose-download-folder" type="button" ${disabled ? 'disabled' : ''}>${downloadFolder.busy ? 'Choosing…' : (downloadFolder.handle ? 'Change folder' : 'Choose folder')}</button>
     ${downloadFolder.handle ? `<button class="search-file-clear" id="clear-download-folder" type="button" ${disabled ? 'disabled' : ''}>Use browser default</button>` : ''}
@@ -981,24 +985,30 @@ function boundedWalletGeneratorMarkup() {
   const native = selectedNetworkId === 'ethereum';
   const progressPercent = boundedWallet.total ? Math.min(100, 100 * boundedWallet.completed / boundedWallet.total) : 0;
   const randomSelected = boundedWalletSelection.mode === 'random';
+  const downloadFormat = normalizeScalarExportFormat(boundedWalletSelection.format);
+  const downloadLabel = SCALAR_EXPORT_FORMATS[downloadFormat].label;
   const generateLabel = boundedWallet.busy
     ? (boundedWallet.mode === 'native' ? 'Generating natively…' : 'Generating…')
     : (randomSelected ? 'Generate random sample' : 'Generate all addresses + private keys');
   return `<div class="public-key-extract-panel bounded-wallet-panel" id="bounded-wallet-generator">
     <strong>Addresses + private keys within these bounds</strong>
-    <p>Choose <b>All entries</b> to enumerate every scalar from lower through upper, or <b>Random sample</b> to export an exact number of unique random entries from that inclusive range. The TXT contains only <code>address → tab → 32-byte private key</code> on each line, with no header or other information. ${native ? 'Ethereum uses the parallel native C service and streams the completed TXT directly to your chosen file—no whole-file browser Blob. The independent export service does not control the puzzle scanner.' : 'This network currently uses the slower browser generator, which holds the complete result in memory.'} <strong>The TXT contains sensitive private keys.</strong> Small or known intervals can be brute-forced; never use their keys for real funds.</p>
+    <p>Choose <b>All entries</b> to enumerate every scalar from lower through upper, or <b>Random sample</b> to export an exact number of unique random entries from that inclusive range. Every row pairs an address with its 32-byte private key. <b>TXT</b> is headerless and tab-separated; <b>CSV</b> adds an <code>address,private_key</code> header and uses comma separators for spreadsheet import. ${native ? 'Ethereum uses the parallel native C service and streams the completed export directly to your chosen file—no whole-file browser Blob. The independent export service does not control the puzzle scanner.' : 'This network currently uses the slower browser generator, which holds the complete result in memory.'} <strong>The export contains sensitive private keys.</strong> Small or known intervals can be brute-forced; never use their keys for real funds.</p>
     <div class="candidate-range">
       <label>Export mode<select id="bounded-wallet-mode" ${boundedWallet.busy || boundedWallet.downloadBusy ? 'disabled' : ''}><option value="all" ${randomSelected ? '' : 'selected'}>All entries in range</option><option value="random" ${randomSelected ? 'selected' : ''}>Random sample</option></select></label>
       <label>Random entries<input id="bounded-wallet-sample-count" type="text" inputmode="numeric" value="${escapeHtml(boundedWalletSelection.sampleCount)}" ${randomSelected && !boundedWallet.busy && !boundedWallet.downloadBusy ? '' : 'disabled'} placeholder="500000"></label>
     </div>
     <p class="step-explanation subtle">Random sample count is exact entries, not lakhs: <code>500000</code> means 500,000 rows (5 lakh). It must be ≤ the inclusive range size. Sampling is without replacement, so private keys do not repeat.</p>
+    <div class="candidate-range">
+      <label>Download format<select id="bounded-wallet-format" ${boundedWallet.downloadBusy ? 'disabled' : ''}><option value="txt" ${downloadFormat === 'txt' ? 'selected' : ''}>TXT · tab-separated, no header</option><option value="csv" ${downloadFormat === 'csv' ? 'selected' : ''}>CSV · comma-separated, with header</option></select></label>
+    </div>
+    <p class="step-explanation subtle">CSV helps spreadsheet/database import, but it does not remove file-size or row limits: Excel worksheets stop at about 1,048,576 rows, and editors have their own limits. For larger exports, use a streaming viewer, database import, or split the range/sample into smaller files.</p>
     ${downloadFolderMarkup()}
     ${native ? `<div class="point-worker-control"><label for="bounded-wallet-token">Native API access token <span class="subtle">(same token as native scanner controls)</span></label><input id="bounded-wallet-token" type="password" value="${escapeHtml(nativePuzzle.accessToken)}" ${boundedWallet.busy ? 'disabled' : ''} autocomplete="off" spellcheck="false" placeholder="Leave blank only for an unprotected local service"><small>Sent only as a same-origin bearer token. It is kept in page state, not persistent browser storage, and is never placed in the download URL.</small></div>` : ''}
-    <div class="dlog-actions"><button class="search-file-button" id="generate-bounded-wallet" type="button" ${boundedWallet.busy || boundedWallet.downloadBusy ? 'disabled' : ''}>${generateLabel}</button>${boundedWallet.busy ? '<button class="dlog-stop-button" id="stop-bounded-wallet" type="button">Cancel generation</button>' : ''}${result ? `<button class="search-file-button" id="download-bounded-wallet" type="button" ${boundedWallet.downloadBusy ? 'disabled' : ''}>${boundedWallet.downloadBusy ? 'Streaming download…' : 'Download TXT'}</button>` : ''}${result?.native ? `<button class="dlog-stop-button" id="delete-native-bounded-wallet" type="button" ${boundedWallet.downloadBusy ? 'disabled' : ''}>Delete server copy</button>` : ''}</div>
+    <div class="dlog-actions"><button class="search-file-button" id="generate-bounded-wallet" type="button" ${boundedWallet.busy || boundedWallet.downloadBusy ? 'disabled' : ''}>${generateLabel}</button>${boundedWallet.busy ? '<button class="dlog-stop-button" id="stop-bounded-wallet" type="button">Cancel generation</button>' : ''}${result ? `<button class="search-file-button" id="download-bounded-wallet" type="button" ${boundedWallet.downloadBusy ? 'disabled' : ''}>${boundedWallet.downloadBusy ? 'Streaming download…' : `Download ${downloadLabel}`}</button>` : ''}${result?.native ? `<button class="dlog-stop-button" id="delete-native-bounded-wallet" type="button" ${boundedWallet.downloadBusy ? 'disabled' : ''}>Delete server copy</button>` : ''}</div>
     ${boundedWallet.error ? `<p class="search-file-error" role="alert">${escapeHtml(boundedWallet.error)}</p>` : ''}
     ${boundedWallet.busy ? `<div class="dlog-live-progress bounded-wallet-result" role="status" aria-live="polite"><b id="bounded-wallet-progress">Generated ${boundedWallet.completed.toLocaleString()} / ${boundedWallet.total.toLocaleString()} rows</b><div class="search-progress"><span id="bounded-wallet-progress-bar" style="width:${progressPercent}%"></span></div><p>${boundedWallet.mode === 'native' ? 'Native C writes bounded chunks on the server. Cancel signals only this export job.' : 'Derivation runs in small JavaScript chunks and holds the result in browser memory.'}</p></div>` : ''}
     ${boundedWalletDownloadMarkup()}
-    ${result ? `<div class="dlog-live-progress bounded-wallet-result" aria-live="polite"><b>${result.count.toLocaleString()} rows ready · ${escapeHtml(result.networkLabel)} · ${result.selectionMode === 'random' ? 'random sample' : 'all entries'}${result.ratePerSecond ? ` · ${result.ratePerSecond.toLocaleString()} rows/s` : ''}</b><p>Inclusive scalar range: <code>${escapeHtml(result.lower)}</code> – <code>${escapeHtml(result.upper)}</code></p><p>${result.native ? 'Native C export complete. Download streams to disk without loading the TXT into browser memory. The server copy expires after 30 minutes.' : 'Headerless browser-generated TXT is held in memory.'} <strong>Keep it secret.</strong>${result.downloaded ? ` Saved and verified: <code>${escapeHtml(result.savedFileName || result.fileName)}</code>${result.savedFolderName ? ` in <code>${escapeHtml(result.savedFolderName)}</code>` : ''} · ${result.bytes.toLocaleString()} bytes.` : ''}</p></div>` : ''}
+    ${result ? `<div class="dlog-live-progress bounded-wallet-result" aria-live="polite"><b>${result.count.toLocaleString()} rows ready · ${escapeHtml(result.networkLabel)} · ${result.selectionMode === 'random' ? 'random sample' : 'all entries'}${result.ratePerSecond ? ` · ${result.ratePerSecond.toLocaleString()} rows/s` : ''}</b><p>Inclusive scalar range: <code>${escapeHtml(result.lower)}</code> – <code>${escapeHtml(result.upper)}</code></p><p>${result.native ? 'Native C export complete. Download streams to disk without loading the export into browser memory. The server copy expires after 30 minutes.' : 'Headerless browser-generated rows are held in memory.'} <strong>Keep it secret.</strong>${result.downloaded ? ` Saved and verified: <code>${escapeHtml(result.savedFileName || scalarExportFileName(result.fileName, downloadFormat))}</code>${result.savedFolderName ? ` in <code>${escapeHtml(result.savedFolderName)}</code>` : ''} · ${(result.savedBytes ?? result.bytes).toLocaleString()} bytes.` : ''}</p></div>` : ''}
   </div>`;
 }
 
@@ -1184,13 +1194,29 @@ async function generateBoundedWallet() {
 async function downloadBoundedWallet() {
   const result = boundedWallet.result;
   if (!result || boundedWallet.downloadBusy) return;
-  const fileName = result.fileName || `address-private-keys-${result.networkId}-${result.lower}-${result.upper}.txt`;
+  const format = normalizeScalarExportFormat(boundedWalletSelection.format);
+  const fileName = scalarExportFileName(result.fileName || `address-private-keys-${result.networkId}-${result.lower}-${result.upper}.txt`, format);
   const directoryHandle = downloadFolder.handle;
+  let browserContents = null;
+  let total;
+  if (result.native) {
+    // The canonical native job is TSV. CSV is a streamed download-time view,
+    // so switching formats does not require regenerating the server export.
+    total = Number(format === 'csv' ? nativeScalarExportByteCount(result.count, 'csv') : result.bytes);
+  } else {
+    try {
+      browserContents = format === 'csv' ? scalarTsvToCsv(result.text) : result.text;
+    } catch (error) {
+      boundedWallet.error = error?.message ?? String(error);
+      render();
+      return;
+    }
+    total = utf8ByteLength(browserContents);
+  }
   if (!result.native && !directoryHandle) {
-    exportTextFile(fileName, result.text);
+    exportTextFile(fileName, browserContents, `${SCALAR_EXPORT_FORMATS[format].mimeType};charset=utf-8`);
     return;
   }
-  const total = result.native ? Number(result.bytes) : utf8ByteLength(result.text);
   boundedWallet.downloadBusy = true;
   boundedWallet.downloadProgress = { phase: 'writing', completed: 0, total };
   boundedWallet.error = '';
@@ -1202,7 +1228,8 @@ async function downloadBoundedWallet() {
         jobId: result.jobId,
         accessToken: nativePuzzle.accessToken,
         suggestedName: fileName,
-        expectedBytes: result.bytes,
+        expectedBytes: total,
+        format,
         onProgress: updateBoundedWalletDownloadProgress,
         directoryHandle,
         showSaveFilePicker: globalThis.showSaveFilePicker?.bind(globalThis),
@@ -1210,20 +1237,20 @@ async function downloadBoundedWallet() {
       : await saveTextToExportFolder({
         directoryHandle,
         suggestedName: fileName,
-        contents: result.text,
+        contents: browserContents,
         onProgress: updateBoundedWalletDownloadProgress,
       });
-    // The helper has closed the staging file and verified the final TXT size.
+    // The helper has closed the staging file and verified the final file size.
     if (boundedWallet.result === result) {
       result.downloaded = true;
       result.savedFileName = saved.fileName;
       result.savedFolderName = saved.folderName || directoryHandle?.name || '';
-      result.bytes = saved.bytes;
+      result.savedBytes = saved.bytes;
     }
     boundedWallet.error = '';
   } catch (error) {
     boundedWallet.error = error?.name === 'AbortError'
-      ? (result.native ? 'Download cancelled; the server copy remains available.' : 'Download cancelled; no TXT was saved.')
+      ? (result.native ? 'Download cancelled; the server copy remains available.' : 'Download cancelled; no export was saved.')
       : (error?.message ?? String(error));
   } finally {
     boundedWallet.downloadBusy = false;
@@ -1822,6 +1849,10 @@ function render() {
   });
   document.querySelector('#bounded-wallet-sample-count')?.addEventListener('input', (event) => {
     boundedWalletSelection.sampleCount = event.target.value;
+  });
+  document.querySelector('#bounded-wallet-format')?.addEventListener('change', (event) => {
+    boundedWalletSelection.format = normalizeScalarExportFormat(event.target.value);
+    render();
   });
   document.querySelector('#choose-download-folder')?.addEventListener('click', chooseDownloadFolder);
   document.querySelector('#clear-download-folder')?.addEventListener('click', clearDownloadFolder);

@@ -1,4 +1,5 @@
-import { createExportFileHandle, ensureExportFolderPermission, TEXT_FILE_TYPES } from './download-folder.js';
+import { createExportFileHandle, ensureExportFolderPermission } from './download-folder.js';
+import { normalizeScalarExportFormat, scalarExportFileTypes, SCALAR_EXPORT_FORMATS } from './scalar-export-format.js';
 
 async function responseError(response, fallback) {
   const data = await response.json().catch(() => null);
@@ -33,19 +34,25 @@ export async function streamNativeScalarExportDownload({
   accessToken = '',
   suggestedName,
   expectedBytes,
+  format = 'txt',
   onProgress = () => {},
   directoryHandle,
   showSaveFilePicker,
   fetchImpl = (...args) => globalThis.fetch(...args),
 }) {
+  const exportFormat = normalizeScalarExportFormat(format);
+  const { label, mimeType, extension } = SCALAR_EXPORT_FORMATS[exportFormat];
   const total = Number(expectedBytes);
   if (!Number.isSafeInteger(total) || total <= 0) {
-    throw new Error('The expected export size must be a positive integer before saving the TXT.');
+    throw new Error(`The expected export size must be a positive integer before saving the ${label}.`);
+  }
+  if (suggestedName !== undefined && (typeof suggestedName !== 'string' || !suggestedName.toLowerCase().endsWith(`.${extension}`))) {
+    throw new Error(`The ${label} download file name must end in .${extension}.`);
   }
   // A previously chosen folder still needs write permission, and the browser
   // may only grant it inside this download click. Do this before any network
   // await, but delay creating the destination file until the response headers
-  // validate so an HTTP/error response does not leave an empty TXT behind.
+  // validate so an HTTP/error response does not leave an empty export behind.
   let handle;
   if (directoryHandle) {
     await ensureExportFolderPermission(directoryHandle);
@@ -53,7 +60,7 @@ export async function streamNativeScalarExportDownload({
     if (typeof showSaveFilePicker !== 'function') {
       throw new Error('This browser cannot stream an authenticated large download. Use a current Chromium browser or the native CLI instead.');
     }
-    handle = await showSaveFilePicker({ suggestedName, types: TEXT_FILE_TYPES });
+    handle = await showSaveFilePicker({ suggestedName, types: scalarExportFileTypes(exportFormat) });
   }
   let writable;
   let writer;
@@ -62,20 +69,21 @@ export async function streamNativeScalarExportDownload({
   let verified = false;
   try {
     if (!directoryHandle) {
-      // Chromium stages writes in a temporary .crswap file. The chosen TXT stays
+      // Chromium stages writes in a temporary .crswap file. The chosen file stays
       // empty until close() succeeds; do not report success before that commit.
       writable = await handle.createWritable({ keepExistingData: false });
       writer = writable.getWriter();
     }
     const headers = accessToken ? { authorization: `Bearer ${accessToken}` } : {};
-    const response = await fetchImpl(`/api/native-scalar-export/download?id=${encodeURIComponent(jobId)}`, {
+    const formatQuery = exportFormat === 'txt' ? '' : `&format=${exportFormat}`;
+    const response = await fetchImpl(`/api/native-scalar-export/download?id=${encodeURIComponent(jobId)}${formatQuery}`, {
       cache: 'no-store',
       headers,
     });
     if (!response.ok) throw await responseError(response, 'Native scalar download failed');
     const contentType = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-    if (contentType !== 'text/plain') {
-      throw new Error('The server did not return a text/plain TXT export. No download was saved.');
+    if (contentType !== mimeType) {
+      throw new Error(`The server did not return a ${mimeType} ${label} export. No download was saved.`);
     }
     if (!response.body) throw new Error('The browser did not provide a readable download stream.');
     const encoding = (response.headers.get('content-encoding') || 'identity').trim().toLowerCase();
@@ -97,31 +105,31 @@ export async function streamNativeScalarExportDownload({
     reader = response.body.getReader();
     let completed = 0;
     // Await each write for disk backpressure. Only one network chunk is held;
-    // neither a whole-file Blob nor a second in-memory copy of the TXT is used.
+    // neither a whole-file Blob nor a second in-memory copy of the export is used.
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       if (!(value instanceof Uint8Array)) throw new Error('The download stream returned invalid byte data.');
       if (completed + value.byteLength > total) {
-        throw new Error('The download is larger than expected. The incomplete TXT was not saved.');
+        throw new Error(`The download is larger than expected. The incomplete ${label} was not saved.`);
       }
       await writer.write(value);
       completed += value.byteLength;
       onProgress({ phase: 'writing', completed, total });
     }
-    if (completed === 0) throw new Error('The server returned an empty download. No TXT was saved.');
+    if (completed === 0) throw new Error(`The server returned an empty download. No ${label} was saved.`);
     if (completed !== total) {
       throw new Error(`Download incomplete: received ${completed} of ${total} bytes. Retry while the server copy is available.`);
     }
 
     onProgress({ phase: 'finalizing', completed, total });
     // Explicitly commit and flush the browser's staging file. Merely receiving
-    // the last network chunk does not mean the destination TXT is ready.
+    // the last network chunk does not mean the destination file is ready.
     await writer.close();
     closed = true;
     const savedFile = await handle.getFile();
     if (savedFile.size !== total) {
-      throw new Error(`The saved file has ${savedFile.size} bytes; expected ${total}. Do not use this incomplete TXT; retry the download.`);
+      throw new Error(`The saved file has ${savedFile.size} bytes; expected ${total}. Do not use this incomplete ${label}; retry the download.`);
     }
     verified = true;
     onProgress({ phase: 'verified', completed, total });

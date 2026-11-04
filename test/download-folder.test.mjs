@@ -109,13 +109,14 @@ test('utf8ByteLength counts UTF-8 bytes, including surrogate pairs', () => {
   assert.equal(utf8ByteLength('a😀é'), 7);
 });
 
-test('export file names are safe .txt basenames, not paths', () => {
+test('export file names are safe .txt or .csv basenames, not paths', () => {
   assert.equal(validateExportFileName('address-private-keys-ethereum-1-1000.txt'), 'address-private-keys-ethereum-1-1000.txt');
+  assert.equal(validateExportFileName('address-private-keys-ethereum-1-1000.csv'), 'address-private-keys-ethereum-1-1000.csv');
   for (const name of [
-    '', '.txt', 'keys.csv', '../keys.txt', 'D:\\keys.txt', 'folder/keys.txt', 'keys.txt\n',
-    'keys.txt ', ' keys.txt', 'keys..txt', 'keys .txt', 'con.txt', 'LPT1.txt', 'a'.repeat(252) + '.txt',
+    '', '.txt', '.csv', 'keys.tsv', '../keys.txt', 'D:\\keys.csv', 'folder/keys.txt', 'keys.txt\n',
+    'keys.txt ', ' keys.csv', 'keys..txt', 'keys .csv', 'con.txt', 'LPT1.csv', 'a'.repeat(252) + '.txt',
   ]) {
-    assert.throws(() => validateExportFileName(name), /safe \.txt file name/);
+    assert.throws(() => validateExportFileName(name), /safe \.txt or \.csv file name/);
   }
 });
 
@@ -139,7 +140,7 @@ test('folder permission is queried, then requested only when needed', async () =
   await ensureExportFolderPermission(opfsLike);
 });
 
-test('a repeated export never silently overwrites an earlier private-key TXT', async () => {
+test('a repeated export never silently overwrites an earlier private-key file', async () => {
   const folder = directoryHandle({ existing: ['keys.txt', 'keys-2.txt'] });
   const handle = await createExportFileHandle(folder, 'keys.txt');
   assert.equal(handle.name, 'keys-3.txt');
@@ -149,6 +150,11 @@ test('a repeated export never silently overwrites an earlier private-key TXT', a
 
   const fresh = directoryHandle();
   assert.equal((await createExportFileHandle(fresh, 'keys.txt')).name, 'keys.txt');
+
+  const csvFolder = directoryHandle({ existing: ['keys.csv', 'keys-2.csv'] });
+  assert.equal((await createExportFileHandle(csvFolder, 'keys.csv')).name, 'keys-3.csv');
+  assert.equal(csvFolder.files.has('keys.csv'), true);
+  assert.equal(csvFolder.files.has('keys-2.csv'), true);
 });
 
 test('createExportFileHandle can skip a redundant permission prompt but still requires a folder', async () => {
@@ -188,6 +194,16 @@ test('saving multibyte text verifies the UTF-8 byte count, not the string length
   const result = await saveTextToExportFolder({ directoryHandle: folder, suggestedName: 'keys.txt', contents });
   assert.equal(result.bytes, utf8ByteLength(contents));
   assert.ok(result.bytes > contents.length);
+});
+
+test('saving browser-generated CSV writes the exact comma-separated bytes and verifies size', async () => {
+  const folder = directoryHandle();
+  const contents = 'address,private_key\r\n0xabc,0x123\r\n';
+  const result = await saveTextToExportFolder({ directoryHandle: folder, suggestedName: 'keys.csv', contents });
+  assert.equal(result.fileName, 'keys.csv');
+  assert.equal(result.bytes, utf8ByteLength(contents));
+  assert.equal(Buffer.from(folder.files.get('keys.csv').bytes).toString(), contents);
+  assert.equal(folder.files.get('keys.csv').closed, true);
 });
 
 test('empty browser text is rejected before a destination file is created', async () => {

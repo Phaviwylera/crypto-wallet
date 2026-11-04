@@ -8,6 +8,13 @@ import { constants as fsConstants } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { parseSearchRange } from '../src/search-range.js';
 import { parseScalarSampleCount } from '../src/scalar-wallet.js';
+import {
+  nativeScalarExportByteCount,
+  normalizeScalarExportFormat,
+  scalarExportFileName,
+  SCALAR_CSV_HEADER,
+  SCALAR_EXPORT_FORMATS,
+} from '../src/scalar-export-format.js';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DEFAULT_BINARY = path.join(PROJECT_ROOT, '.runtime', 'bin', 'seedlab-eth-export');
@@ -20,6 +27,37 @@ function apiError(message, statusCode = 400) {
   const error = new Error(message);
   error.statusCode = statusCode;
   return error;
+}
+
+async function* nativeTsvToCsvChunks(source, expectedRows) {
+  yield Buffer.from(SCALAR_CSV_HEADER, 'utf8');
+  let pending = Buffer.alloc(0);
+  let rows = 0n;
+  for await (const chunk of source) {
+    const buffer = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+    const completeRows = Math.floor(buffer.length / 110);
+    if (completeRows > 0) {
+      const csv = Buffer.allocUnsafe(completeRows * 111);
+      for (let index = 0; index < completeRows; index += 1) {
+        const input = index * 110;
+        const output = index * 111;
+        if (buffer[input + 42] !== 0x09 || buffer[input + 109] !== 0x0a) {
+          throw new Error('The native export contains an invalid TSV row; CSV download stopped.');
+        }
+        buffer.copy(csv, output, input, input + 42);
+        csv[output + 42] = 0x2c;
+        buffer.copy(csv, output + 43, input + 43, input + 109);
+        csv[output + 109] = 0x0d;
+        csv[output + 110] = 0x0a;
+      }
+      yield csv;
+      rows += BigInt(completeRows);
+    }
+    pending = completeRows * 110 < buffer.length ? Buffer.from(buffer.subarray(completeRows * 110)) : Buffer.alloc(0);
+  }
+  if (pending.length !== 0 || rows !== expectedRows) {
+    throw new Error('The native export ended before the expected CSV row count; download stopped.');
+  }
 }
 
 function normalizeThreads(value = 2) {
@@ -263,13 +301,26 @@ export function createNativeScalarExportService({
     return { ok: true };
   }
 
-  async function download(id) {
+  async function download(id, requestedFormat = 'txt') {
+    let format;
+    try { format = normalizeScalarExportFormat(requestedFormat); } catch (error) { throw apiError(error.message, 400); }
     const job = jobs.get(String(id));
     if (!job || job.state !== 'COMPLETED') throw apiError('Completed native scalar export not found.', 404);
     let details;
     try { details = await stat(job.output); } catch { throw apiError('The exported file is no longer available.', 404); }
     if (BigInt(details.size) !== BigInt(job.totalBytes)) throw apiError('The exported file size is invalid.', 500);
-    return { stream: createReadStream(job.output), size: details.size, fileName: job.fileName };
+    const fileName = scalarExportFileName(job.fileName, format);
+    const contentType = SCALAR_EXPORT_FORMATS[format].mimeType;
+    if (format === 'txt') {
+      return { stream: createReadStream(job.output), size: details.size, fileName, contentType };
+    }
+    // The canonical server copy stays headerless TSV. CSV is a streamed
+    // download-time view, so the same completed job can be saved in either
+    // format without regenerating or loading the whole export into memory.
+    const expectedRows = BigInt(job.count);
+    const size = Number(nativeScalarExportByteCount(expectedRows, 'csv'));
+    const stream = Readable.from(nativeTsvToCsvChunks(createReadStream(job.output), expectedRows), { objectMode: false });
+    return { stream, size, fileName, contentType };
   }
 
   function shutdown() {
@@ -326,8 +377,8 @@ export function registerNativeScalarExportRoutes(app, options = {}) {
     context.header('referrer-policy', 'no-referrer');
     if (!authorized(context)) return context.json({ error: 'A valid native API bearer token is required for scalar export.' }, 401);
     try {
-      const result = await service.download(context.req.query('id') || '');
-      context.header('content-type', 'text/plain; charset=utf-8');
+      const result = await service.download(context.req.query('id') || '', context.req.query('format') || 'txt');
+      context.header('content-type', `${result.contentType}; charset=utf-8`);
       context.header('content-length', String(result.size));
       context.header('content-disposition', `attachment; filename="${result.fileName}"`);
       return context.body(Readable.toWeb(result.stream));
