@@ -1,1 +1,1 @@
-{"rewrites":[{"source":"/auditor","destination":"/auditor.html"},{"source":"/auditor.html","destination":"/auditor.html"},{"source":"/(.*)","destination":"/index.html"}]}
+{"rewrites":[{"source":"/auditor","destination":"/auditor.html"},{"source":"/auditor.html","destination":"/auditor.html"},{"source":"/quantum","destination":"/quantum.html"},{"source":"/quantum.html","destination":"/quantum.html"},{"source":"/(.*)","destination":"/index.html"}]}

@@ -43,6 +43,7 @@ export default defineConfig({
       input: {
         main: new URL('./index.html', import.meta.url).pathname,
         auditor: new URL('./auditor.html', import.meta.url).pathname,
+        quantum: new URL('./quantum.html', import.meta.url).pathname,
       },
     },
   },
@@ -50,6 +51,11 @@ export default defineConfig({
     host: '0.0.0.0',
     allowedHosts: true,
     proxy: {
+      // Dev: optional educational Shor N=15 simulator API (loopback Python service).
+      '/api/quantum': {
+        target: process.env.QUANTUM_SERVER_URL || 'http://127.0.0.1:8789',
+        changeOrigin: true,
+      },
       // Dev: the independent scalar-export service never shares the puzzle lifecycle.
       '/api/native-scalar-export': {
         target: process.env.SCALAR_EXPORT_SERVER_URL || 'http://localhost:8788',

@@ -1,0 +1,5 @@
+# Optional educational Shor lab (N=15 only). Not used by the wallet exporter/auditor.
+# Tested with Python 3.11. Install with: bash scripts/setup-shors-lab.sh
+qiskit==2.6.1
+qiskit-aer==0.18.2
+numpy==2.4.6

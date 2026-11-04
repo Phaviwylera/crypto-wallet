@@ -23,6 +23,21 @@ npm run dev              # then open /auditor.html
 
 The auditor tests raw generator output and authorized source only. It does not search funded wallets, check balances or recover third-party keys. Statistical signals and static rule matches are triage leads, not confirmed vulnerabilities or bounty eligibility. See [Security Auditor guide](docs/security-auditor.md) for browser/CLI execution, production deployment, data handling, limits and official sources.
 
+## Shor N=15 Quantum Lab
+
+A separate page at **`/quantum.html`** implements the educational N=15 factoring demo: an exact browser statevector simulation plus an optional local Qiskit Aer runner, phase-estimation visualization, continued-fraction period inference and GCD verification. It factors the fixed integer 15 only; there are no wallet, address or key inputs, and it does not run on quantum hardware. Existing processes are unchanged.
+
+```sh
+bash scripts/setup-shors-lab.sh                 # isolated .runtime/quantum-venv
+npm run quantum:shor -- --base 7 --seed 42 --shots 128
+npm run server:quantum                          # optional API for the page's Qiskit mode
+npm run test:quantum                            # JS core/API contracts
+npm run test:quantum:python                     # real Qiskit/Aer tests
+npm run dev                                     # then open /quantum.html
+```
+
+See [Shor N=15 guide](docs/shors-n15.md) for execution, API limits, deployment notes and the corrections made to the original snippet.
+
 ## Address profiles
 
 | Profile | Derivation path | Address construction |

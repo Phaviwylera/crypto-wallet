@@ -1,0 +1,52 @@
+name: Quantum Lab Tests
+
+on:
+  push:
+    paths:
+      - 'scripts/shors_algorithm.py'
+      - 'scripts/setup-shors-lab.sh'
+      - 'scripts/run-quantum.mjs'
+      - 'requirements-quantum.txt'
+      - 'server/quantum-api.mjs'
+      - 'src/quantum/**'
+      - 'quantum.html'
+      - 'test/quantum-*'
+      - 'vite.config.js'
+      - 'vercel.json'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/quantum-lab-tests.yml'
+  pull_request:
+    paths:
+      - 'scripts/shors_algorithm.py'
+      - 'scripts/setup-shors-lab.sh'
+      - 'scripts/run-quantum.mjs'
+      - 'requirements-quantum.txt'
+      - 'server/quantum-api.mjs'
+      - 'src/quantum/**'
+      - 'quantum.html'
+      - 'test/quantum-*'
+      - 'vite.config.js'
+      - 'vercel.json'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/quantum-lab-tests.yml'
+
+jobs:
+  quantum:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: npm ci
+      - name: Set up isolated Qiskit/Aer environment
+        run: bash scripts/setup-shors-lab.sh
+      - run: npm run test:quantum
+      - run: npm run test:quantum:python
+      - run: npm run build

@@ -23,7 +23,12 @@
     "audit:demo": "node scripts/security-audit.mjs demo",
     "audit:verify": "node scripts/security-audit.mjs verify",
     "audit:programs": "node scripts/security-audit.mjs programs",
-    "test:security": "node --test test/security-*.test.mjs"
+    "test:security": "node --test test/security-*.test.mjs",
+    "quantum:setup": "bash scripts/setup-shors-lab.sh",
+    "quantum:shor": "node scripts/run-quantum.mjs",
+    "server:quantum": "node server/quantum-api.mjs",
+    "test:quantum": "node --test test/quantum-*.test.mjs",
+    "test:quantum:python": ".runtime/quantum-venv/bin/python -m unittest discover -s test -p \"quantum_python_*.py\" -v"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.645.0",
