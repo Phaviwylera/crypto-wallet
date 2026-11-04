@@ -1,3 +1,5 @@
+import { createExportFileHandle, ensureExportFolderPermission, TEXT_FILE_TYPES } from './download-folder.js';
+
 async function responseError(response, fallback) {
   const data = await response.json().catch(() => null);
   return new Error(data?.error || `${fallback} (HTTP ${response.status})`);
@@ -32,6 +34,7 @@ export async function streamNativeScalarExportDownload({
   suggestedName,
   expectedBytes,
   onProgress = () => {},
+  directoryHandle,
   showSaveFilePicker,
   fetchImpl = (...args) => globalThis.fetch(...args),
 }) {
@@ -39,23 +42,31 @@ export async function streamNativeScalarExportDownload({
   if (!Number.isSafeInteger(total) || total <= 0) {
     throw new Error('The expected export size must be a positive integer before saving the TXT.');
   }
-  if (typeof showSaveFilePicker !== 'function') {
-    throw new Error('This browser cannot stream an authenticated large download. Use a current Chromium browser or the native CLI instead.');
+  // A previously chosen folder still needs write permission, and the browser
+  // may only grant it inside this download click. Do this before any network
+  // await, but delay creating the destination file until the response headers
+  // validate so an HTTP/error response does not leave an empty TXT behind.
+  let handle;
+  if (directoryHandle) {
+    await ensureExportFolderPermission(directoryHandle);
+  } else {
+    if (typeof showSaveFilePicker !== 'function') {
+      throw new Error('This browser cannot stream an authenticated large download. Use a current Chromium browser or the native CLI instead.');
+    }
+    handle = await showSaveFilePicker({ suggestedName, types: TEXT_FILE_TYPES });
   }
-  // The picker must be invoked from the user's click before any network await.
-  const handle = await showSaveFilePicker({
-    suggestedName,
-    types: [{ description: 'Text file', accept: { 'text/plain': ['.txt'] } }],
-  });
   let writable;
   let writer;
   let reader;
   let closed = false;
+  let verified = false;
   try {
-    // Chromium stages writes in a temporary .crswap file. The chosen TXT stays
-    // empty until close() succeeds; do not report success before that commit.
-    writable = await handle.createWritable({ keepExistingData: false });
-    writer = writable.getWriter();
+    if (!directoryHandle) {
+      // Chromium stages writes in a temporary .crswap file. The chosen TXT stays
+      // empty until close() succeeds; do not report success before that commit.
+      writable = await handle.createWritable({ keepExistingData: false });
+      writer = writable.getWriter();
+    }
     const headers = accessToken ? { authorization: `Bearer ${accessToken}` } : {};
     const response = await fetchImpl(`/api/native-scalar-export/download?id=${encodeURIComponent(jobId)}`, {
       cache: 'no-store',
@@ -73,6 +84,14 @@ export async function streamNativeScalarExportDownload({
     // decompressed byte count below must always match the completed job size.
     if ((!encoding || encoding === 'identity') && contentLength !== null && Number(contentLength) !== total) {
       throw new Error(`Download Content-Length is ${contentLength}, but the completed export requires ${total} bytes.`);
+    }
+
+    if (directoryHandle) {
+      // Permission was already requested inside the download click. Create the
+      // no-clobber destination only after the response headers are known good.
+      handle = await createExportFileHandle(directoryHandle, suggestedName, { ensurePermission: false });
+      writable = await handle.createWritable({ keepExistingData: false });
+      writer = writable.getWriter();
     }
 
     reader = response.body.getReader();
@@ -104,6 +123,7 @@ export async function streamNativeScalarExportDownload({
     if (savedFile.size !== total) {
       throw new Error(`The saved file has ${savedFile.size} bytes; expected ${total}. Do not use this incomplete TXT; retry the download.`);
     }
+    verified = true;
     onProgress({ phase: 'verified', completed, total });
     return { bytes: savedFile.size, fileName: handle.name };
   } catch (error) {
@@ -114,6 +134,11 @@ export async function streamNativeScalarExportDownload({
     }
     if (writer && !closed) {
       try { await writer.abort(error); } catch { /* Already closed or aborted. */ }
+    }
+    if (directoryHandle && handle && !verified) {
+      // The folder path created a fresh no-clobber file name. Remove an empty
+      // or incomplete destination so a failed download does not look usable.
+      try { await directoryHandle.removeEntry(handle.name); } catch { /* Best effort. */ }
     }
     throw error;
   } finally {

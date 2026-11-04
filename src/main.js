@@ -21,6 +21,7 @@ import { runRecoveryBatch } from './recovery-batch.js';
 import { createPuzzleCampaignSnapshot, puzzleCampaignContentMarkup, puzzleCampaignStatusMarkup } from './puzzle-campaigns.js';
 import { createNativePuzzleState, nativePuzzleMarkup, nativePuzzleRequest, nativePuzzleStatusMarkup, nextNativePuzzleChunk } from './native-puzzle.js';
 import { nativeScalarExportRequest, streamNativeScalarExportDownload } from './native-scalar-export.js';
+import { saveTextToExportFolder, utf8ByteLength } from './download-folder.js';
 import { generateRandomScalarBatch, generateScalarBatch, parseScalarBatchRange, parseScalarSampleCount } from './scalar-wallet.js';
 import { collectWalletSpacePoints } from './wallet-space-data.js';
 import './style.css';
@@ -43,6 +44,7 @@ let searchUpper = '10000';
 let boundedWallet = { result: null, error: '', busy: false, completed: 0, total: 0, mode: '', jobId: '', downloadBusy: false, downloadProgress: null };
 let boundedWalletRunId = 0;
 let boundedWalletSelection = { mode: 'all', sampleCount: '500000' };
+let downloadFolder = { handle: null, name: '', busy: false, error: '' };
 const selectedNetwork = () => NETWORKS[selectedNetworkId];
 let wallet = freshWallet();
 let passphrase = '';
@@ -928,6 +930,52 @@ function updateBoundedWalletDownloadProgress(progress) {
     : 'Keep this tab open until “Saved and verified” appears. Chrome may show a temporary .crswap file while saving; use only the completed .txt file.';
 }
 
+function downloadFolderMarkup() {
+  const supported = typeof globalThis.showDirectoryPicker === 'function';
+  const disabled = downloadFolder.busy || boundedWallet.downloadBusy || !supported;
+  return `<div class="search-file-row">
+    <div class="search-file-copy"><strong>Download folder</strong><small>${downloadFolder.handle
+      ? `Selected folder: <b>${escapeHtml(downloadFolder.name)}</b>. The browser hides the full drive path; confirm in the picker that it is on D: if that is where you want the TXT.`
+      : 'To save on D:, choose a folder on that drive (for example D:\\SeedlabExports). This app cannot change the browser’s global download drive by itself.'}</small></div>
+    <button class="search-file-button" id="choose-download-folder" type="button" ${disabled ? 'disabled' : ''}>${downloadFolder.busy ? 'Choosing…' : (downloadFolder.handle ? 'Change folder' : 'Choose folder')}</button>
+    ${downloadFolder.handle ? `<button class="search-file-clear" id="clear-download-folder" type="button" ${disabled ? 'disabled' : ''}>Use browser default</button>` : ''}
+  </div>
+  ${!supported ? '<p class="step-explanation subtle">Folder selection requires a desktop Chromium browser on HTTPS. You can still use the normal Save As dialog or browser download settings.</p>' : ''}
+  ${downloadFolder.error ? `<p class="search-file-error" role="alert">${escapeHtml(downloadFolder.error)}</p>` : ''}`;
+}
+
+async function chooseDownloadFolder() {
+  if (downloadFolder.busy || boundedWallet.downloadBusy) return;
+  if (typeof globalThis.showDirectoryPicker !== 'function') {
+    downloadFolder.error = 'This browser cannot choose a download folder. Use desktop Chrome/Edge on HTTPS, or change the browser download location in settings.';
+    render();
+    return;
+  }
+  downloadFolder.busy = true;
+  downloadFolder.error = '';
+  render();
+  try {
+    const handle = await globalThis.showDirectoryPicker({
+      id: 'seedlab-export-folder',
+      mode: 'readwrite',
+      startIn: downloadFolder.handle || 'downloads',
+    });
+    downloadFolder.handle = handle;
+    downloadFolder.name = handle.name || 'Selected folder';
+  } catch (error) {
+    if (error?.name !== 'AbortError') downloadFolder.error = error?.message ?? String(error);
+  } finally {
+    downloadFolder.busy = false;
+    render();
+  }
+}
+
+function clearDownloadFolder() {
+  if (downloadFolder.busy || boundedWallet.downloadBusy) return;
+  downloadFolder = { handle: null, name: '', busy: false, error: '' };
+  render();
+}
+
 function boundedWalletGeneratorMarkup() {
   const result = boundedWallet.result;
   const native = selectedNetworkId === 'ethereum';
@@ -944,12 +992,13 @@ function boundedWalletGeneratorMarkup() {
       <label>Random entries<input id="bounded-wallet-sample-count" type="text" inputmode="numeric" value="${escapeHtml(boundedWalletSelection.sampleCount)}" ${randomSelected && !boundedWallet.busy && !boundedWallet.downloadBusy ? '' : 'disabled'} placeholder="500000"></label>
     </div>
     <p class="step-explanation subtle">Random sample count is exact entries, not lakhs: <code>500000</code> means 500,000 rows (5 lakh). It must be ≤ the inclusive range size. Sampling is without replacement, so private keys do not repeat.</p>
+    ${downloadFolderMarkup()}
     ${native ? `<div class="point-worker-control"><label for="bounded-wallet-token">Native API access token <span class="subtle">(same token as native scanner controls)</span></label><input id="bounded-wallet-token" type="password" value="${escapeHtml(nativePuzzle.accessToken)}" ${boundedWallet.busy ? 'disabled' : ''} autocomplete="off" spellcheck="false" placeholder="Leave blank only for an unprotected local service"><small>Sent only as a same-origin bearer token. It is kept in page state, not persistent browser storage, and is never placed in the download URL.</small></div>` : ''}
     <div class="dlog-actions"><button class="search-file-button" id="generate-bounded-wallet" type="button" ${boundedWallet.busy || boundedWallet.downloadBusy ? 'disabled' : ''}>${generateLabel}</button>${boundedWallet.busy ? '<button class="dlog-stop-button" id="stop-bounded-wallet" type="button">Cancel generation</button>' : ''}${result ? `<button class="search-file-button" id="download-bounded-wallet" type="button" ${boundedWallet.downloadBusy ? 'disabled' : ''}>${boundedWallet.downloadBusy ? 'Streaming download…' : 'Download TXT'}</button>` : ''}${result?.native ? `<button class="dlog-stop-button" id="delete-native-bounded-wallet" type="button" ${boundedWallet.downloadBusy ? 'disabled' : ''}>Delete server copy</button>` : ''}</div>
     ${boundedWallet.error ? `<p class="search-file-error" role="alert">${escapeHtml(boundedWallet.error)}</p>` : ''}
     ${boundedWallet.busy ? `<div class="dlog-live-progress bounded-wallet-result" role="status" aria-live="polite"><b id="bounded-wallet-progress">Generated ${boundedWallet.completed.toLocaleString()} / ${boundedWallet.total.toLocaleString()} rows</b><div class="search-progress"><span id="bounded-wallet-progress-bar" style="width:${progressPercent}%"></span></div><p>${boundedWallet.mode === 'native' ? 'Native C writes bounded chunks on the server. Cancel signals only this export job.' : 'Derivation runs in small JavaScript chunks and holds the result in browser memory.'}</p></div>` : ''}
     ${boundedWalletDownloadMarkup()}
-    ${result ? `<div class="dlog-live-progress bounded-wallet-result" aria-live="polite"><b>${result.count.toLocaleString()} rows ready · ${escapeHtml(result.networkLabel)} · ${result.selectionMode === 'random' ? 'random sample' : 'all entries'}${result.ratePerSecond ? ` · ${result.ratePerSecond.toLocaleString()} rows/s` : ''}</b><p>Inclusive scalar range: <code>${escapeHtml(result.lower)}</code> – <code>${escapeHtml(result.upper)}</code></p><p>${result.native ? 'Native C export complete. Download streams to disk without loading the TXT into browser memory. The server copy expires after 30 minutes.' : 'Headerless browser-generated TXT is held in memory.'} <strong>Keep it secret.</strong>${result.downloaded ? ` Saved and verified: <code>${escapeHtml(result.savedFileName || result.fileName)}</code> · ${result.bytes.toLocaleString()} bytes.` : ''}</p></div>` : ''}
+    ${result ? `<div class="dlog-live-progress bounded-wallet-result" aria-live="polite"><b>${result.count.toLocaleString()} rows ready · ${escapeHtml(result.networkLabel)} · ${result.selectionMode === 'random' ? 'random sample' : 'all entries'}${result.ratePerSecond ? ` · ${result.ratePerSecond.toLocaleString()} rows/s` : ''}</b><p>Inclusive scalar range: <code>${escapeHtml(result.lower)}</code> – <code>${escapeHtml(result.upper)}</code></p><p>${result.native ? 'Native C export complete. Download streams to disk without loading the TXT into browser memory. The server copy expires after 30 minutes.' : 'Headerless browser-generated TXT is held in memory.'} <strong>Keep it secret.</strong>${result.downloaded ? ` Saved and verified: <code>${escapeHtml(result.savedFileName || result.fileName)}</code>${result.savedFolderName ? ` in <code>${escapeHtml(result.savedFolderName)}</code>` : ''} · ${result.bytes.toLocaleString()} bytes.` : ''}</p></div>` : ''}
   </div>`;
 }
 
@@ -1135,33 +1184,46 @@ async function generateBoundedWallet() {
 async function downloadBoundedWallet() {
   const result = boundedWallet.result;
   if (!result || boundedWallet.downloadBusy) return;
-  if (!result.native) {
-    exportTextFile(result.fileName || `address-private-keys-${result.networkId}-${result.lower}-${result.upper}.txt`, result.text);
+  const fileName = result.fileName || `address-private-keys-${result.networkId}-${result.lower}-${result.upper}.txt`;
+  const directoryHandle = downloadFolder.handle;
+  if (!result.native && !directoryHandle) {
+    exportTextFile(fileName, result.text);
     return;
   }
+  const total = result.native ? Number(result.bytes) : utf8ByteLength(result.text);
   boundedWallet.downloadBusy = true;
-  boundedWallet.downloadProgress = { phase: 'writing', completed: 0, total: Number(result.bytes) };
+  boundedWallet.downloadProgress = { phase: 'writing', completed: 0, total };
   boundedWallet.error = '';
   result.downloaded = false;
   render();
   try {
-    const saved = await streamNativeScalarExportDownload({
-      jobId: result.jobId,
-      accessToken: nativePuzzle.accessToken,
-      suggestedName: result.fileName,
-      expectedBytes: result.bytes,
-      onProgress: updateBoundedWalletDownloadProgress,
-      showSaveFilePicker: globalThis.showSaveFilePicker?.bind(globalThis),
-    });
+    const saved = result.native
+      ? await streamNativeScalarExportDownload({
+        jobId: result.jobId,
+        accessToken: nativePuzzle.accessToken,
+        suggestedName: fileName,
+        expectedBytes: result.bytes,
+        onProgress: updateBoundedWalletDownloadProgress,
+        directoryHandle,
+        showSaveFilePicker: globalThis.showSaveFilePicker?.bind(globalThis),
+      })
+      : await saveTextToExportFolder({
+        directoryHandle,
+        suggestedName: fileName,
+        contents: result.text,
+        onProgress: updateBoundedWalletDownloadProgress,
+      });
     // The helper has closed the staging file and verified the final TXT size.
-    if (boundedWallet.result?.jobId === result.jobId) {
-      boundedWallet.result.downloaded = true;
-      boundedWallet.result.savedFileName = saved.fileName;
+    if (boundedWallet.result === result) {
+      result.downloaded = true;
+      result.savedFileName = saved.fileName;
+      result.savedFolderName = saved.folderName || directoryHandle?.name || '';
+      result.bytes = saved.bytes;
     }
     boundedWallet.error = '';
   } catch (error) {
     boundedWallet.error = error?.name === 'AbortError'
-      ? 'Download cancelled; the server copy remains available.'
+      ? (result.native ? 'Download cancelled; the server copy remains available.' : 'Download cancelled; no TXT was saved.')
       : (error?.message ?? String(error));
   } finally {
     boundedWallet.downloadBusy = false;
@@ -1761,6 +1823,8 @@ function render() {
   document.querySelector('#bounded-wallet-sample-count')?.addEventListener('input', (event) => {
     boundedWalletSelection.sampleCount = event.target.value;
   });
+  document.querySelector('#choose-download-folder')?.addEventListener('click', chooseDownloadFolder);
+  document.querySelector('#clear-download-folder')?.addEventListener('click', clearDownloadFolder);
   document.querySelector('#generate-bounded-wallet')?.addEventListener('click', generateBoundedWallet);
   document.querySelector('#stop-bounded-wallet')?.addEventListener('click', stopBoundedWalletGeneration);
   document.querySelector('#download-bounded-wallet')?.addEventListener('click', downloadBoundedWallet);
