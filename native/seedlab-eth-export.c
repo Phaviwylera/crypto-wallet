@@ -450,18 +450,21 @@ int main(int argc, char **argv)
     pz_u256 count;
     pz_u256_sub(&count, &upper, &job.lower);
     pz_u256_add_u64(&count, &count, 1);
-    if (count.w[1] || count.w[2] || count.w[3] || count.w[0] > (uint64_t)LLONG_MAX / ROW_BYTES) {
-        fputs("The requested row count or output file is too large for this host.\n", stderr);
-        return 1;
-    }
+    const bool width_fits_u64 = !(count.w[1] || count.w[2] || count.w[3]);
     if (sample) {
-        const bool width_fits_u64 = !(count.w[1] || count.w[2] || count.w[3]);
+        /* A random sample writes only `sample` rows, so the inclusive range may
+         * be far wider than the host output limit. Validate the sample count,
+         * not the full range width. */
         if ((width_fits_u64 && sample > count.w[0]) || sample > (uint64_t)LLONG_MAX / ROW_BYTES) {
             fputs("Sample count must be between 1 and the inclusive range size, and fit the host output limit.\n", stderr);
             return 1;
         }
         job.total = sample;
     } else {
+        if (!width_fits_u64 || count.w[0] > (uint64_t)LLONG_MAX / ROW_BYTES) {
+            fputs("The requested row count or output file is too large for this host. Use --sample N to export a random subset of a wide range.\n", stderr);
+            return 1;
+        }
         job.total = count.w[0];
     }
     job.chunk_size = chunk_size;
