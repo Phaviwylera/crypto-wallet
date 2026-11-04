@@ -201,6 +201,50 @@ test('authenticated native API streams the same completed job as TXT or CSV with
   assert.match((await invalid.json()).error, /TXT or CSV/);
 });
 
+test('authenticated native API accepts a small random sample from a range wider than the host output limit', { skip }, async (t) => {
+  const previousToken = process.env.NATIVE_PUZZLE_API_TOKEN;
+  process.env.NATIVE_PUZZLE_API_TOKEN = TOKEN;
+  t.after(() => {
+    if (previousToken === undefined) delete process.env.NATIVE_PUZZLE_API_TOKEN;
+    else process.env.NATIVE_PUZZLE_API_TOKEN = previousToken;
+  });
+  const { app } = await fixture(t);
+  const lower = '8886537567565632563756237567736572356383562336563565237857';
+  const upper = '9886537567565632563756237567736572356383562336563599999999';
+  const startedResponse = await app.request('/api/native-scalar-export/start', {
+    method: 'POST', headers: { ...authorization, 'content-type': 'application/json' },
+    body: JSON.stringify({ lower, upper, mode: 'random', sampleCount: '5000', threads: 2 }),
+  });
+  assert.equal(startedResponse.status, 202);
+  const { job: started } = await startedResponse.json();
+  assert.equal(started.count, '5000');
+  assert.equal(started.totalBytes, String(5000 * 110));
+  const completed = await waitForState(app, started.id, ['COMPLETED'], 30000);
+  assert.equal(completed.completed, '5000');
+  assert.equal(completed.bytes, String(5000 * 110));
+
+  const download = await app.request(`/api/native-scalar-export/download?id=${started.id}`, { headers: authorization });
+  assert.equal(download.status, 200);
+  const lines = (await download.text()).trimEnd().split('\n');
+  assert.equal(lines.length, 5000);
+  const keys = lines.map((line) => line.split('\t')[1]);
+  assert.equal(new Set(keys).size, 5000);
+  for (const key of keys) assert.ok(BigInt(key) >= BigInt(lower) && BigInt(key) <= BigInt(upper));
+  for (const line of [lines[0], lines[2500], lines[4999]]) {
+    const [address, key] = line.split('\t');
+    const expected = deriveScalarWallet(BigInt(key));
+    assert.equal(address, expected.address);
+    assert.equal(key, expected.privateKey);
+  }
+
+  const csv = await app.request(`/api/native-scalar-export/download?id=${started.id}&format=csv`, { headers: authorization });
+  assert.equal(csv.status, 200);
+  assert.equal(csv.headers.get('content-length'), String(21 + 5000 * 111));
+  const csvRows = (await csv.text()).trimEnd().split('\r\n');
+  assert.equal(csvRows.length, 5001);
+  assert.equal(csvRows[0], 'address,private_key');
+});
+
 test('authenticated native API can generate and download an exact random sample', { skip }, async (t) => {
   const previousToken = process.env.NATIVE_PUZZLE_API_TOKEN;
   process.env.NATIVE_PUZZLE_API_TOKEN = TOKEN;

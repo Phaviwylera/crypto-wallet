@@ -171,6 +171,75 @@ test('native random sample exports exact unique in-range rows that match JavaScr
   assert.equal((await stat(output)).mode & 0o777, 0o600);
 });
 
+test('native random sample works when the inclusive range is wider than the host output limit', { skip }, async (t) => {
+  const directory = await temporaryDirectory(t, 'native-scalar-random-wide-');
+  // The reported UI case: a ~1e56-wide inclusive range with only 5,000 entries.
+  const lower = 8886537567565632563756237567736572356383562336563565237857n;
+  const upper = 9886537567565632563756237567736572356383562336563599999999n;
+  const output = path.join(directory, 'wide-random.txt');
+  const result = await runNative([
+    '--start', String(lower), '--end', String(upper), '--sample', '5000',
+    '--output', output, '--threads', '2', '--chunk-size', '512',
+  ]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /Complete: 5000 rows, 550000 bytes/);
+  assert.equal(existsSync(`${output}.partial`), false);
+  const text = await readFile(output, 'utf8');
+  assert.equal(Buffer.byteLength(text), 5000 * 110);
+  const lines = text.trimEnd().split('\n');
+  assert.equal(lines.length, 5000);
+  const keys = lines.map((line) => line.split('\t')[1]);
+  assert.equal(new Set(keys).size, 5000);
+  for (const line of lines) {
+    const [address, key] = line.split('\t');
+    const scalar = BigInt(key);
+    assert.ok(scalar >= lower && scalar <= upper);
+    const expected = deriveScalarWallet(scalar);
+    assert.equal(address, expected.address);
+    assert.equal(key, expected.privateKey);
+  }
+  assert.equal((await stat(output)).mode & 0o777, 0o600);
+});
+
+test('native random sample works for ranges wider than 64 bits and for u64 widths above the output limit', { skip }, async (t) => {
+  const directory = await temporaryDirectory(t, 'native-scalar-random-width-');
+  const cases = [
+    // Width exceeds uint64 entirely.
+    [String(N - (1n << 100n)), String(N - 1n), '64'],
+    // Width fits uint64 but exceeds LLONG_MAX / 110 (the host output limit).
+    ['1', '100000000000000000', '32'],
+  ];
+  for (const [index, [lower, upper, sample]] of cases.entries()) {
+    const output = path.join(directory, `width-${index}.txt`);
+    const result = await runNative([
+      '--start', lower, '--end', upper, '--sample', sample, '--output', output, '--threads', '2',
+    ]);
+    assert.equal(result.code, 0, result.stderr);
+    const lines = (await readFile(output, 'utf8')).trimEnd().split('\n');
+    assert.equal(lines.length, Number(sample));
+    assert.equal(new Set(lines.map((line) => line.split('\t')[1])).size, Number(sample));
+    for (const line of lines) {
+      const scalar = BigInt(line.split('\t')[1]);
+      assert.ok(scalar >= BigInt(lower) && scalar <= BigInt(upper));
+    }
+  }
+});
+
+test('native all-entries export still rejects ranges wider than the host output limit', { skip }, async (t) => {
+  const directory = await temporaryDirectory(t, 'native-scalar-all-wide-');
+  const output = path.join(directory, 'too-wide.txt');
+  const result = await runNative([
+    '--start', '8886537567565632563756237567736572356383562336563565237857',
+    '--end', '9886537567565632563756237567736572356383562336563599999999',
+    '--output', output,
+  ]);
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /too large for this host/);
+  assert.match(result.stderr, /--sample/);
+  assert.equal(existsSync(output), false);
+  assert.equal(existsSync(`${output}.partial`), false);
+});
+
 test('native random sample rejects counts outside the inclusive range before creating files', { skip }, async (t) => {
   const directory = await temporaryDirectory(t, 'native-scalar-random-invalid-');
   for (const [index, sample] of ['0', '1001'].entries()) {

@@ -111,7 +111,7 @@ The output is owner-only (`0600`) where supported. Workers stream bounded batche
 
 - `--threads` accepts 1–32 and defaults to 2. More threads than available cores can be slower.
 - `--chunk-size` accepts 1–65,536 rows and defaults to 4,096.
-- `--sample N` exports exactly N unique random scalars from the inclusive range, without replacement. N must be between 1 and the range size.
+- `--sample N` exports exactly N unique random scalars from the inclusive range, without replacement. N must be between 1 and the range size. The inclusive range itself may be wider than the host all-entries output limit (for example a ~10^56-wide range with `--sample 5000`); only N rows are written. Without `--sample`, a range wider than the host output limit is rejected with a message pointing at `--sample`.
 - `--network ethereum` is accepted for command-line consistency; other networks are rejected rather than silently using the wrong derivation.
 - Existing final and `.partial` paths are never overwritten.
 - On success, the binary flushes and closes the file, then publishes the final name with a no-replace hard-link operation.
