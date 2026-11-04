@@ -305,7 +305,9 @@ test('main passes the expected size, renders save progress and marks success onl
   assert.match(source, /const mode = networkId === 'ethereum' \? 'native' : 'browser'/);
   assert.match(source, /await runNativeBoundedWallet\(/);
   assert.match(source, /await streamNativeScalarExportDownload\(/);
-  assert.match(source, /expectedBytes: result\.bytes/);
+  assert.match(source, /expectedBytes: total/);
+  assert.match(source, /format,\n\s*onProgress: updateBoundedWalletDownloadProgress/);
+  assert.match(source, /result\.savedBytes = saved\.bytes/);
   assert.match(source, /onProgress: updateBoundedWalletDownloadProgress/);
   assert.match(source, /result\.downloaded = true/);
   assert.match(source, /Saved and verified/);
@@ -463,4 +465,83 @@ test('main passes the chosen directory handle to the native streaming helper', a
   const source = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
   assert.match(source, /const directoryHandle = downloadFolder\.handle/);
   assert.match(source, /directoryHandle,\n\s*showSaveFilePicker/);
+});
+
+// --- CSV download format ---
+
+test('native CSV download requests format=csv, offers a .csv picker and verifies text/csv bytes', async () => {
+  const handle = saveHandle({ name: 'address-private-keys-ethereum-1-1000.csv' });
+  let pickerOptions;
+  let captured;
+  const csv = 'address,private_key\r\n0xabc,0x123\r\n';
+  const result = await streamNativeScalarExportDownload({
+    jobId: 'job-csv',
+    accessToken: 'secret-token',
+    suggestedName: handle.name,
+    expectedBytes: Buffer.byteLength(csv),
+    format: 'csv',
+    showSaveFilePicker: async (options) => { pickerOptions = options; return handle; },
+    fetchImpl: async (url, options) => {
+      captured = { url, options };
+      return responseWithChunks([csv], { headers: { 'content-type': 'text/csv; charset=utf-8' } }).response;
+    },
+  });
+  assert.equal(captured.url, '/api/native-scalar-export/download?id=job-csv&format=csv');
+  assert.equal(captured.options.headers.authorization, 'Bearer secret-token');
+  assert.equal(captured.url.includes('secret-token'), false);
+  assert.deepEqual(pickerOptions.types, [{ description: 'CSV spreadsheet', accept: { 'text/csv': ['.csv'] } }]);
+  assert.equal(pickerOptions.suggestedName, handle.name);
+  assert.equal(Buffer.from(handle.published).toString(), csv);
+  assert.equal(result.bytes, Buffer.byteLength(csv));
+  assert.equal(handle.closed, true);
+});
+
+test('native CSV download rejects a .txt suggested name and a text/plain response', async () => {
+  await assert.rejects(streamNativeScalarExportDownload({
+    jobId: 'job-csv', expectedBytes: 25, format: 'csv', suggestedName: 'keys.txt',
+    showSaveFilePicker: async () => saveHandle(),
+  }), /must end in \.csv/i);
+
+  const handle = saveHandle({ name: 'keys.csv' });
+  await assert.rejects(streamNativeScalarExportDownload({
+    jobId: 'job-csv', expectedBytes: 25, format: 'csv', suggestedName: 'keys.csv',
+    showSaveFilePicker: async () => handle,
+    fetchImpl: async () => responseWithChunks(['first chunk\n', 'second chunk\n']).response,
+  }), /text\/csv/i);
+  assert.equal(handle.closed, false);
+  assert.equal(handle.aborted, true);
+});
+
+test('a chosen folder streams CSV without the save picker and keeps the .csv extension when de-duplicating', async () => {
+  const folder = folderHandle({ existing: ['keys.csv'] });
+  let picked = false;
+  let capturedUrl;
+  const csv = 'address,private_key\r\n0xabc,0x123\r\n';
+  const result = await streamNativeScalarExportDownload({
+    jobId: 'job-csv',
+    suggestedName: 'keys.csv',
+    expectedBytes: Buffer.byteLength(csv),
+    format: 'csv',
+    directoryHandle: folder,
+    showSaveFilePicker: async () => { picked = true; },
+    fetchImpl: async (url) => {
+      capturedUrl = url;
+      return responseWithChunks([csv], { headers: { 'content-type': 'text/csv' } }).response;
+    },
+  });
+  assert.equal(picked, false);
+  assert.equal(capturedUrl, '/api/native-scalar-export/download?id=job-csv&format=csv');
+  assert.equal(result.fileName, 'keys-2.csv');
+  assert.equal(Buffer.from(folder.files.get('keys-2.csv')).toString(), csv);
+  assert.equal(folder.files.has('keys.csv'), true);
+});
+
+test('main exposes a TXT/CSV format selector and converts browser TSV only at download time', async () => {
+  const source = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
+  assert.match(source, /id="bounded-wallet-format"/);
+  assert.match(source, /#bounded-wallet-format'\)\?\.addEventListener\('change'/);
+  assert.match(source, /normalizeScalarExportFormat\(boundedWalletSelection\.format\)/);
+  assert.match(source, /scalarTsvToCsv\(result\.text\)/);
+  assert.match(source, /nativeScalarExportByteCount\(result\.count, 'csv'\)/);
+  assert.match(source, /scalarExportFileName\(result\.fileName/);
 });
