@@ -307,7 +307,160 @@ test('main passes the expected size, renders save progress and marks success onl
   assert.match(source, /await streamNativeScalarExportDownload\(/);
   assert.match(source, /expectedBytes: result\.bytes/);
   assert.match(source, /onProgress: updateBoundedWalletDownloadProgress/);
-  assert.match(source, /boundedWallet\.result\.downloaded = true/);
+  assert.match(source, /result\.downloaded = true/);
   assert.match(source, /Saved and verified/);
   assert.match(source, /#download-bounded-wallet'\)\?\.addEventListener\('click', downloadBoundedWallet\)/);
+});
+
+// --- Chosen download folder (showDirectoryPicker) path ---
+
+function folderHandle({ name = 'SeedlabExports', existing = [], permission = 'granted', requestPermission = 'granted' } = {}) {
+  const files = new Map(existing.map((fileName) => [fileName, new Uint8Array()]));
+  const events = [];
+  const handle = {
+    name,
+    events,
+    files,
+    async queryPermission(descriptor) {
+      events.push(['queryPermission', descriptor]);
+      return permission;
+    },
+    async requestPermission(descriptor) {
+      events.push(['requestPermission', descriptor]);
+      return requestPermission;
+    },
+    async getFileHandle(fileName, options = {}) {
+      events.push(['getFileHandle', fileName, options]);
+      if (files.has(fileName)) return fileFor(fileName);
+      if (!options.create) {
+        const error = new Error('File not found.');
+        error.name = 'NotFoundError';
+        throw error;
+      }
+      files.set(fileName, new Uint8Array());
+      return fileFor(fileName);
+    },
+    async removeEntry(fileName) {
+      events.push(['removeEntry', fileName]);
+      files.delete(fileName);
+    },
+  };
+  function fileFor(fileName) {
+    const staged = [];
+    return {
+      name: fileName,
+      async createWritable(options) {
+        events.push(['createWritable', fileName, options]);
+        return new WritableStream({
+          write(chunk) {
+            events.push(['write', fileName]);
+            staged.push(new Uint8Array(chunk));
+          },
+          close() {
+            events.push(['close', fileName]);
+            files.set(fileName, new Uint8Array(Buffer.concat(staged)));
+          },
+          abort() {
+            events.push(['abort', fileName]);
+            staged.length = 0;
+          },
+        });
+      },
+      async getFile() {
+        events.push(['getFile', fileName]);
+        return { name: fileName, size: files.get(fileName).byteLength };
+      },
+    };
+  }
+  return handle;
+}
+
+test('a chosen folder bypasses the save picker and streams into a verified no-clobber TXT', async () => {
+  const folder = folderHandle();
+  let picked = false;
+  const result = await streamNativeScalarExportDownload({
+    jobId: 'job-123',
+    accessToken: 'secret-token',
+    suggestedName: 'keys.txt',
+    expectedBytes: 25,
+    directoryHandle: folder,
+    showSaveFilePicker: async () => { picked = true; },
+    fetchImpl: async () => {
+      folder.events.push(['fetch']);
+      return responseWithChunks(['first chunk\n', 'second chunk\n']).response;
+    },
+  });
+  assert.equal(picked, false);
+  assert.equal(result.bytes, 25);
+  assert.equal(result.fileName, 'keys.txt');
+  assert.equal(Buffer.from(folder.files.get('keys.txt')).toString(), 'first chunk\nsecond chunk\n');
+  const order = folder.events.map(([event]) => event);
+  // Permission is requested inside the click, before any network await; the
+  // destination file is created only after the response headers validate.
+  assert.ok(order.indexOf('queryPermission') < order.indexOf('fetch'));
+  assert.ok(order.indexOf('getFileHandle') > order.indexOf('fetch'));
+  assert.ok(order.indexOf('close') > order.lastIndexOf('write'));
+  assert.ok(order.indexOf('getFile') > order.indexOf('close'));
+});
+
+test('a repeated folder export gets a unique name instead of overwriting', async () => {
+  const folder = folderHandle({ existing: ['keys.txt'] });
+  const result = await streamNativeScalarExportDownload({
+    jobId: 'job-123',
+    suggestedName: 'keys.txt',
+    expectedBytes: 25,
+    directoryHandle: folder,
+    fetchImpl: async () => responseWithChunks(['first chunk\n', 'second chunk\n']).response,
+  });
+  assert.equal(result.fileName, 'keys-2.txt');
+  assert.equal(folder.files.has('keys.txt'), true);
+  assert.equal(folder.files.get('keys-2.txt').byteLength, 25);
+});
+
+test('folder permission denial rejects before any fetch or destination file', async () => {
+  const folder = folderHandle({ permission: 'prompt', requestPermission: 'denied' });
+  let fetched = false;
+  await assert.rejects(streamNativeScalarExportDownload({
+    jobId: 'job-123',
+    suggestedName: 'keys.txt',
+    expectedBytes: 25,
+    directoryHandle: folder,
+    fetchImpl: async () => { fetched = true; },
+  }), /permission.*not granted/i);
+  assert.equal(fetched, false);
+  assert.equal(folder.files.size, 0);
+});
+
+test('an HTTP error with a chosen folder leaves no empty destination TXT', async () => {
+  const folder = folderHandle();
+  await assert.rejects(streamNativeScalarExportDownload({
+    jobId: 'job-123',
+    suggestedName: 'keys.txt',
+    expectedBytes: 25,
+    directoryHandle: folder,
+    fetchImpl: async () => new Response(JSON.stringify({ error: 'The server copy expired.' }), {
+      status: 404, headers: { 'content-type': 'application/json' },
+    }),
+  }), /server copy expired/i);
+  assert.equal(folder.files.size, 0);
+});
+
+test('a mid-stream failure with a chosen folder removes the incomplete destination', async () => {
+  const folder = folderHandle();
+  const source = responseWithChunks(['first chunk\n'], { fail: true });
+  await assert.rejects(streamNativeScalarExportDownload({
+    jobId: 'job-123',
+    suggestedName: 'keys.txt',
+    expectedBytes: 25,
+    directoryHandle: folder,
+    fetchImpl: async () => source.response,
+  }), /Connection lost/);
+  assert.equal(folder.files.has('keys.txt'), false);
+  assert.equal(folder.events.some(([event]) => event === 'removeEntry'), true);
+});
+
+test('main passes the chosen directory handle to the native streaming helper', async () => {
+  const source = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
+  assert.match(source, /const directoryHandle = downloadFolder\.handle/);
+  assert.match(source, /directoryHandle,\n\s*showSaveFilePicker/);
 });
