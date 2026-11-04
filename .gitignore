@@ -9,3 +9,6 @@ server/dist-lambda/
 *.zip
 __pycache__/
 *.py[cod]
+reports/audit-*/
+reports/entropy*/
+reports/source/

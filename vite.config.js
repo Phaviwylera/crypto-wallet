@@ -37,6 +37,15 @@ function puzzleCampaignApi() {
 
 export default defineConfig({
   plugins: [puzzleCampaignApi(), nativePuzzleApi()],
+  // Additive multi-page entry: the existing lab remains the default page.
+  build: {
+    rollupOptions: {
+      input: {
+        main: new URL('./index.html', import.meta.url).pathname,
+        auditor: new URL('./auditor.html', import.meta.url).pathname,
+      },
+    },
+  },
   server: {
     host: '0.0.0.0',
     allowedHosts: true,

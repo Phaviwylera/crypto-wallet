@@ -1,1 +1,1 @@
-{"rewrites":[{"source":"/(.*)","destination":"/index.html"}]}
+{"rewrites":[{"source":"/auditor","destination":"/auditor.html"},{"source":"/auditor.html","destination":"/auditor.html"},{"source":"/(.*)","destination":"/index.html"}]}

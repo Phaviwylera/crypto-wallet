@@ -1,0 +1,27 @@
+name: Security auditor tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  auditor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run test:security
+      - run: npm run audit:demo
+      - run: npm run audit:verify -- ./reports/audit-demo/bundle.zip
+      - run: npm run build
+      - name: Verify both page entries exist
+        run: test -s dist/index.html && test -s dist/auditor.html

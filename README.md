@@ -11,6 +11,18 @@ npm run dev
 
 Open the URL Vite prints (localhost is a secure context for browser cryptography). Build with `npm run build`.
 
+## Wallet Security Auditor + Immunefi research workspace
+
+A separate page at **`/auditor.html`** adds offline entropy auditing, static source-code triage, an official Immunefi program snapshot with scope tracking, and a responsible-disclosure report builder. The existing lab, exporter, search workers and APIs are unchanged; the top bar links to the new page.
+
+```sh
+npm run audit:demo       # complete synthetic CLI demonstration + verified ZIP
+npm run test:security    # auditor regression suite
+npm run dev              # then open /auditor.html
+```
+
+The auditor tests raw generator output and authorized source only. It does not search funded wallets, check balances or recover third-party keys. Statistical signals and static rule matches are triage leads, not confirmed vulnerabilities or bounty eligibility. See [Security Auditor guide](docs/security-auditor.md) for browser/CLI execution, production deployment, data handling, limits and official sources.
+
 ## Address profiles
 
 | Profile | Derivation path | Address construction |
