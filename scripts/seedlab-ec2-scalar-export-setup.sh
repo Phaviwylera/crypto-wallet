@@ -132,14 +132,36 @@ nginx -t
 systemctl reload nginx
 
 ATTEMPT=0
-until curl -fsS --max-time 2 http://127.0.0.1:8788/health >/dev/null 2>&1; do
-  ATTEMPT=$((ATTEMPT + 1))
-  if [ "$ATTEMPT" -ge 15 ]; then
-    systemctl status $SERVICE --no-pager >&2 || true
-    exit 1
-  fi
-  sleep 1
+HEALTH_CODE=""
+until [ "$HEALTH_CODE" = "200" ] || [ "$HEALTH_CODE" = "503" ]; do
+  HEALTH_CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:8788/health 2>/dev/null || true)"
+  [ "$HEALTH_CODE" = "200" ] || [ "$HEALTH_CODE" = "503" ] || {
+    ATTEMPT=$((ATTEMPT + 1))
+    if [ "$ATTEMPT" -ge 15 ]; then
+      systemctl status $SERVICE --no-pager >&2 || true
+      exit 1
+    fi
+    sleep 1
+  }
 done
+
+# A running HTTP process is not enough: verify that the service actually uses a
+# rebuilt exporter with wide-range random sampling. Never print the bearer token.
+HEALTH_JSON="$(curl -sS --max-time 2 http://127.0.0.1:8788/health)"
+printf '%s' "$HEALTH_JSON" | node -e '
+let raw = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { raw += chunk; });
+process.stdin.on("end", () => {
+  let data;
+  try { data = JSON.parse(raw); } catch { console.error("The scalar export health endpoint returned invalid JSON."); process.exit(1); }
+  if (!data.ok) {
+    console.error(data.error || data.runner?.reason || "The scalar export service is not ready.");
+    process.exit(1);
+  }
+  console.log(`Native exporter ${data.runner?.version || "unknown"} verified: ${(data.runner?.capabilities || []).join(", ")}`);
+});
+'
 
 printf '\nIndependent scalar export API ready at https://%s/api/native-scalar-export/status\n' "$DOMAIN"
 printf 'The service listens only on 127.0.0.1:8788 and requires the existing native bearer token.\n'

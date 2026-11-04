@@ -28,6 +28,8 @@
 #include "keccak256.h"
 
 #define ROW_BYTES 110u
+#define EXPORT_VERSION "1.1.0"
+#define EXPORT_CAPABILITIES "all-entries,random-sample,wide-range-random-sample"
 #define DEFAULT_THREADS 2
 #define DEFAULT_CHUNK 4096u
 #define MAX_CHUNK 65536u
@@ -360,7 +362,8 @@ static double monotonic_seconds(void)
 
 static void print_version(void)
 {
-    puts("seedlab-eth-export 1.0.0 (modified work based on pzsolve pzcore)");
+    printf("seedlab-eth-export %s (modified work based on pzsolve pzcore)\n", EXPORT_VERSION);
+    printf("Native capabilities: %s\n", EXPORT_CAPABILITIES);
     puts("Copyright (C) 2026 Leonardo Boulay");
     puts("License: GNU AGPL version 3 or later, with the additional terms of the NOTICE file (section 7 of the AGPL).");
     puts("This is free software: you may use, study, change and share it under those terms. There is NO WARRANTY.");

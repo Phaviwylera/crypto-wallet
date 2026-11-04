@@ -1,5 +1,6 @@
 import { createExportFileHandle, ensureExportFolderPermission } from './download-folder.js';
 import { normalizeScalarExportFormat, scalarExportFileTypes, SCALAR_EXPORT_FORMATS } from './scalar-export-format.js';
+import { NATIVE_SCALAR_EXPORT_UPGRADE_MESSAGE, NATIVE_WIDE_RANGE_SAMPLE_CAPABILITY } from './native-scalar-export-runtime.js';
 
 async function responseError(response, fallback) {
   const data = await response.json().catch(() => null);
@@ -27,6 +28,25 @@ export async function nativeScalarExportRequest(action, {
   const data = await response.json().catch(() => null);
   if (!data || typeof data !== 'object') throw new Error('Native scalar export returned an invalid response.');
   return data;
+}
+
+export async function nativeScalarExportHealth({
+  accessToken = '',
+  fetchImpl = (...args) => globalThis.fetch(...args),
+} = {}) {
+  const headers = accessToken ? { authorization: `Bearer ${accessToken}` } : {};
+  const response = await fetchImpl('/api/native-scalar-export/health', { cache: 'no-store', headers });
+  if (response.status === 404) throw new Error(NATIVE_SCALAR_EXPORT_UPGRADE_MESSAGE);
+  const data = await response.json().catch(() => null);
+  if (!response.ok || data?.ok !== true) {
+    throw new Error(data?.error || data?.runner?.reason || NATIVE_SCALAR_EXPORT_UPGRADE_MESSAGE);
+  }
+  const runner = data.runner;
+  if (!runner?.supportsWideRangeSample || !Array.isArray(runner.capabilities) ||
+      !runner.capabilities.includes(NATIVE_WIDE_RANGE_SAMPLE_CAPABILITY)) {
+    throw new Error(NATIVE_SCALAR_EXPORT_UPGRADE_MESSAGE);
+  }
+  return runner;
 }
 
 export async function streamNativeScalarExportDownload({

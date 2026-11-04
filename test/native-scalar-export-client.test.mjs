@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { nativeScalarExportRequest, streamNativeScalarExportDownload } from '../src/native-scalar-export.js';
+import { nativeScalarExportHealth, nativeScalarExportRequest, streamNativeScalarExportDownload } from '../src/native-scalar-export.js';
+import { NATIVE_SCALAR_EXPORT_VERSION, NATIVE_WIDE_RANGE_SAMPLE_CAPABILITY } from '../src/native-scalar-export-runtime.js';
 
 // Model the save picker's staging file: writes are not visible in the chosen
 // TXT until close succeeds. An aborted stream must never publish those bytes.
@@ -85,6 +86,49 @@ test('native scalar API requests keep the bearer token out of the URL', async ()
   assert.equal(captured.url, '/api/native-scalar-export/status?id=job%20id%2Fwith%20reserved%20characters');
   assert.equal(captured.options.headers.authorization, 'Bearer secret-token');
   assert.equal(captured.url.includes('secret-token'), false);
+});
+
+test('native export preflight accepts a verified wide-range-capable backend', async () => {
+  let captured;
+  const runner = {
+    available: true,
+    ready: true,
+    version: NATIVE_SCALAR_EXPORT_VERSION,
+    capabilities: ['all-entries', 'random-sample', NATIVE_WIDE_RANGE_SAMPLE_CAPABILITY],
+    supportsWideRangeSample: true,
+    reason: '',
+  };
+  const result = await nativeScalarExportHealth({
+    accessToken: 'secret-token',
+    fetchImpl: async (url, options) => {
+      captured = { url, options };
+      return new Response(JSON.stringify({ ok: true, runner }), { status: 200, headers: { 'content-type': 'application/json' } });
+    },
+  });
+  assert.deepEqual(result, runner);
+  assert.equal(captured.url, '/api/native-scalar-export/health');
+  assert.equal(captured.options.headers.authorization, 'Bearer secret-token');
+  assert.equal(captured.url.includes('secret-token'), false);
+});
+
+test('native export preflight explains stale, missing, or unverifiable backends instead of starting a job', async () => {
+  const cases = [
+    new Response(JSON.stringify({ ok: false, error: 'The export service is still using an older native exporter.' }), { status: 503, headers: { 'content-type': 'application/json' } }),
+    new Response('Not found', { status: 404 }),
+    new Response(JSON.stringify({ ok: true, runner: { version: '1.0.0', capabilities: [], supportsWideRangeSample: false } }), { status: 200, headers: { 'content-type': 'application/json' } }),
+  ];
+  for (const response of cases) {
+    await assert.rejects(nativeScalarExportHealth({ fetchImpl: async () => response }), /older native exporter|Rebuild and restart/i);
+  }
+});
+
+test('main checks native export health before starting a native generation job', async () => {
+  const source = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
+  const health = source.indexOf('await nativeScalarExportHealth(');
+  const start = source.indexOf("nativeScalarExportRequest('start'", health);
+  assert.ok(health >= 0);
+  assert.ok(start > health);
+  assert.match(source, /nativeVersion: runner\.version/);
 });
 
 test('native download writes, backpressures, explicitly closes and verifies the final TXT without a Blob', async () => {
