@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { access, mkdir, readdir, rm, stat } from 'node:fs/promises';
@@ -6,8 +6,14 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 import { constants as fsConstants } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { parseSearchRange } from '../src/search-range.js';
 import { parseScalarSampleCount } from '../src/scalar-wallet.js';
+import {
+  NATIVE_SCALAR_EXPORT_UPGRADE_MESSAGE,
+  NATIVE_SCALAR_EXPORT_VERSION,
+  parseNativeScalarExportVersion,
+} from '../src/native-scalar-export-runtime.js';
 import {
   nativeScalarExportByteCount,
   normalizeScalarExportFormat,
@@ -22,6 +28,8 @@ const DEFAULT_OUTPUT_ROOT = path.join(PROJECT_ROOT, '.runtime', 'scalar-exports'
 const ROW_BYTES = 110n;
 const RETENTION_MS = 30 * 60 * 1000;
 const MAX_RETAINED_JOBS = 8;
+const MAX_NATIVE_OUTPUT_ROWS = 9223372036854775807n / ROW_BYTES;
+const execFileAsync = promisify(execFile);
 
 function apiError(message, statusCode = 400) {
   const error = new Error(message);
@@ -98,6 +106,7 @@ export function createNativeScalarExportService({
   let startLock = false;
   const resolvedBinary = path.resolve(binary);
   const resolvedOutputRoot = path.resolve(outputRoot);
+  let runnerProbe = null;
 
   const touch = (job) => {
     job.updatedAt = new Date().toISOString();
@@ -133,12 +142,53 @@ export function createNativeScalarExportService({
   cleanupTimer.unref();
 
   async function runnerInfo() {
+    let details;
     try {
       await access(resolvedBinary, fsConstants.X_OK);
-      return { available: true, reason: '' };
+      details = await stat(resolvedBinary);
     } catch {
-      return { available: false, reason: 'Native Ethereum exporter is not installed on this service.' };
+      return {
+        available: false,
+        ready: false,
+        version: '',
+        capabilities: [],
+        supportsWideRangeSample: false,
+        reason: 'Native Ethereum exporter is not installed on this service.',
+      };
     }
+    // The installer replaces the binary with an atomic rename. Re-probe when the
+    // executable changes so a long-running API picks up a rebuilt exporter.
+    const key = `${details.dev}:${details.ino}:${details.size}:${details.mtimeMs}:${details.ctimeMs}`;
+    if (runnerProbe?.key === key) return runnerProbe.promise;
+    const promise = (async () => {
+      try {
+        const { stdout } = await execFileAsync(resolvedBinary, ['--version'], {
+          timeout: 5000,
+          maxBuffer: 16384,
+          windowsHide: true,
+        });
+        const { version, capabilities, supportsWideRangeSample } = parseNativeScalarExportVersion(stdout);
+        return {
+          available: true,
+          ready: supportsWideRangeSample,
+          version,
+          capabilities,
+          supportsWideRangeSample,
+          reason: supportsWideRangeSample ? '' : NATIVE_SCALAR_EXPORT_UPGRADE_MESSAGE,
+        };
+      } catch {
+        return {
+          available: true,
+          ready: false,
+          version: 'unknown',
+          capabilities: [],
+          supportsWideRangeSample: false,
+          reason: `The native Ethereum exporter could not be verified. Rebuild it with npm run export:scalars:native:setup. ${NATIVE_SCALAR_EXPORT_UPGRADE_MESSAGE}`,
+        };
+      }
+    })();
+    runnerProbe = { key, promise };
+    return promise;
   }
 
   async function start(body) {
@@ -173,6 +223,9 @@ export function createNativeScalarExportService({
     const exportCount = sampleCount ?? range.count;
     const runner = await runnerInfo();
     if (!runner.available) throw apiError(runner.reason, 503);
+    if (mode === 'random' && range.count > MAX_NATIVE_OUTPUT_ROWS && !runner.supportsWideRangeSample) {
+      throw apiError(runner.reason || NATIVE_SCALAR_EXPORT_UPGRADE_MESSAGE, 503);
+    }
     await mkdir(resolvedOutputRoot, { recursive: true, mode: 0o700 });
 
     const id = randomUUID();
@@ -360,13 +413,25 @@ function jsonRoute(handler, successStatus = 200) {
       return context.json(await handler(context), successStatus);
     } catch (error) {
       const status = error.statusCode || 500;
-      return context.json({ error: status < 500 ? error.message : 'Native scalar export failed.' }, status);
+      return context.json({ error: status < 500 || status === 503 ? error.message : 'Native scalar export failed.' }, status);
     }
   };
 }
 
 export function registerNativeScalarExportRoutes(app, options = {}) {
   const service = createNativeScalarExportService(options);
+  app.get('/api/native-scalar-export/health', async (context) => {
+    context.header('cache-control', 'private, no-store');
+    context.header('x-content-type-options', 'nosniff');
+    const runner = await service.runnerInfo();
+    return context.json({
+      ok: runner.ready,
+      service: 'native-scalar-export',
+      expectedVersion: NATIVE_SCALAR_EXPORT_VERSION,
+      runner,
+      error: runner.ready ? '' : runner.reason,
+    }, runner.ready ? 200 : 503);
+  });
   app.post('/api/native-scalar-export/start', jsonRoute(async (context) => service.start(await jsonBody(context)), 202));
   app.get('/api/native-scalar-export/status', jsonRoute((context) => service.status(context.req.query('id') || '')));
   app.post('/api/native-scalar-export/stop', jsonRoute(async (context) => service.stop(await jsonBody(context)), 202));

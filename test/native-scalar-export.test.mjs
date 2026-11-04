@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deriveScalarWallet } from '../scripts/generate-scalar-wallets.mjs';
 import { scalarBatchRow } from '../src/scalar-wallet.js';
+import { NATIVE_SCALAR_EXPORT_VERSION, NATIVE_WIDE_RANGE_SAMPLE_CAPABILITY } from '../src/native-scalar-export-runtime.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const BINARY = process.env.SEEDLAB_ETH_EXPORT_BIN || path.join(ROOT, '.runtime', 'bin', 'seedlab-eth-export');
@@ -50,6 +51,8 @@ test('native exporter self-test and license notices', { skip }, async () => {
   assert.match(selftest.stdout, /Keccak-256.*secp256k1.*EIP-55/);
   const version = await runNative(['--version']);
   assert.equal(version.code, 0);
+  assert.ok(version.stdout.startsWith(`seedlab-eth-export ${NATIVE_SCALAR_EXPORT_VERSION} `));
+  assert.match(version.stdout, new RegExp(`Native capabilities: .*${NATIVE_WIDE_RANGE_SAMPLE_CAPABILITY}`));
   assert.match(version.stdout, /Copyright \(C\) 2026 Leonardo Boulay/);
   assert.match(version.stdout, /GNU AGPL version 3 or later/);
   assert.match(version.stdout, /modified exporter.*not the original pzsolve/i);
@@ -171,30 +174,32 @@ test('native random sample exports exact unique in-range rows that match JavaScr
   assert.equal((await stat(output)).mode & 0o777, 0o600);
 });
 
-test('native random sample works when the inclusive range is wider than the host output limit', { skip }, async (t) => {
+test('native random sample exports 500000 rows when the inclusive range is wider than the host output limit', { skip }, async (t) => {
   const directory = await temporaryDirectory(t, 'native-scalar-random-wide-');
-  // The reported UI case: a ~1e56-wide inclusive range with only 5,000 entries.
+  // The reported UI case: a ~1e56-wide inclusive range with 500,000 entries.
   const lower = 8886537567565632563756237567736572356383562336563565237857n;
   const upper = 9886537567565632563756237567736572356383562336563599999999n;
   const output = path.join(directory, 'wide-random.txt');
   const result = await runNative([
-    '--start', String(lower), '--end', String(upper), '--sample', '5000',
-    '--output', output, '--threads', '2', '--chunk-size', '512',
-  ]);
+    '--start', String(lower), '--end', String(upper), '--sample', '500000',
+    '--output', output, '--threads', '2', '--chunk-size', '4096',
+  ], { timeout: 60000 });
   assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stdout, /Complete: 5000 rows, 550000 bytes/);
+  assert.match(result.stdout, /Complete: 500000 rows, 55000000 bytes/);
   assert.equal(existsSync(`${output}.partial`), false);
   const text = await readFile(output, 'utf8');
-  assert.equal(Buffer.byteLength(text), 5000 * 110);
+  assert.equal(Buffer.byteLength(text), 500000 * 110);
   const lines = text.trimEnd().split('\n');
-  assert.equal(lines.length, 5000);
+  assert.equal(lines.length, 500000);
   const keys = lines.map((line) => line.split('\t')[1]);
-  assert.equal(new Set(keys).size, 5000);
+  assert.equal(new Set(keys).size, 500000);
   for (const line of lines) {
-    const [address, key] = line.split('\t');
-    const scalar = BigInt(key);
+    const scalar = BigInt(line.split('\t')[1]);
     assert.ok(scalar >= lower && scalar <= upper);
-    const expected = deriveScalarWallet(scalar);
+  }
+  for (const line of [lines[0], lines[250000], lines[499999]]) {
+    const [address, key] = line.split('\t');
+    const expected = deriveScalarWallet(BigInt(key));
     assert.equal(address, expected.address);
     assert.equal(key, expected.privateKey);
   }

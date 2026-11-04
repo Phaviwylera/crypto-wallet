@@ -24,7 +24,7 @@ npm run export:scalars:native:setup
 
 For a local checkout, use its own directory instead of `/home/ssm-user/seedlab-src`. On a minimal Ubuntu host, install the build prerequisites first with `sudo apt-get update && sudo apt-get install -y build-essential git`.
 
-Setup clones `boulayo/bitcoin-puzzle-solver` at the exact pinned commit `f6b85a19411e61258ad6ecc5af7d20d521fdb7d7`, builds only its `pzcore` static library, compiles Seedlab's separate exporter, runs native self-tests, and installs:
+Setup clones `boulayo/bitcoin-puzzle-solver` at the exact pinned commit `f6b85a19411e61258ad6ecc5af7d20d521fdb7d7`, builds only its `pzcore` static library, compiles Seedlab's separate exporter, runs native self-tests plus a wide-range random-sample smoke test, and installs:
 
 ```text
 .runtime/bin/seedlab-eth-export
@@ -51,14 +51,31 @@ sudo systemctl start seedlab-deploy.service
 
 The deploy service builds the latest `origin/main` from its own source archive, so the older unrelated deployment checkout does not need to be reset or merged. The scalar installer:
 
-- builds the pinned exporter under `/var/lib/seedlab-native/bin`;
+- builds the pinned exporter under `/var/lib/seedlab-native/bin` and refuses to install a binary that lacks wide-range random sampling;
 - creates owner-only `/var/lib/seedlab-native/scalar-exports` storage;
 - installs `seedlab-scalar-export-api.service` on **127.0.0.1:8788**;
 - reuses `/etc/seedlab/native-api.env` without printing the bearer token;
 - adds the authenticated `/api/native-scalar-export/*` Nginx proxy to the same HTTPS server blocks as the existing native controls;
-- restarts **only** `seedlab-scalar-export-api.service` and reloads Nginx.
+- restarts **only** `seedlab-scalar-export-api.service` and reloads Nginx;
+- verifies the running service reports native exporter `1.1.0` with `wide-range-random-sample` before declaring success.
 
 It does **not** restart `seedlab-native-api.service`, signal pzsolve, or restart a puzzle campaign. Port 8788 must remain loopback-only; do not add it to the EC2 security group.
+
+### If Random sample still says “too large for this host”
+
+The static-site deploy timer updates only the browser UI. It does **not** rebuild or restart the independent C export service. A new UI can therefore still talk to an old exporter. The current UI checks `/api/native-scalar-export/health` before starting a native job and reports an out-of-date backend explicitly; the API also rejects wide-range random samples when the configured binary lacks the required capability.
+
+On the EC2 host, check the non-secret health endpoint (no bearer token is needed):
+
+```bash
+curl -sS http://127.0.0.1:8788/health
+sudo systemctl status seedlab-scalar-export-api.service --no-pager
+sudo -u ssm-user /var/lib/seedlab-native/bin/seedlab-eth-export --version | head -2
+```
+
+A ready service reports `"ok": true`, exporter version `1.1.0`, and the `wide-range-random-sample` capability. If it reports an older version or `"ok": false`, update the export checkout and rerun the scalar installer above. `systemctl start seedlab-deploy.service` alone only redeploys static files.
+
+For scale: 500,000 Ethereum rows are 55,000,000 bytes as TXT and 55,500,021 bytes as CSV. That sample size is supported even when the inclusive range itself is astronomically wider; only the sample is written.
 
 Hard-refresh the deployed site. In **Addresses + private keys within these bounds**, enter the existing native API token, choose Ethereum and inclusive bounds, then choose **All entries in range** or **Random sample**. For a random sample, enter the exact number of unique entries (for example `500000` means 500,000 rows / 5 lakh, not 500,000 lakhs); it must not exceed the inclusive range size. Click **Generate all addresses + private keys** or **Generate random sample**. The button now starts native C generation instead of the old JavaScript loop. When complete, choose **Download format → TXT or CSV**, then click **Download TXT** / **Download CSV** in a current Chromium browser on HTTPS: the authenticated response is written directly to a file chosen with the browser's save-file picker, or into the folder selected with **Choose folder** (see below). No bearer token appears in the URL and no whole-file Blob is created. Browsers without the File System Access API should use the CLI instead.
 
@@ -82,7 +99,7 @@ The panel has a **Download folder** row with **Choose folder**. It opens the bro
 
 Keep the tab open while the button says **Streaming download…**. Chromium may temporarily show a `.crswap` file beside the chosen `.txt` or `.csv`; that is the browser's staging file, not the completed export. The UI reports byte progress, waits for the browser to close/commit the file, and verifies that the saved file size equals the expected TXT or CSV size before showing **Saved and verified**. Empty, truncated, oversized, or wrong-format responses are rejected and are not reported as successful downloads. If a download fails, retry **Download TXT** / **Download CSV** while the server copy is still available; do not rename or use a leftover `.crswap` file as a verified export.
 
-Only one UI export runs at a time. Completed files expire after 30 minutes; **Delete server copy** removes one sooner. API job metadata is memory-only, so restarting the scalar service invalidates old job IDs and its cleanup removes orphaned UUID-named files from the dedicated export directory. All status, start, stop, delete, and download endpoints require the bearer token. Nginx forwards the Authorization header and disables response buffering for downloads.
+Only one UI export runs at a time. Completed files expire after 30 minutes; **Delete server copy** removes one sooner. API job metadata is memory-only, so restarting the scalar service invalidates old job IDs and its cleanup removes orphaned UUID-named files from the dedicated export directory. All status, start, stop, delete, and download endpoints require the bearer token. The health endpoint exposes only non-secret readiness/version/capability information. Nginx forwards the Authorization header and disables response buffering for downloads.
 
 ## Generate with the CLI
 

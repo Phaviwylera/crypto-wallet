@@ -20,7 +20,7 @@ import { MAX_BATCH_FILE_BYTES, parseAddressBatch, parseRecoveryBatch, publicKeyR
 import { runRecoveryBatch } from './recovery-batch.js';
 import { createPuzzleCampaignSnapshot, puzzleCampaignContentMarkup, puzzleCampaignStatusMarkup } from './puzzle-campaigns.js';
 import { createNativePuzzleState, nativePuzzleMarkup, nativePuzzleRequest, nativePuzzleStatusMarkup, nextNativePuzzleChunk } from './native-puzzle.js';
-import { nativeScalarExportRequest, streamNativeScalarExportDownload } from './native-scalar-export.js';
+import { nativeScalarExportHealth, nativeScalarExportRequest, streamNativeScalarExportDownload } from './native-scalar-export.js';
 import { saveTextToExportFolder, utf8ByteLength } from './download-folder.js';
 import { nativeScalarExportByteCount, normalizeScalarExportFormat, scalarExportFileName, scalarTsvToCsv, SCALAR_EXPORT_FORMATS } from './scalar-export-format.js';
 import { generateRandomScalarBatch, generateScalarBatch, parseScalarBatchRange, parseScalarSampleCount } from './scalar-wallet.js';
@@ -1008,7 +1008,7 @@ function boundedWalletGeneratorMarkup() {
     ${boundedWallet.error ? `<p class="search-file-error" role="alert">${escapeHtml(boundedWallet.error)}</p>` : ''}
     ${boundedWallet.busy ? `<div class="dlog-live-progress bounded-wallet-result" role="status" aria-live="polite"><b id="bounded-wallet-progress">Generated ${boundedWallet.completed.toLocaleString()} / ${boundedWallet.total.toLocaleString()} rows</b><div class="search-progress"><span id="bounded-wallet-progress-bar" style="width:${progressPercent}%"></span></div><p>${boundedWallet.mode === 'native' ? 'Native C writes bounded chunks on the server. Cancel signals only this export job.' : 'Derivation runs in small JavaScript chunks and holds the result in browser memory.'}</p></div>` : ''}
     ${boundedWalletDownloadMarkup()}
-    ${result ? `<div class="dlog-live-progress bounded-wallet-result" aria-live="polite"><b>${result.count.toLocaleString()} rows ready · ${escapeHtml(result.networkLabel)} · ${result.selectionMode === 'random' ? 'random sample' : 'all entries'}${result.ratePerSecond ? ` · ${result.ratePerSecond.toLocaleString()} rows/s` : ''}</b><p>Inclusive scalar range: <code>${escapeHtml(result.lower)}</code> – <code>${escapeHtml(result.upper)}</code></p><p>${result.native ? 'Native C export complete. Download streams to disk without loading the export into browser memory. The server copy expires after 30 minutes.' : 'Headerless browser-generated rows are held in memory.'} <strong>Keep it secret.</strong>${result.downloaded ? ` Saved and verified: <code>${escapeHtml(result.savedFileName || scalarExportFileName(result.fileName, downloadFormat))}</code>${result.savedFolderName ? ` in <code>${escapeHtml(result.savedFolderName)}</code>` : ''} · ${(result.savedBytes ?? result.bytes).toLocaleString()} bytes.` : ''}</p></div>` : ''}
+    ${result ? `<div class="dlog-live-progress bounded-wallet-result" aria-live="polite"><b>${result.count.toLocaleString()} rows ready · ${escapeHtml(result.networkLabel)} · ${result.selectionMode === 'random' ? 'random sample' : 'all entries'}${result.ratePerSecond ? ` · ${result.ratePerSecond.toLocaleString()} rows/s` : ''}</b><p>Inclusive scalar range: <code>${escapeHtml(result.lower)}</code> – <code>${escapeHtml(result.upper)}</code></p><p>${result.native ? `Native C export complete${result.nativeVersion ? ` (exporter v${escapeHtml(result.nativeVersion)})` : ''}. Download streams to disk without loading the export into browser memory. The server copy expires after 30 minutes.` : 'Headerless browser-generated rows are held in memory.'} <strong>Keep it secret.</strong>${result.downloaded ? ` Saved and verified: <code>${escapeHtml(result.savedFileName || scalarExportFileName(result.fileName, downloadFormat))}</code>${result.savedFolderName ? ` in <code>${escapeHtml(result.savedFolderName)}</code>` : ''} · ${(result.savedBytes ?? result.bytes).toLocaleString()} bytes.` : ''}</p></div>` : ''}
   </div>`;
 }
 
@@ -1054,6 +1054,11 @@ function updateBoundedWalletProgress(completed, total) {
 
 async function runNativeBoundedWallet({ range, runId, networkId, networkLabel, selectionMode, sampleCount }) {
   try {
+    // The static UI can deploy independently of the C export service. Fail
+    // clearly on an old backend instead of reporting its full-range size error
+    // as though the requested random sample were too large.
+    const runner = await nativeScalarExportHealth({ accessToken: nativePuzzle.accessToken });
+    if (runId !== boundedWalletRunId) return;
     const body = { lower: range.start.toString(), upper: range.end.toString(), threads: 2, mode: selectionMode };
     if (selectionMode === 'random') body.sampleCount = sampleCount.toString();
     const started = await nativeScalarExportRequest('start', {
@@ -1080,6 +1085,7 @@ async function runNativeBoundedWallet({ range, runId, networkId, networkLabel, s
           result: {
             native: true,
             jobId: job.id,
+            nativeVersion: runner.version,
             fileName: job.fileName,
             count: Number(job.count),
             bytes: Number(job.bytes),
